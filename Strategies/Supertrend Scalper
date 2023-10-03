@@ -1,0 +1,57 @@
+//@version=5
+indicator("Scalping Bot 1.0", overlay=true, timeframe="", timeframe_gaps=true)
+
+src = input(close, "Source input")
+
+atrPeriod1 = input(10, "ATR1 Length")
+factor1 = input.float(1.5, "Factor1", step = 0.01)
+
+[supertrend1, direction1] = ta.supertrend(factor1, atrPeriod1)
+
+bodyMiddle1 = plot((open + close) / 2, display=display.none)
+upTrend1 = plot(direction1 < 0 ? supertrend1 : na, "Up Trend", color = color.green, style=plot.style_linebr)
+downTrend1 = plot(direction1 < 0? na : supertrend1, "Down Trend", color = color.red, style=plot.style_linebr)
+
+// Second Chart
+atrPeriod2 = input(11, "ATR2 Length")
+factor2 = input.float(2.0, "Factor2", step = 0.01)
+
+[supertrend2, direction2] = ta.supertrend(factor2, atrPeriod2)
+
+bodyMiddle2 = plot((open + close) / 2, display=display.none)
+upTrend2 = plot(direction2 < 0 ? supertrend2 : na, "Up Trend", color = color.green, style=plot.style_linebr)
+downTrend2 = plot(direction2 < 0? na : supertrend2, "Down Trend", color = color.red, style=plot.style_linebr)
+
+// Third Chart
+atrPeriod3 = input(12, "ATR3 Length")
+factor3 = input.float(3.0, "Factor3", step = 0.01)
+
+[supertrend3, direction3] = ta.supertrend(factor3, atrPeriod3)
+
+bodyMiddle3 = plot((open + close) / 2, display=display.none)
+upTrend3 = plot(direction3 < 0 ? supertrend3 : na, "Up Trend", color = color.green, style=plot.style_linebr)
+downTrend3 = plot(direction3 < 0? na : supertrend3, "Down Trend", color = color.red, style=plot.style_linebr)
+
+// 100 EMA
+ema100 = ta.ema(close, 100)
+
+// Color of the 100 EMA
+
+// This code compiles
+directionIsSame = if ((direction1 == direction2) and (direction2  == direction3) and (direction3  == direction1))
+    true
+else
+    false
+
+color theColor = color.gray
+if(directionIsSame == true)
+    if(direction1 < 0) // If all up
+        theColor := color.green
+    else if(direction1 > 0) // If all down
+        theColor := color.red
+    else // If not the same
+        theColor := color.gray
+
+
+plot(ema100, "100 EMA", color=theColor, style=plot.style_linebr)
+
