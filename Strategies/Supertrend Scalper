@@ -3,6 +3,13 @@ indicator("Scalping Bot 1.0", overlay=true, timeframe="", timeframe_gaps=true)
 
 src = input(close, "Source input")
 
+// tradingHours = input(title = "Trading Hours", type = input.session())
+
+
+
+
+
+//////////////////////////// S U P E R T R E N D        I N I T I A L I Z A T I O N /////////////////////////////////////
 atrPeriod1 = input(10, "ATR1 Length")
 factor1 = input.float(1.5, "Factor1", step = 0.01)
 
@@ -33,7 +40,7 @@ upTrend3 = plot(direction3 < 0 ? supertrend3 : na, "Up Trend", color = color.gre
 downTrend3 = plot(direction3 < 0? na : supertrend3, "Down Trend", color = color.red, style=plot.style_linebr)
 
 // 100 EMA
-ema100 = ta.ema(close, 100)
+ema100 = ta.ema(close, 200)
 
 // Color of the 100 EMA
 
@@ -53,5 +60,30 @@ if(directionIsSame == true)
         theColor := color.gray
 
 
+
+
+
+
 plot(ema100, "100 EMA", color=theColor, style=plot.style_linebr)
+
+buy = false
+sell = false
+exitOut = false
+
+if(directionIsSame)
+    if(direction1<0)
+        buy := true
+    else
+        sell := true
+else
+    exitOut := true
+
+plotcandle(open, high, low, close, title='Bar', color = buy ? color.green : sell ? color.red : exitOut ? color.gray : na, wickcolor= buy ? color.green : sell ? color.red : exitOut ? color.gray : na)
+
+plotshape(buy and not buy[1], style = shape.labelup, location = location.belowbar, 
+         color = color.green, size = size.small, text = "B", textcolor = color.white)
+plotshape(sell and not sell[1], style = shape.labeldown, location = location.abovebar, 
+         color = color.red, size = size.small, text = "S", textcolor = color.white)
+plotshape(exitOut and not exitOut[1], style = shape.labeldown, location = location.abovebar, 
+         color = color.yellow, size = size.small, text = "E", textcolor = color.white)
 
