@@ -1,9 +1,11 @@
 //@version=5
-indicator("Scalping Bot 1.0", overlay=true, timeframe="", timeframe_gaps=true)
+// indicator("Scalping Bot 1.0", overlay=true, timeframe="", timeframe_gaps=true)
+strategy("Scalping Bot 1.0", overlay=true)
+
+tradingSession = input.session("1300-1700", "Session")
+
 
 src = input(close, "Source input")
-
-// tradingHours = input(title = "Trading Hours", type = input.session())
 
 
 //////////////////////////// S U P E R T R E N D        I N I T I A L I Z A T I O N ////////////////////////////
@@ -79,7 +81,12 @@ sell = false
 exitOut = false
 isTrending = ta.tr(true) > lowVolatility
 
-if(directionIsSame and isTrending) // This logic needs to be fixed
+
+// Is tradingSession
+canTrade = time(timeframe.period, tradingSession)
+
+
+if(directionIsSame and canTrade) // This logic needs to be fixed
     if(direction1<0)
         buy := true
     else
@@ -87,7 +94,6 @@ if(directionIsSame and isTrending) // This logic needs to be fixed
 else
     exitOut := true
 ///////////////////////////////////////////////////////////////////////////////////////////////
-
 
 
 
@@ -102,4 +108,11 @@ plotshape(sell and not sell[1], style = shape.labeldown, location = location.abo
          color = color.red, size = size.small, text = "S", textcolor = color.white)
 plotshape(exitOut and not exitOut[1], style = shape.labeldown, location = location.abovebar, 
          color = color.yellow, size = size.small, text = "E", textcolor = color.white)
+
+
+strategy.entry("Long", strategy.long, 100.0, when = buy)
+strategy.entry("Short", strategy.short, 100.0, when = sell)
+
+strategy.close("Long", when = sell or exitOut)
+strategy.close("Short", when = buy or exitOut)
 
