@@ -1,0 +1,46 @@
+//@version=5
+indicator("ADX Highlighted", format=format.price, precision=2, timeframe="", timeframe_gaps=true)
+
+
+adxlen = input(14, title="ADX Smoothing")
+emaLength = input(21, title="EMA Length")
+dilen = input(14, title="DI Length")
+rangingValue = input(22, title = "Ranging Value") // If the plot is under this value, it is a ranging market
+src = input(close, "ADX Source")
+
+
+
+dirmov(len) =>
+	up = ta.change(src)
+	down = -ta.change(src)
+	plusDM = na(up) ? na : (up > down and up > 0 ? up : 0)
+	minusDM = na(down) ? na : (down > up and down > 0 ? down : 0)
+	truerange = ta.rma(ta.tr, len)
+	plus = fixnan(100 * ta.rma(plusDM, len) / truerange)
+	minus = fixnan(100 * ta.rma(minusDM, len) / truerange)
+	[plus, minus]
+adx(dilen, adxlen) =>
+	[plus, minus] = dirmov(dilen)
+	sum = plus + minus
+	adx = 100 * ta.rma(math.abs(plus - minus) / (sum == 0 ? 1 : sum), adxlen)
+sig = adx(dilen, adxlen)
+adxColor = color.red
+if(sig < rangingValue)
+    adxColor := color.red
+else
+    adxColor := color.green
+    
+
+// Calculate EMA
+ema = ta.ema(sig, emaLength)
+
+// Find EMA Direction
+emaDirection = (ema > ema[2])
+
+emaColor = (emaDirection ? color.blue : color.yellow)
+
+plot(ema, color=emaColor, title="EMA")
+
+
+hline(rangingValue, "Lower Value", color=color.blue)
+plot(sig, color=adxColor, title="ADX")
