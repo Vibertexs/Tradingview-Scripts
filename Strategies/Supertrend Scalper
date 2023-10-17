@@ -8,9 +8,11 @@ tradingSession = input.session("1300-1700", "Session")
 
 
 
-
-
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////// S U P E R T R E N D        I N I T I A L I Z A T I O N ////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
 
 src = input(close, "Super Trned Source input", group = supertrendGroup)
 
@@ -21,8 +23,8 @@ factor1 = input.float(1.5, "Factor1", step = 0.1, inline = "3", group = supertre
 [supertrend1, direction1] = ta.supertrend(factor1, atrPeriod1)
 
 // bodyMiddle1 = plot((open + close) / 2, display=display.none)
-upTrend1 = plot(direction1 < 0 ? supertrend1 : na, "Up Trend", color = color.green, style=plot.style_linebr)
-downTrend1 = plot(direction1 < 0? na : supertrend1, "Down Trend", color = color.red, style=plot.style_linebr)
+upTrend1 = plot(direction1 < 0 ? supertrend1 : na, "Up Trend", color = color.green, style=plot.style_linebr, display = display.none)
+downTrend1 = plot(direction1 < 0? na : supertrend1, "Down Trend", color = color.red, style=plot.style_linebr, display = display.none)
 
 // Supertrend 2
 atrPeriod2 = input(11, "ATR2 Length", inline = "4", group = supertrendGroup)
@@ -31,8 +33,8 @@ factor2 = input.float(2.0, "Factor2", step = 0.1, inline = "4", group = supertre
 [supertrend2, direction2] = ta.supertrend(factor2, atrPeriod2)
 
 // bodyMiddle2 = plot((open + close) / 2, display=display.none)
-upTrend2 = plot(direction2 < 0 ? supertrend2 : na, "Up Trend", color = color.green, style=plot.style_linebr)
-downTrend2 = plot(direction2 < 0? na : supertrend2, "Down Trend", color = color.red, style=plot.style_linebr)
+upTrend2 = plot(direction2 < 0 ? supertrend2 : na, "Up Trend", color = color.green, style=plot.style_linebr, display = display.none)
+downTrend2 = plot(direction2 < 0? na : supertrend2, "Down Trend", color = color.red, style=plot.style_linebr, display = display.none)
 
 // Supertrend 3
 atrPeriod3 = input(12, "ATR3 Length", inline = "5", group = supertrendGroup)
@@ -41,31 +43,28 @@ factor3 = input.float(3.0, "Factor3", step = 0.1, inline = "5", group = supertre
 [supertrend3, direction3] = ta.supertrend(factor3, atrPeriod3)
 
 // bodyMiddle3 = plot((open + close) / 2, display=display.none)
-upTrend3 = plot(direction3 < 0 ? supertrend3 : na, "Up Trend", color = color.green, style=plot.style_linebr)
-downTrend3 = plot(direction3 < 0? na : supertrend3, "Down Trend", color = color.red, style=plot.style_linebr)
+upTrend3 = plot(direction3 < 0 ? supertrend3 : na, "Up Trend", color = color.green, style=plot.style_linebr, display = display.none)
+downTrend3 = plot(direction3 < 0? na : supertrend3, "Down Trend", color = color.red, style=plot.style_linebr, display = display.none)
 
 
+direction2:= direction1
+direction3:= direction1
+atrPeriod2 := atrPeriod1
+atrPeriod3 := atrPeriod1
 
-// This code compiles
 directionIsSame = if ((direction1 == direction2) and (direction2  == direction3) and (direction3  == direction1))
     true
 else
     false
 
 
-//////////////////////////// A V E R A G E    T R U E    R A N G E ////////////////////////////
-// lowVolatility = input.int(title="Range Value", defval = 25)
-// length = input.int(title="Length", defval=14, minval=1)
-// smoothing = input.string(title="Smoothing", defval="RMA", options=["RMA", "SMA", "EMA", "WMA"])
-// ma_function(source, length) =>
-// 	switch smoothing
-// 		"RMA" => ta.rma(source, length)
-// 		"SMA" => ta.sma(source, length)
-// 		"EMA" => ta.ema(source, length)
-// 		=> ta.wma(source, length)
 
-//////////////////////////////////////////////////////////////////////////////////////////////
-//////////////////////////// H U L L        M O V I N G        A V E R A G E  ////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////// H U L L        S U I T E        A V E R A G E  ////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
 HMAGroup = "HMA"
 Hsrc = input(close, title="Hull Source", group = HMAGroup)
 Hlength = input(55, title="Length", group = HMAGroup)
@@ -79,10 +78,36 @@ MHULL = HULL[0]
 hullDirection = (HULL > HULL[2])
 
 hullColor = (hullDirection ? #00ff00 : #ff0000)
-
-
 plot(MHULL, title="MHULL", color=hullColor, linewidth=HthicknesSwitch)
-//////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////// L A G U E R R E        F I L T E R ////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
+Lsrc = input(hl2, "Laguerre Source")
+Lalpha = input.float(0.1, "Alpha", step = 0.01)
+gamma = 1 - Lalpha
+var float L0 = na
+L0 := na(L0[1]) ? (1 - gamma) * src + gamma * nz(L0[1]) : (1 - gamma) * src + gamma * L0[1]
+var float L1 = na
+L1 := na(L1[1]) ? -gamma * L0 + nz(L0[1]) + gamma * nz(L1[1]) : -gamma * L0 + L0[1] + gamma * L1[1]
+var float L2 = na
+L2 := na(L2[1]) ? -gamma * L1 + nz(L1[1]) + gamma * nz(L2[1]) : -gamma * L1 + L1[1] + gamma * L2[1]
+var float L3 = na
+L3 := na(L3[1]) ? -gamma * L2 + nz(L2[1]) + gamma * nz(L3[1]) : -gamma * L2 + L2[1] + gamma * L3[1]
+LagF = (L0 + 2 * L1 + 2 * L2 + L3) / 6
+LaguerreDirection = (LagF > LagF[1])
+Color = LaguerreDirection ? color.green : color.red
+plot(LagF, title="LagF", linewidth=2, color=Color, transp=0)
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////// P O S I T I O N    L O G I C ////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 buy = false
 sell = false
@@ -91,13 +116,6 @@ exitOut = false
 
 
 // Is tradingSession
-
-// bothSame = if directionIsSame and direction1 < 0 and hullDirection
-//       true
-//     else if directionIsSame and direction1 > 0 and not hullDirection
-//         true
-//     else
-//         false
 
 canTrade = time(timeframe.period, tradingSession) and directionIsSame 
 
@@ -109,8 +127,6 @@ else
     false
 
 
-
-
 if(canTrade and bothSame) // This logic needs to be fixed
     if(direction1<0)
         buy := true
@@ -118,14 +134,14 @@ if(canTrade and bothSame) // This logic needs to be fixed
         sell := true
 else
     exitOut := true
-///////////////////////////////////////////////////////////////////////////////////////////////
 
 
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////// T R A D E        S I Z E        L O G I C //////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-///////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////// P O S I T I O N    L O G I C ////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////
+
 
 // Calculate the number of lot
 accountInfoGroup = "Account Info"
@@ -148,11 +164,10 @@ number_of_lots = math.abs(account_balance*risk_percentage / (stopLossDistance))
 // if bar_index % 1 == 0
 //     label.new(bar_index, na, "Number of pips = " + str.tostring(math.abs(stopLossDistance), format.mintick) + "\n🠇", yloc = yloc.abovebar, style = label.style_none, textcolor = color.white, size = size.normal)
 
-///////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////
 
-
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////// P L O T        G R A P H S ////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Plot Labels
 plotcandle(open, high, low, close, title='Bar', color = buy ? color.green : sell ? color.red : exitOut ? color.gray : na, wickcolor= buy ? color.green : sell ? color.red : exitOut ? color.gray : na)
@@ -170,11 +185,4 @@ strategy.entry("Short", strategy.short, number_of_lots, when = sell)
 
 strategy.close("Long", when = sell or exitOut)
 strategy.close("Short", when = buy or exitOut)
-// ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// plotchar(ta.rising(close, 5), "`plotchar()`", "🠅", location.belowbar, color.lime, size = size.small)
-// plotshape(ta.falling(close, 5), "`plotchar()`", location = location.abovebar, color = na, text = "•`plotshape()•`\n🠇", textcolor = color.fuchsia, size = size.huge)
-
-
-
-
 
