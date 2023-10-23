@@ -1,0 +1,69 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © vibertexyt
+
+//@version=5
+
+// Value goes up if market is ranging
+// Basically the RSI Trends modified
+indicator(title="RSI Based Range Identifier", format=format.price, precision=2, timeframe="", timeframe_gaps=true)
+
+ma(source, length, type) =>
+    switch type
+        "SMA" => ta.sma(source, length)
+        "EMA" => ta.ema(source, length)
+        "SMMA (RMA)" => ta.rma(source, length)
+        "WMA" => ta.wma(source, length)
+        "VWMA" => ta.vwma(source, length)
+
+rsiLengthInput = input.int(37, minval=1, title="RSI Length", group="RSI Settings")
+rsiSourceInput = input.source(close, "Source", group="RSI Settings")
+maTypeInput = input.string("EMA", title="MA Type", options=["SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group="MA Settings")
+maLengthInput = input.int(38, title="MA Length", group="MA Settings")
+rsiSpread = input.int(4, title = "RSI Spread")
+rsiUpperBandValue = 50+rsiSpread
+rsiLowerBandValue = 50-rsiSpread
+smoothingInput = input.int(2, title="Smoothing")
+thresholdLine = input.int(15, title="Threshold")
+
+
+up = ta.rma(math.max(ta.change(rsiSourceInput), 0), rsiLengthInput)
+down = ta.rma(-math.min(ta.change(rsiSourceInput), 0), rsiLengthInput)
+rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+rsiMA = ma(rsi, maLengthInput, maTypeInput)
+
+// rsiPlot = plot(rsi, "RSI", color=#7E57C2)
+
+rsiMAColor = color.green
+
+bool isBroken = false
+numberOfTimesInRange = 0
+// Get the longest current streak of bars in between bands
+// Check if current bar is in Range
+// isBroken var
+    // Checks if streak is not broken and will add to counter
+
+// Counter adds if streak is not broken    
+// If it is look back until u reach a point in time where it is not
+    // Count the number of bars until
+
+// Make sure value is above 0
+
+// Plot the counter
+int rsiCoutner = 0
+while not isBroken
+    if((rsiMA[rsiCoutner]>rsiLowerBandValue) and (rsiMA[rsiCoutner] < rsiUpperBandValue))
+        numberOfTimesInRange += 1
+        rsiCoutner += 1
+    else
+        isBroken:= true
+
+smoothedPlot = ta.ema(numberOfTimesInRange, smoothingInput)
+
+rsiColor = color.from_gradient(smoothedPlot, 0, thresholdLine*2, color.blue, color.red)
+
+
+
+// plot(numberOfTimesInRange, "RSI Counter", color=rsiColor)
+threshold = hline(thresholdLine, "Threshold", color=color.new(#787B86, 50))
+plot(smoothedPlot, title = "RSI Counter", color = rsiColor)
+h2 = hline(0)
