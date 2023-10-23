@@ -6,16 +6,15 @@ strategy("Scalping Bot 1.0", overlay=true)
 supertrendGroup = "Super Trend"
 tradingSession = input.session("1300-1700", "Session")
 
-
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//////////////////////////// S U P E R T R E N D        I N I T I A L I Z A T I O N ////////////////////////////
+//////////////////////////// S U P E R T R E N D    I N I T I A L I Z A T I O N ////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+HeikinA = input(false, title='Use Heikin Ashi')
 
-
-src = input(close, "Super Trned Source input", group = supertrendGroup)
-
+Price = input(open, "Super Trned Source input", group = supertrendGroup)
+src = HeikinA ? request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, Price, lookahead=barmerge.lookahead_off) : Price
+// src := request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, src, lookahead=barmerge.lookahead_off)
 // Supertrend 1
 atrPeriod1 = input(10, "ATR1 Length", inline = "3", group = supertrendGroup)
 factor1 = input.float(1.5, "Factor1", step = 0.1, inline = "3", group = supertrendGroup)
@@ -60,10 +59,8 @@ else
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//////////////////////////////// H U L L        S U I T E        A V E R A G E  ////////////////////////////////
+//////////////////////////////// H U L L    S U I T E    A V E R A G E  ////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
 
 HMAGroup = "HMA"
 Hsrc = input(close, title="Hull Source", group = HMAGroup)
@@ -83,30 +80,64 @@ plot(MHULL, title="MHULL", color=hullColor, linewidth=HthicknesSwitch)
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//////////////////////////////// L A G U E R R E        F I L T E R ////////////////////////////////////////////
+//////////////////////////////// L A G U E R R E    F I L T E R ////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
 
-Lsrc = input(hl2, "Laguerre Source")
-Lalpha = input.float(0.1, "Alpha", step = 0.01)
-gamma = 1 - Lalpha
-var float L0 = na
-L0 := na(L0[1]) ? (1 - gamma) * src + gamma * nz(L0[1]) : (1 - gamma) * src + gamma * L0[1]
-var float L1 = na
-L1 := na(L1[1]) ? -gamma * L0 + nz(L0[1]) + gamma * nz(L1[1]) : -gamma * L0 + L0[1] + gamma * L1[1]
-var float L2 = na
-L2 := na(L2[1]) ? -gamma * L1 + nz(L1[1]) + gamma * nz(L2[1]) : -gamma * L1 + L1[1] + gamma * L2[1]
-var float L3 = na
-L3 := na(L3[1]) ? -gamma * L2 + nz(L2[1]) + gamma * nz(L3[1]) : -gamma * L2 + L2[1] + gamma * L3[1]
-LagF = (L0 + 2 * L1 + 2 * L2 + L3) / 6
-LaguerreDirection = (LagF > LagF[1])
-Color = LaguerreDirection ? color.green : color.red
-plot(LagF, title="LagF", linewidth=2, color=Color, transp=0)
-
+// Lsrc = input(hl2, "Laguerre Source")
+// Lalpha = input.float(0.1, "Alpha", step = 0.01)
+// gamma = 1 - Lalpha
+// var float L0 = na
+// L0 := na(L0[1]) ? (1 - gamma) * src + gamma * nz(L0[1]) : (1 - gamma) * src + gamma * L0[1]
+// var float L1 = na
+// L1 := na(L1[1]) ? -gamma * L0 + nz(L0[1]) + gamma * nz(L1[1]) : -gamma * L0 + L0[1] + gamma * L1[1]
+// var float L2 = na
+// L2 := na(L2[1]) ? -gamma * L1 + nz(L1[1]) + gamma * nz(L2[1]) : -gamma * L1 + L1[1] + gamma * L2[1]
+// var float L3 = na
+// L3 := na(L3[1]) ? -gamma * L2 + nz(L2[1]) + gamma * nz(L3[1]) : -gamma * L2 + L2[1] + gamma * L3[1]
+// LagF = (L0 + 2 * L1 + 2 * L2 + L3) / 6
+// LaguerreDirection = (LagF > LagF[1])
+// Color = LaguerreDirection ? color.green : color.red
+// plot(LagF, title="LagF", linewidth=2, color=Color, transp=0)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////// P O S I T I O N    L O G I C ////////////////////////////////////////
+////////////////////////////////// R A N G E    I D E N T I F I E R/////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+RangeGroup = "RSI SETTINGS"
+
+bool isRanging = false
+RSIma(source, length, type) =>
+    switch type
+        "SMA" => ta.sma(source, length)
+        "EMA" => ta.ema(source, length)
+        "SMMA (RMA)" => ta.rma(source, length)
+        "WMA" => ta.wma(source, length)
+        "VWMA" => ta.vwma(source, length)
+rsiLengthInput = input.int(37, minval=1, title="RSI Length", group=RangeGroup, inline = "1")
+rsiSourceInput = input.source(close, "Source", group=RangeGroup, inline = "1")
+maTypeInput = input.string("EMA", title="MA Type", options=["SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group=RangeGroup, inline = "2")
+maLengthInput = input.int(38, title="MA Length", group=RangeGroup, inline = "2")
+rsiLookback = input.int(15, title = "Look Back Period", group=RangeGroup, inline = "3")
+rsiSpread = input.int(4, title = "RSI Spread", group=RangeGroup, inline = "3")
+rsiUpperBandValue = 50+rsiSpread
+rsiLowerBandValue = 50-rsiSpread
+
+up = ta.rma(math.max(ta.change(rsiSourceInput), 0), rsiLengthInput)
+down = ta.rma(-math.min(ta.change(rsiSourceInput), 0), rsiLengthInput)
+rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+rsiMA = RSIma(rsi, maLengthInput, maTypeInput)
+
+numberOfTimesInRange = 0
+
+for i = 0 to rsiLookback
+    if(rsiMA[i] < rsiUpperBandValue and rsiMA[i] > rsiLowerBandValue)
+        numberOfTimesInRange := numberOfTimesInRange + 1
+
+if(numberOfTimesInRange >= rsiLookback)
+    isRanging := true
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////// P O S I T I O N    L O G I C /////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 buy = false
@@ -114,10 +145,9 @@ sell = false
 exitOut = false
 // isTrending = ta.tr(true) > lowVolatility
 
-
 // Is tradingSession
 
-canTrade = time(timeframe.period, tradingSession) and directionIsSame 
+canTrade = time(timeframe.period, tradingSession) and directionIsSame and not isRanging
 
 bothSame = if directionIsSame and direction1 < 0 and hullDirection
     true
@@ -132,15 +162,16 @@ if(canTrade and bothSame) // This logic needs to be fixed
         buy := true
     else if(direction1>0 )
         sell := true
-else
+else        
     exitOut := true
-
-
+    
+// Current issue: it exits out as soon as it enters a range
+// But rather it should be that i t should not enter in a range but can hold in a range
+// modify this so that it checks if there is a position entered, and only exit once the stoploss has been HthicknesSwitch
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////// T R A D E        S I Z E        L O G I C //////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
 
 
 // Calculate the number of lot
@@ -148,7 +179,7 @@ accountInfoGroup = "Account Info"
 
 
 account_balance = input(10000, "Account Balance", group = accountInfoGroup)
-risk_percentage = input.float(1, "Risk Percentage", group = accountInfoGroup)
+float  risk_percentage = input.float(1, "Risk Percentage", group = accountInfoGroup)
 
 risk_percentage := risk_percentage/100
 float stopLossDistance = na
