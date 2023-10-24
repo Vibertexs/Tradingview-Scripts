@@ -74,6 +74,7 @@ HULL = _hull
 MHULL = HULL[0]
 hullDirection = (HULL > HULL[2])
 
+// if hull direction is true means that it is going up otherwise it is down
 hullColor = (hullDirection ? #00ff00 : #ff0000)
 plot(MHULL, title="MHULL", color=hullColor, linewidth=HthicknesSwitch)
 
@@ -140,31 +141,134 @@ if(numberOfTimesInRange >= rsiLookback)
 ///////////////////////////////// P O S I T I O N    L O G I C /////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-buy = false
-sell = false
-exitOut = false
+// Lets rewrite the entire code
+
+// Create buy sell variables
+bool buy = false
+bool sell = false
+bool exitOut = false
+
+// logic variables
+
+// isInTradingSession checks if time is in between 
+bool isInTradingSession = time(timeframe.period, tradingSession)
+
+// bool isRanging // Checks if rsi is ranging; this is already definded
+
+// Checks if hullIsAlgo going up or down
+bool hullGoingUp = hullDirection
+bool hullGoingDown = not hullDirection
+
+// Checks if super trend is going up or down; direction < 0 means up
+bool supertrendGoingUp = (directionIsSame) and (direction1 < 0)
+bool supertrendGoingDown = (directionIsSame) and (direction1 > 0)
+
+
+// Only place a buy if the last bar was not a buy
+
+
+// You can place a buy/sell if 
+    // 1. Supertrend Directions are all the same
+    // 2. HMA Direction is the same as Supertrend direction
+    // 3. RSI is not currently ranging
+
+// You can only exit out if
+    // The supertrend direction changes or tradingSession Ends
+    // If directionIsSame[1] but not for directionIsSame[0]
+
+
+// Logic flow:
+// if is in trading session --> super trend direction is same --> if the last one was not also a buy/sell and its not continueing --> check if you can buy/sell
+// rewrite everything
+
+if not isInTradingSession  // If it is not in trading session, exit out of all positions
+    buy     := false
+    sell    := false
+    exitOut := true
+else if not directionIsSame // If the direction is no longer the same, exit out
+    buy     := false
+    sell    := false
+    exitOut := true
+else if (buy[1] and supertrendGoingUp and directionIsSame) // if direction is the same, going up and the last one was a buy, keep buy 
+    buy     := true
+    sell    := false
+    exitOut := false
+else if (sell[1] and supertrendGoingDown and directionIsSame) // if direction is the same, going down and the last one was a sell, keep sell
+    buy     := false
+    sell    := true
+    exitOut := false
+else if (not buy[1] and supertrendGoingUp and hullGoingUp and (not isRanging) and directionIsSame) // if last one was not a buy and everything is going up and not ranigng buy
+    buy     := true
+    sell    := false
+    exitOut := false
+else if (not sell[1] and supertrendGoingDown and hullGoingDown and (not isRanging) and directionIsSame) // if last one was not a sell and everything is going down and not ranigng sell
+    buy     := false
+    sell    := true
+    exitOut := false
+else
+    buy     := false
+    sell    := false
+    exitOut := true
+
+
+// if (supertrendGoingUp and hullGoingUp and not isRanging) // If everything is all going up and is not ranging
+//     buy := true
+// else if (supertrendGoingDown and hullGoingDown and not isRanging) // If everything is all going down and is not ranging
+//     sell := true
+// else if (not directionIsSame) // this means everything else is false. make sure to do if the last candle was a buy and and direction is still same, then keep buy true
+//     exitOut := true
+// else if (buy[1] and supertrendGoingUp) // if the last one was a buy and the direction is still the same keep the buy
+//     buy := true
+// else if (sell[1] and supertrendGoingDown) // if the last candle was a sell and the direction is still the same, keep the buy
+//     sell := true
+
+// // Do a hard set exit
+// if not isInTradingSession
+//     buy := false
+//     sell := false
+//     exitOut := true
+// else if (not directionIsSame)
+//     buy := false
+//     sell := false
+//     exitOut := true
+
+
+
+
+
 // isTrending = ta.tr(true) > lowVolatility
 
 // Is tradingSession
 
-canTrade = time(timeframe.period, tradingSession) and directionIsSame and not isRanging
-
-bothSame = if directionIsSame and direction1 < 0 and hullDirection
-    true
-else if directionIsSame and direction1 > 0 and not hullDirection
-    true
-else
-    false
+// canTrade = time(timeframe.period, tradingSession) and directionIsSame and not isRanging
 
 
-if(canTrade and bothSame) // This logic needs to be fixed
-    if(direction1<0)
-        buy := true
-    else if(direction1>0 )
-        sell := true
-else        
-    exitOut := true
-    
+///////////////////// U N C O M M E N T    T H I S    I F    I T    D O E S N T    W O R K
+// canTrade = time(timeframe.period, tradingSession) and directionIsSame
+
+
+// bothSame = if directionIsSame and direction1 < 0 and hullDirection
+//     true
+// else if directionIsSame and direction1 > 0 and not hullDirection
+//     true
+// else
+//     false
+
+
+// if(canTrade and bothSame) // This logic needs to be fixed
+//     if(direction1<0)
+//         if(not isRanging)
+//             buy := true
+//         else if(buy[1])
+//             buy := true
+//     else if(direction1>0 )
+//         if(not isRanging)
+//             sell := true
+//         else if(sell[1])
+//             sell := true
+// else        
+//     exitOut := true
+
 // Current issue: it exits out as soon as it enters a range
 // But rather it should be that i t should not enter in a range but can hold in a range
 // modify this so that it checks if there is a position entered, and only exit once the stoploss has been HthicknesSwitch
@@ -201,8 +305,19 @@ number_of_lots = math.abs(account_balance*risk_percentage / (stopLossDistance))
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Plot Labels
-plotcandle(open, high, low, close, title='Bar', color = buy ? color.green : sell ? color.red : exitOut ? color.gray : na, wickcolor= buy ? color.green : sell ? color.red : exitOut ? color.gray : na)
+barColor = if(buy)
+    color.green
+else if(sell)
+    color.red
+else if(isRanging)
+    color.purple
+else
+    color.gray
 
+
+plotcandle(open, high, low, close, title='Bar', color = barColor, wickcolor= barColor)
+
+// If the current one says to buy but the last one wasnt a buy, that means this is the first buy signal
 plotshape(buy and not buy[1], style = shape.labelup, location = location.belowbar, 
          color = color.green, size = size.small, text = "B", textcolor = color.white)
 plotshape(sell and not sell[1], style = shape.labeldown, location = location.abovebar, 
@@ -210,10 +325,8 @@ plotshape(sell and not sell[1], style = shape.labeldown, location = location.abo
 plotshape(exitOut and not exitOut[1], style = shape.labeldown, location = location.abovebar, 
          color = color.yellow, size = size.small, text = "E", textcolor = color.white)
 
-
 strategy.entry("Long", strategy.long, number_of_lots, when = buy)
 strategy.entry("Short", strategy.short, number_of_lots, when = sell)
 
 strategy.close("Long", when = sell or exitOut)
 strategy.close("Short", when = buy or exitOut)
-
