@@ -128,12 +128,6 @@ factor3 = input.float(3.0, "Factor3", step = 0.1, inline = "5", group = supertre
 upTrend3 = plot(direction3 < 0 ? supertrend3 : na, "Up Trend", color = color.green, style=plot.style_linebr, display = display.none)
 downTrend3 = plot(direction3 < 0? na : supertrend3, "Down Trend", color = color.red, style=plot.style_linebr, display = display.none)
 
-
-direction2:= direction1
-direction3:= direction1
-atrPeriod2 := atrPeriod1
-atrPeriod3 := atrPeriod1
-
 directionIsSame = if ((direction1 == direction2) and (direction2  == direction3) and (direction3  == direction1))
     true
 else
