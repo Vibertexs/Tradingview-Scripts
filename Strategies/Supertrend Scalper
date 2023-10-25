@@ -1,14 +1,97 @@
 //@version=5
-// indicator("Scalping Bot 1.0", overlay=true, timeframe="", timeframe_gaps=true)
 strategy("Scalping Bot 1.0", overlay=true)
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////// S T R A T E G Y    G U I D E ///////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// # Scalping Bot 1.0 Strategy
 
-supertrendGroup = "Super Trend"
-tradingSession = input.session("1300-1700", "Session")
+// This TradingView Pine Script strategy, is designed for scalping in financial markets specifically only XAUUSD. 
+// With the goal in mind of easily passing common prop firm challenges relatively fast. 
+
+// It combines multiple technical indicators, including Super Trend, Hull Moving Average (HMA), 
+// and RSI to generate buy and sell signals.
+
+// ## Strategy Overview
+
+// The Scalping Bot 1.0 strategy employs a combination of technical indicators and trading rules to determine 
+// the optimal entry and exit points for scalping trades. Here's an overview of the key components of the strategy:
+
+// ### Super Trend
+// - The Super Trend indicator is used to identify the short term trend direction.
+// - Three Super Trend indicators with different settings are used for less but more accurate signals
+
+// ### Hull Moving Average (HMA)
+// - The Hull Moving Average is utilized to provide additional long term trend direction confirmation.
+// - The HMA is calculated based on user-defined parameters.
+
+// ### RSI Range Identifier
+// - Commonly the RSI is used for over bought or over sold signals
+// - However, the RSI is a great tool for determining trend direction
+// - This means that The RSI can be used to identify ranging market conditions.
+// - If the RSI remains within a defined range, the market is considered to be ranging.
+
+// ### Position Logic
+// - The strategy employs a set of rules to determine whether to enter a buy or sell position.
+// - Entry conditions are based on the other indicators. Exits only happen when supertrends do not allign
+
+// ### Trade Size Logic
+// - The trade size is calculated based on the account balance and user-defined risk percentage.
+// - The strategy aims to control the risk by determining the number of lots to trade.
+
+// ## Installation and Usage
+// 1. Copy the entire script (from `//@version=5` to the end) and paste it into TradingView's Pine Script editor.
+// 2. Configure the script's input settings as desired.
+// 3. Apply the strategy to a chart.
+// 4. Monitor the chart for buy and sell signals based on the strategy's conditions.
+// 5. Execute trades manually or automate them based on the generated signals.
+
+// ## Parameters
+// - The strategy allows users to customize various input parameters, including Super Trend settings, HMA parameters, RSI settings, and risk management.
+// - Adjust these parameters according to your trading preferences and risk tolerance.
+
+// ## Important Notes
+// - The Scalping Bot 1.0 strategy is designed for educational and experimental purposes. Trading involves risks, and it's important to thoroughly test the strategy on historical data before using it in live trading.
+// - Always use proper risk management and consider setting stop-loss and take-profit orders for your trades.
+
+// ## License
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+
+// ## Feedback and Contributions
+// If you have feedback or improvements to suggest for this strategy, please feel free to create issues or pull requests on the GitHub repository linked below.
+
+// ## Author
+// © Vibertex
+
+// ## Disclaimer
+// This serves as a guide to understanding the Scalping Bot 1.0 strategy. By using the strategy, you acknowledge that you understand and accept the associated risks.
+// ---
+// For more information, visit the [GitHub repository](https://github.com/Vibertexs/Tradingview-Scripts) for this strategy.
+// Happy trading!
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////C U R R E N T    P R O B L E M S ///////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Do research on strategy.current profits
+
+// Based on account size, do a tp
+
+// Chekc if lot size calculations are working
+
+// Get user input for what RRR you want a specific % of your trade closed
+
+// Once this works make it so that you can do up to 3 custom TP
+
+// Plot the profit gained from it on close to see if it works
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////// S U P E R T R E N D    I N I T I A L I Z A T I O N ////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+tradingSession = input.session("1300-1700", "Session")
+
+supertrendGroup = "Super Trend"
 
 HeikinA = input(false, title='Use Heikin Ashi')
 
@@ -56,8 +139,6 @@ directionIsSame = if ((direction1 == direction2) and (direction2  == direction3)
 else
     false
 
-
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////// H U L L    S U I T E    A V E R A G E  ////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -78,14 +159,11 @@ hullDirection = (HULL > HULL[2])
 hullColor = (hullDirection ? #00ff00 : #ff0000)
 plot(MHULL, title="MHULL", color=hullColor, linewidth=HthicknesSwitch)
 
-
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////// L A G U E R R E    F I L T E R ////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-
-
+// Leaving this in here in case i decide to switch in the future
 // Lsrc = input(hl2, "Laguerre Source")
 // Lalpha = input.float(0.1, "Alpha", step = 0.01)
 // gamma = 1 - Lalpha
@@ -105,6 +183,7 @@ plot(MHULL, title="MHULL", color=hullColor, linewidth=HthicknesSwitch)
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////// R A N G E    I D E N T I F I E R/////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 RangeGroup = "RSI SETTINGS"
 
 bool isRanging = false
@@ -137,11 +216,24 @@ for i = 0 to rsiLookback
 
 if(numberOfTimesInRange >= rsiLookback)
     isRanging := true
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////// P O S I T I O N    L O G I C /////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Lets rewrite the entire code
+// Only place a buy if the last bar was not a buy
+
+
+// You can place a buy/sell if 
+    // 1. Supertrend Directions are all the same
+    // 2. HMA Direction is the same as Supertrend direction
+    // 3. RSI is not currently ranging
+
+// You can only exit out if
+    // The supertrend direction changes or tradingSession Ends
+    // If directionIsSame[1] but not for directionIsSame[0]
+
 
 // Create buy sell variables
 bool buy = false
@@ -162,20 +254,6 @@ bool hullGoingDown = not hullDirection
 // Checks if super trend is going up or down; direction < 0 means up
 bool supertrendGoingUp = (directionIsSame) and (direction1 < 0)
 bool supertrendGoingDown = (directionIsSame) and (direction1 > 0)
-
-
-// Only place a buy if the last bar was not a buy
-
-
-// You can place a buy/sell if 
-    // 1. Supertrend Directions are all the same
-    // 2. HMA Direction is the same as Supertrend direction
-    // 3. RSI is not currently ranging
-
-// You can only exit out if
-    // The supertrend direction changes or tradingSession Ends
-    // If directionIsSame[1] but not for directionIsSame[0]
-
 
 // Logic flow:
 // if is in trading session --> super trend direction is same --> if the last one was not also a buy/sell and its not continueing --> check if you can buy/sell
@@ -205,73 +283,10 @@ else if (not sell[1] and supertrendGoingDown and hullGoingDown and (not isRangin
     buy     := false
     sell    := true
     exitOut := false
-else
+else    // if unsure of conditions, just exit out
     buy     := false
     sell    := false
     exitOut := true
-
-
-// if (supertrendGoingUp and hullGoingUp and not isRanging) // If everything is all going up and is not ranging
-//     buy := true
-// else if (supertrendGoingDown and hullGoingDown and not isRanging) // If everything is all going down and is not ranging
-//     sell := true
-// else if (not directionIsSame) // this means everything else is false. make sure to do if the last candle was a buy and and direction is still same, then keep buy true
-//     exitOut := true
-// else if (buy[1] and supertrendGoingUp) // if the last one was a buy and the direction is still the same keep the buy
-//     buy := true
-// else if (sell[1] and supertrendGoingDown) // if the last candle was a sell and the direction is still the same, keep the buy
-//     sell := true
-
-// // Do a hard set exit
-// if not isInTradingSession
-//     buy := false
-//     sell := false
-//     exitOut := true
-// else if (not directionIsSame)
-//     buy := false
-//     sell := false
-//     exitOut := true
-
-
-
-
-
-// isTrending = ta.tr(true) > lowVolatility
-
-// Is tradingSession
-
-// canTrade = time(timeframe.period, tradingSession) and directionIsSame and not isRanging
-
-
-///////////////////// U N C O M M E N T    T H I S    I F    I T    D O E S N T    W O R K
-// canTrade = time(timeframe.period, tradingSession) and directionIsSame
-
-
-// bothSame = if directionIsSame and direction1 < 0 and hullDirection
-//     true
-// else if directionIsSame and direction1 > 0 and not hullDirection
-//     true
-// else
-//     false
-
-
-// if(canTrade and bothSame) // This logic needs to be fixed
-//     if(direction1<0)
-//         if(not isRanging)
-//             buy := true
-//         else if(buy[1])
-//             buy := true
-//     else if(direction1>0 )
-//         if(not isRanging)
-//             sell := true
-//         else if(sell[1])
-//             sell := true
-// else        
-//     exitOut := true
-
-// Current issue: it exits out as soon as it enters a range
-// But rather it should be that i t should not enter in a range but can hold in a range
-// modify this so that it checks if there is a position entered, and only exit once the stoploss has been HthicknesSwitch
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////// T R A D E        S I Z E        L O G I C //////////////////////////////////
@@ -296,12 +311,12 @@ if(sell == true)
 
 number_of_lots = math.abs(account_balance*risk_percentage / (stopLossDistance))
 
+
 // if bar_index % 1 == 0
 //     label.new(bar_index, na, "Number of pips = " + str.tostring(math.abs(stopLossDistance), format.mintick) + "\n🠇", yloc = yloc.abovebar, style = label.style_none, textcolor = color.white, size = size.normal)
 
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////// P L O T        G R A P H S ////////////////////////////////////////
+//////////////////////////////////////// P L O T    G R A P H S ////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Plot Labels
@@ -330,3 +345,7 @@ strategy.entry("Short", strategy.short, number_of_lots, when = sell)
 
 strategy.close("Long", when = sell or exitOut)
 strategy.close("Short", when = buy or exitOut)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////// E N D    O F    C O D E /////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
