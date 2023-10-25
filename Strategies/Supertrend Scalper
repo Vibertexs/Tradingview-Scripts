@@ -4,6 +4,7 @@ strategy("Scalping Bot 1.0", overlay=true)
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////// S T R A T E G Y    G U I D E ///////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // # Scalping Bot 1.0 Strategy
 
 // This TradingView Pine Script strategy, is designed for scalping in financial markets specifically only XAUUSD. 
@@ -68,26 +69,28 @@ strategy("Scalping Bot 1.0", overlay=true)
 // ---
 // For more information, visit the [GitHub repository](https://github.com/Vibertexs/Tradingview-Scripts) for this strategy.
 // Happy trading!
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////C U R R E N T    P R O B L E M S ///////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Do research on strategy.current profits
+// Do research on strategy.current profits DONE ✅ 
 
-// Based on account size, do a tp
+// Based on account size, do a tp ✅
 
-// Chekc if lot size calculations are working
+// Chekc if lot size calculations are working ✅
 
-// Get user input for what RRR you want a specific % of your trade closed
+// Get user input for what RRR you want a specific % of your trade closed ✅
 
-// Once this works make it so that you can do up to 3 custom TP
+// Make it so that it doesnt take another trade when you get your tp filled
+
+// Once this works make it so that you can do up to 3 custom TP 
 
 // Plot the profit gained from it on close to see if it works
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////// S U P E R T R E N D    I N I T I A L I Z A T I O N ////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
 
 tradingSession = input.session("1300-1700", "Session")
 
@@ -286,7 +289,6 @@ else    // if unsure of conditions, just exit out
 /////////////////////////////////// T R A D E        S I Z E        L O G I C //////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-
 // Calculate the number of lot
 accountInfoGroup = "Account Info"
 
@@ -310,6 +312,29 @@ number_of_lots = math.abs(account_balance*risk_percentage / (stopLossDistance))
 //     label.new(bar_index, na, "Number of pips = " + str.tostring(math.abs(stopLossDistance), format.mintick) + "\n🠇", yloc = yloc.abovebar, style = label.style_none, textcolor = color.white, size = size.normal)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////// T A K E    P R O F I T  /  S T O P    L O S S //////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// At a certain RRR take profit and close a portion of the trade
+TP = input.int(5, minval=1, title="RRR TP", group = accountInfoGroup)
+
+currentRRR = 0.00
+standardRRR = account_balance * risk_percentage
+
+// Get the open profit. get the 
+// how do i handle this with varying risk
+if (strategy.openprofit > 0)
+    currentRRR := strategy.openprofit / standardRRR
+
+if (currentRRR >= TP)
+    exitOut := true
+
+
+// Output the current RRR
+if (bar_index % 1 == 0) and not exitOut
+    label.new(bar_index, na, "CR = " + str.tostring(currentRRR), yloc = yloc.abovebar, style = label.style_none, textcolor = color.white, size = size.normal)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////// P L O T    G R A P H S ////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -323,7 +348,6 @@ else if(isRanging)
 else
     color.gray
 
-
 plotcandle(open, high, low, close, title='Bar', color = barColor, wickcolor= barColor)
 
 // If the current one says to buy but the last one wasnt a buy, that means this is the first buy signal
@@ -333,6 +357,10 @@ plotshape(sell and not sell[1], style = shape.labeldown, location = location.abo
          color = color.red, size = size.small, text = "S", textcolor = color.white)
 plotshape(exitOut and not exitOut[1], style = shape.labeldown, location = location.abovebar, 
          color = color.yellow, size = size.small, text = "E", textcolor = color.white)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////// S T R A T E G Y    M A N A G E M E N T ////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 strategy.entry("Long", strategy.long, number_of_lots, when = buy)
 strategy.entry("Short", strategy.short, number_of_lots, when = sell)
