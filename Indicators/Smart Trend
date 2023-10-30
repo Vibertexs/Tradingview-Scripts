@@ -1,0 +1,67 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © vibertexyt
+
+//@version=5
+indicator("SmartTrend", overlay=true, timeframe="", timeframe_gaps=true)
+import TradingView/ta/5
+
+atr1 = input(10, "ATR Length")
+float factor1 = input.float(3.0, "Factor", step = 0.1)
+atrMulti = input(2, "ATR Multiplier")
+float FactorMulti = input.float(2.0, "Factor Adder", step = 0.1)
+
+[supertrend1, direction1] = ta.supertrend(factor1, atr1)
+
+upTrend1 = plot(direction1 < 0 ? supertrend1 : na, "Up Trend", color = color.green, style=plot.style_linebr, display = display.none, editable = false)
+downTrend1 = plot(direction1 < 0? na : supertrend1, "Down Trend", color = color.red, style=plot.style_linebr, display = display.none, editable = false)
+
+
+// Second Chart
+atr2 = atr1 * atrMulti
+float factor2 = factor1 + FactorMulti
+
+[supertrend2, direction2] = ta.supertrend(factor2, atr2)
+
+
+upTrend2 = plot(direction2 < 0 ? supertrend2 : na, "Up Trend", color = color.green, style=plot.style_linebr, display = display.none, editable = false)
+downTrend2 = plot(direction2 < 0? na : supertrend2, "Down Trend", color = color.red, style=plot.style_linebr, display = display.none, editable = false)
+
+// Third Chart
+
+atr3 = atr2 * atrMulti
+float factor3 = factor2 + FactorMulti
+
+[supertrend3, direction3] = ta.supertrend(factor3, atr3)
+
+upTrend3 = plot(direction3 < 0 ? supertrend3 : na, "Up Trend", color = color.green, style=plot.style_linebr, display = display.none, editable = false)
+downTrend3 = plot(direction3 < 0? na : supertrend3, "Down Trend", color = color.red, style=plot.style_linebr, display = display.none, editable = false)
+
+
+// Display Supertrend
+displayAtr = (atr1 + atr2) / 2
+displayFactor = (factor1 + factor2) / 2
+
+[ supertrendD, directionD] = ta.supertrend(displayFactor,displayAtr,true)
+
+bodyMiddle = plot(barstate.isfirst ? na : (open + close) / 2, "Body Middle",display = display.none, editable = false)
+
+bool same = false
+bool up = false
+bool down = false
+if (direction1 == direction2  and direction1 == direction3 and direction2 == direction3)
+    same := true
+
+if (same and direction1 < 0)
+    up := true
+else if (same and direction1 > 0)
+    down := true
+
+
+
+displayUp = plot(up ? supertrendD : na, "Up Trend", color = color.rgb(6, 214, 160), style=plot.style_linebr, linewidth = 2)
+displayDown = plot(down ? supertrendD : na, "Down Trend", color = color.rgb(255, 71, 71), style=plot.style_linebr, linewidth = 2)
+displayGray = plot((not same) ? supertrendD : na, "NA Trend" , color = color.gray, style =  plot.style_linebr, linewidth = 2)
+
+fill(bodyMiddle, displayUp,   color.new(color.rgb(6, 214, 160),    80), fillgaps = false, title = "Up Trend")
+fill(bodyMiddle, displayDown, color.new(color.rgb(255, 71, 71),    80), fillgaps = false, title = "Down Trend")
+fill(bodyMiddle, displayGray, color.new(color.gray,                80), fillgaps = false, title = "NA Trend")
