@@ -1,0 +1,259 @@
+//@version=5
+strategy("Scalping Bot 2.0", overlay=true)
+src = input(close, title="Source")
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////// S T R A T E G Y //////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// LagF will be used for long term
+// Smart trend will be used for intermediate market bias
+// Stoch RSI will be used for immediate market bias
+// Wait for smart trend and lagf to line up
+// Wait for the stoch RSI to cross a certain value and wait for a candle to be in the direction you plan on taking the trade
+// I think we might have to add a feature that only give a signal if the stoch rsi goes back into the range
+// Trade cool down, after a certain number of bars, you are given permission to enter in again
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////// L A G U E R R E F I L T E R //////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+var lagFGroup = "Laguerre Filter"
+Lalpha = input.float(0.08, "Alpha", step=0.01, group = lagFGroup)
+gamma = 1 - Lalpha
+
+var float L0 = na
+var float L1 = na
+var float L2 = na
+var float L3 = na
+var int inBarHistory = 0
+
+L0 := na(L0[1]) ? (1 - gamma) * src + gamma * nz(L0[1]) : (1 - gamma) * src + gamma * L0[1]
+L1 := na(L1[1]) ? -gamma * L0 + nz(L0[1]) + gamma * nz(L1[1]) : -gamma * L0 + L0[1] + gamma * L1[1]
+L2 := na(L2[1]) ? -gamma * L1 + nz(L1[1]) + gamma * nz(L2[1]) : -gamma * L1 + L1[1] + gamma * L2[1]
+L3 := na(L3[1]) ? -gamma * L2 + nz(L2[1]) + gamma * nz(L3[1]) : -gamma * L2 + L2[1] + gamma * L3[1]
+LagF = (L0 + 2 * L1 + 2 * L2 + L3) / 6
+
+// Laguerre direction and color
+LaguerreDirection = LagF > LagF[1]
+Color = LaguerreDirection ? color.green : color.red
+
+// User-defined threshold for bar history
+barHistoryThreshold = input.int(10, title="Bar History Threshold", minval=1, group = lagFGroup)
+
+// Check if it is range by seeing if it was inside a candle for past 'barHistoryThreshold' candles
+bool isRanging = false 
+var int numberOfTimesInRange = 0
+
+for i = 0 to barHistoryThreshold
+    if ((LagF[i] > open[i] and LagF[i] < close[i]) or (LagF[i] < open[i] and LagF[i] > close[i]))
+        isRanging:=true
+
+
+// if (numberOfTimesInRange > 0)
+//     isRanging:=true
+
+Color := isRanging ? color.gray : Color
+    
+
+
+
+// var bool inRange = 0
+// for i = 0 to barHistoryThreshold
+//     if(LagF[i] > open and LagF < close) or (LagF < open and LagF > close)
+
+
+// Tracking if Laguerre is inside the candle
+// inRange = (LagF > open and LagF < close) or (LagF < open and LagF > close)
+// inBarHistory := inRange ? 0 : inBarHistory + 1
+
+
+
+// Determine the Laguerre color based on inRange
+// finalColor = inRange ? color.gray : (LaguerreDirection ? color.green : color.red)
+
+// Plot Laguerre direction below the main chart
+
+
+
+// We will plot this later
+// plot(LagF, title="LagF", linewidth=2, color=Color, transp=0)
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////// S T O C H R S I /////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Inputs
+var stochRSIGroup = "Stochastic RSI"
+SRI_GROUP = "Stoch RSI"
+
+smoothK = input.int(3, "K", minval=1, group = stochRSIGroup)
+lengthRSI = input.int(14, "RSI Length", minval=1, group = stochRSIGroup)
+lengthStoch = input.int(14, "Stochastic Length", minval=1, group = stochRSIGroup)
+lowThreshold = input.float(20, title="Low Threshold", group = stochRSIGroup)
+highThreshold = input.float(80, title="High Threshold", group = stochRSIGroup)
+
+// Calculate Stochastic RSI
+rsi1 = ta.rsi(src, lengthRSI)
+k = ta.sma(ta.stoch(rsi1, rsi1, rsi1, lengthStoch), smoothK)
+k_prev = ta.sma(ta.stoch(rsi1[1], rsi1[1], rsi1[1], lengthStoch), smoothK) // Previous candle's k value
+
+// Determine the SRI_Bias based on thresholds
+var int SRI_Bias = 0
+SRI_Bias := k < lowThreshold ? 1 : (k > highThreshold ? -1 : 0)
+
+// Determine the color based on SRI_Bias
+colorK = SRI_Bias == 1 ? color.green : (SRI_Bias == -1 ? color.red : color.blue)
+
+// Plot the K value with conditional coloring
+plot(k, title="Stochastic RSI K", color=colorK, linewidth=2)
+
+// Check for a bullish candle (close > open) and k_prev < lowThreshold and LaguerreDirection is bullish
+isBullish = close > open
+if (k_prev < lowThreshold and isBullish and LaguerreDirection)
+    label.new(bar_index, high, text="B", color=color.green, style=label.style_label_down, textcolor=color.white, size=size.normal)
+
+// Check for a bearish candle (close < open) and k_prev > highThreshold and LaguerreDirection is bearish
+isBearish = close < open
+if (k_prev > highThreshold and isBearish and not LaguerreDirection)
+    label.new(bar_index, low, text="S", color=color.red, style=label.style_label_up, textcolor=color.white, size=size.normal)
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////// S M A R T -  T R E N D /////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+import TradingView/ta/5
+var smartTrendGroup = "Smart Trend"
+
+atr1 = input(10, "ATR Length", group = smartTrendGroup)
+float factor1 = input.float(3.0, "Factor", step = 0.1, group = smartTrendGroup)
+atrMulti = input(2, "ATR Multiplier", group = smartTrendGroup)
+float FactorMulti = input.float(2.0, "Factor Adder", step = 0.1, group = smartTrendGroup)
+
+[supertrend1, direction1] = ta.supertrend(factor1, atr1, wicks = true)
+
+upTrend1 = plot(direction1 < 0 ? supertrend1 : na, "Up Trend", color = color.green, style=plot.style_linebr, display = display.none)
+downTrend1 = plot(direction1 < 0? na : supertrend1, "Down Trend", color = color.red, style=plot.style_linebr, display = display.none)
+
+
+// Second Chart
+atr2 = atr1 * atrMulti
+float factor2 = factor1 + FactorMulti
+
+[supertrend2, direction2] = ta.supertrend(factor2, atr2)
+
+
+upTrend2 = plot(direction2 < 0 ? supertrend2 : na, "Up Trend", color = color.green, style=plot.style_linebr, display = display.none)
+downTrend2 = plot(direction2 < 0? na : supertrend2, "Down Trend", color = color.red, style=plot.style_linebr, display = display.none)
+
+// Third Chart
+
+atr3 = atr2 * atrMulti
+float factor3 = factor2 + FactorMulti
+
+[supertrend3, direction3] = ta.supertrend(factor3, atr3)
+
+upTrend3 = plot(direction3 < 0 ? supertrend3 : na, "Up Trend", color = color.green, style=plot.style_linebr, display = display.none)
+downTrend3 = plot(direction3 < 0? na : supertrend3, "Down Trend", color = color.red, style=plot.style_linebr, display = display.none)
+
+
+// Display Supertrend
+displayAtr = (atr1 + atr2 + atr1) / 3
+displayFactor = (factor1 + factor2+ factor1) / 3
+
+[ supertrendD, directionD] = ta.supertrend(displayFactor,displayAtr, wicks = true)
+
+bodyMiddle = plot(barstate.isfirst ? na : (open + close) / 2, "Body Middle",display = display.none, editable = false)
+
+bool same = false
+bool up = false
+bool down = false
+if (direction1 == direction2  and direction1 == direction3 and direction2 == direction3)
+    same := true
+
+if (same and direction1 < 0)
+    up := true
+else if (same and direction1 > 0)
+    down := true
+
+
+displayUp = plot(up ? supertrendD : na, "Up Trend", color = color.rgb(6, 214, 160), style=plot.style_linebr, linewidth = 2)
+displayDown = plot(down ? supertrendD : na, "Down Trend", color = color.rgb(255, 71, 71), style=plot.style_linebr, linewidth = 2)
+displayGray = plot((not same) ? supertrendD : na, "NA Trend" , color = color.gray, style =  plot.style_linebr, linewidth = 2)
+
+
+
+// add alert condition so that it alerts when it is red
+
+// get the direction of the super trend
+// if the direction changes then plot equal distance
+    // otherwise get the difference
+
+// is true if direction has changed
+bool changeDir = (directionD[1] != directionD[0])
+
+float candleMiddle = ((open + close) / 2)
+float trendDistance = candleMiddle - supertrendD
+float trendPreviousChange = supertrendD[1] - supertrendD[0]
+
+float otherTrend = -1.0
+if (changeDir)
+    otherTrend := trendDistance + candleMiddle
+else
+    x = otherTrend[1] - trendPreviousChange
+    if (math.abs(x-candleMiddle) > math.abs(supertrendD - candleMiddle))
+        otherTrend := otherTrend[1]
+    else
+        otherTrend := otherTrend[1] - trendPreviousChange
+
+
+// otherTrendBuy = plot(directionD < 0 ? otherTrend : na, color = color.rgb(6, 214, 160), style=plot.style_linebr, linewidth = 2)
+// otherTrendSell = plot(directionD < 0 ? na : otherTrend, color = color.rgb(255, 71, 71), style=plot.style_linebr, linewidth = 2)
+
+// otherTrendDisplay = plot(otherTrend, display = display.none, editable = false)
+
+bool validSTTrend = true
+
+
+fill(bodyMiddle, displayUp,   color.new(color.rgb(6, 214, 160),    80), fillgaps = false, title = "Up Trend")
+fill(bodyMiddle, displayDown, color.new(color.rgb(255, 71, 71),    80), fillgaps = false, title = "Down Trend")
+fill(bodyMiddle, displayGray, color.new(color.gray,                80), fillgaps = false, title = "NA Trend")
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////// L A G U E R R E    F I L T E R     C O L O R ////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// If the laguere filter is true and is up then keep color green
+
+
+// FIX THIS ISSUE
+if (not isRanging and LagF and up)
+    Color := color.green
+else if(not isRanging and not LagF and down)
+    Color := color.red
+else
+    Color := color.gray
+
+plot(LagF, title="LagF", linewidth=2, color=Color, transp=0)
+
+
+// LaguerreDirection true = up trend false = downTrend
+// isRanging = false for this to work
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// This stuff at bottom will need to be here until fully donw
+longCondition = ta.crossover(ta.sma(close, 14), ta.sma(close, 28))
+if (longCondition)
+    strategy.entry("My Long Entry Id", strategy.long)
+
+shortCondition = ta.crossunder(ta.sma(close, 14), ta.sma(close, 28))
+if (shortCondition)
+    strategy.entry("My Short Entry Id", strategy.short)
