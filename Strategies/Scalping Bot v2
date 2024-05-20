@@ -79,44 +79,7 @@ Color := isRanging ? color.gray : Color
 // We will plot this later
 // plot(LagF, title="LagF", linewidth=2, color=Color, transp=0)
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////// S T O C H R S I /////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Inputs
-var stochRSIGroup = "Stochastic RSI"
-SRI_GROUP = "Stoch RSI"
-
-smoothK = input.int(3, "K", minval=1, group = stochRSIGroup)
-lengthRSI = input.int(14, "RSI Length", minval=1, group = stochRSIGroup)
-lengthStoch = input.int(14, "Stochastic Length", minval=1, group = stochRSIGroup)
-lowThreshold = input.float(20, title="Low Threshold", group = stochRSIGroup)
-highThreshold = input.float(80, title="High Threshold", group = stochRSIGroup)
-
-// Calculate Stochastic RSI
-rsi1 = ta.rsi(src, lengthRSI)
-k = ta.sma(ta.stoch(rsi1, rsi1, rsi1, lengthStoch), smoothK)
-k_prev = ta.sma(ta.stoch(rsi1[1], rsi1[1], rsi1[1], lengthStoch), smoothK) // Previous candle's k value
-
-// Determine the SRI_Bias based on thresholds
-var int SRI_Bias = 0
-SRI_Bias := k < lowThreshold ? 1 : (k > highThreshold ? -1 : 0)
-
-// Determine the color based on SRI_Bias
-colorK = SRI_Bias == 1 ? color.green : (SRI_Bias == -1 ? color.red : color.blue)
-
-// Plot the K value with conditional coloring
-plot(k, title="Stochastic RSI K", color=colorK, linewidth=2)
-
-// Check for a bullish candle (close > open) and k_prev < lowThreshold and LaguerreDirection is bullish
-isBullish = close > open
-if (k_prev < lowThreshold and isBullish and LaguerreDirection)
-    label.new(bar_index, high, text="B", color=color.green, style=label.style_label_down, textcolor=color.white, size=size.normal)
-
-// Check for a bearish candle (close < open) and k_prev > highThreshold and LaguerreDirection is bearish
-isBearish = close < open
-if (k_prev > highThreshold and isBearish and not LaguerreDirection)
-    label.new(bar_index, low, text="S", color=color.red, style=label.style_label_up, textcolor=color.white, size=size.normal)
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -231,18 +194,81 @@ fill(bodyMiddle, displayGray, color.new(color.gray,                80), fillgaps
 
 
 // FIX THIS ISSUE
-if (not isRanging and LagF and up)
+bool linedUp = true
+if (not isRanging and (LaguerreDirection) and up)
     Color := color.green
-else if(not isRanging and not LagF and down)
+else if(not isRanging and not(LaguerreDirection) and down)
     Color := color.red
 else
+    linedUp := false
     Color := color.gray
+
+// if (isRanging == false)
+//     if(LagF == true)
 
 plot(LagF, title="LagF", linewidth=2, color=Color, transp=0)
 
 
 // LaguerreDirection true = up trend false = downTrend
 // isRanging = false for this to work
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////// S T O C H R S I /////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Inputs
+var stochRSIGroup = "Stochastic RSI"
+SRI_GROUP = "Stoch RSI"
+
+smoothK = input.int(3, "K", minval=1, group = stochRSIGroup)
+lengthRSI = input.int(14, "RSI Length", minval=1, group = stochRSIGroup)
+lengthStoch = input.int(14, "Stochastic Length", minval=1, group = stochRSIGroup)
+lowThreshold = input.float(20, title="Low Threshold", group = stochRSIGroup)
+highThreshold = input.float(80, title="High Threshold", group = stochRSIGroup)
+
+// Calculate Stochastic RSI
+rsi1 = ta.rsi(src, lengthRSI)
+k = ta.sma(ta.stoch(rsi1, rsi1, rsi1, lengthStoch), smoothK)
+k_prev = ta.sma(ta.stoch(rsi1[1], rsi1[1], rsi1[1], lengthStoch), smoothK) // Previous candle's k value
+
+// Determine the SRI_Bias based on thresholds
+var int SRI_Bias = 0
+SRI_Bias := k < lowThreshold ? 1 : (k > highThreshold ? -1 : 0)
+
+// Determine the color based on SRI_Bias
+colorK = SRI_Bias == 1 ? color.green : (SRI_Bias == -1 ? color.red : color.blue)
+
+// Plot the K value with conditional coloring
+plot(k, title="Stochastic RSI K", color=colorK, linewidth=2)
+
+
+bool trendChanged = false
+// write when the trend changes
+if ((linedUp[1] and up[1]) != (linedUp and up))
+    trendChanged:=true
+    label.new(bar_index, high, text="TC", color=color.yellow, style=label.style_label_down, textcolor=color.white, size=size.normal)
+else if((linedUp[1] and down[1]) != (linedUp and down))
+    trendChanged:=true
+    label.new(bar_index, high, text="TC", color=color.yellow, style=label.style_label_down, textcolor=color.white, size=size.normal)
+// else if(linedUp[1] != linedUp)
+//     label.new(bar_index, high, text="TC", color=color.yellow, style=label.style_label_down, textcolor=color.white, size=size.normal)
+// if printing a labal set trendChanged to false
+    // If previous trend is the same as current one
+    // then set trend changed to false
+
+
+// Check for a bullish candle (close > open) and k_prev < lowThreshold and LaguerreDirection is bullish
+
+isBullish = close > open
+if (k_prev < lowThreshold and isBullish and LaguerreDirection and linedUp and up and not trendChanged)
+    label.new(bar_index, high, text="B", color=color.green, style=label.style_label_down, textcolor=color.white, size=size.normal)
+
+// Check for a bearish candle (close < open) and k_prev > highThreshold and LaguerreDirection is bearish
+isBearish = close < open
+if (k_prev > highThreshold and isBearish and not LaguerreDirection and linedUp and down and not trendChanged)
+    label.new(bar_index, low, text="S", color=color.red, style=label.style_label_up, textcolor=color.white, size=size.normal)
+
+// Add code so that it only prints one label until the trend changes or not lined up
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
