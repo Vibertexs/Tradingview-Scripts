@@ -1,10 +1,13 @@
 //@version=5
 strategy("Scalping Bot 2.0", overlay=true)
 src = input(close, title="Source")
-
+var int barRentry = input(1,"Time for Re-entry(in bars)")
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////// S T R A T E G Y //////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// ISSUES:
+// Make laguerre filter work on HTF that is user defined
 
 // LagF will be used for long term
 // Smart trend will be used for intermediate market bias
@@ -20,7 +23,13 @@ src = input(close, title="Source")
 
 var lagFGroup = "Laguerre Filter"
 Lalpha = input.float(0.08, "Alpha", step=0.01, group = lagFGroup)
+lagFTF = input.timeframe("D", "Laguerre Filter Timeframe", group=lagFGroup) // User-defined higher timeframe
+// Get higher timeframe data
+htf_src = request.security(syminfo.tickerid, lagFTF, close)
+    
+
 gamma = 1 - Lalpha
+
 
 var float L0 = na
 var float L1 = na
@@ -28,7 +37,7 @@ var float L2 = na
 var float L3 = na
 var int inBarHistory = 0
 
-L0 := na(L0[1]) ? (1 - gamma) * src + gamma * nz(L0[1]) : (1 - gamma) * src + gamma * L0[1]
+L0 := na(L0[1]) ? (1 - gamma) * htf_src + gamma * nz(L0[1]) : (1 - gamma) * htf_src + gamma * L0[1]
 L1 := na(L1[1]) ? -gamma * L0 + nz(L0[1]) + gamma * nz(L1[1]) : -gamma * L0 + L0[1] + gamma * L1[1]
 L2 := na(L2[1]) ? -gamma * L1 + nz(L1[1]) + gamma * nz(L2[1]) : -gamma * L1 + L1[1] + gamma * L2[1]
 L3 := na(L3[1]) ? -gamma * L2 + nz(L2[1]) + gamma * nz(L3[1]) : -gamma * L2 + L2[1] + gamma * L3[1]
@@ -77,7 +86,7 @@ Color := isRanging ? color.gray : Color
 
 
 // We will plot this later
-// plot(LagF, title="LagF", linewidth=2, color=Color, transp=0)
+plot(LagF, title="LagF", linewidth=2, color=Color, transp=0, display = display.none)
 
 
 
@@ -128,7 +137,7 @@ displayFactor = (factor1 + factor2+ factor1) / 3
 
 [ supertrendD, directionD] = ta.supertrend(displayFactor,displayAtr, wicks = true)
 
-bodyMiddle = plot(barstate.isfirst ? na : (open + close) / 2, "Body Middle",display = display.none, editable = false)
+bodyMiddle = plot(barstate.isfirst ? na : (open + close) / 2, "Body Middle",display = display.none, editable = false, display = display.none)
 
 bool same = false
 bool up = false
@@ -142,9 +151,9 @@ else if (same and direction1 > 0)
     down := true
 
 
-displayUp = plot(up ? supertrendD : na, "Up Trend", color = color.rgb(6, 214, 160), style=plot.style_linebr, linewidth = 2)
-displayDown = plot(down ? supertrendD : na, "Down Trend", color = color.rgb(255, 71, 71), style=plot.style_linebr, linewidth = 2)
-displayGray = plot((not same) ? supertrendD : na, "NA Trend" , color = color.gray, style =  plot.style_linebr, linewidth = 2)
+displayUp = plot(up ? supertrendD : na, "Up Trend", color = color.rgb(6, 214, 160), style=plot.style_linebr, linewidth = 2, display = display.none)
+displayDown = plot(down ? supertrendD : na, "Down Trend", color = color.rgb(255, 71, 71), style=plot.style_linebr, linewidth = 2, display = display.none)
+displayGray = plot((not same) ? supertrendD : na, "NA Trend" , color = color.gray, style =  plot.style_linebr, linewidth = 2, display = display.none)
 
 
 
@@ -180,9 +189,9 @@ else
 bool validSTTrend = true
 
 
-fill(bodyMiddle, displayUp,   color.new(color.rgb(6, 214, 160),    80), fillgaps = false, title = "Up Trend")
-fill(bodyMiddle, displayDown, color.new(color.rgb(255, 71, 71),    80), fillgaps = false, title = "Down Trend")
-fill(bodyMiddle, displayGray, color.new(color.gray,                80), fillgaps = false, title = "NA Trend")
+fill(bodyMiddle, displayUp,   color.new(color.rgb(6, 214, 160),    80), fillgaps = false, title = "Up Trend", display = display.none)
+fill(bodyMiddle, displayDown, color.new(color.rgb(255, 71, 71),    80), fillgaps = false, title = "Down Trend", display = display.none)
+fill(bodyMiddle, displayGray, color.new(color.gray,                80), fillgaps = false, title = "NA Trend", display = display.none)
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -206,7 +215,7 @@ else
 // if (isRanging == false)
 //     if(LagF == true)
 
-plot(LagF, title="LagF", linewidth=2, color=Color, transp=0)
+// plot(LagF, title="LagF", linewidth=2, color=Color, transp=0)
 
 
 // LaguerreDirection true = up trend false = downTrend
@@ -239,7 +248,7 @@ SRI_Bias := k < lowThreshold ? 1 : (k > highThreshold ? -1 : 0)
 colorK = SRI_Bias == 1 ? color.green : (SRI_Bias == -1 ? color.red : color.blue)
 
 // Plot the K value with conditional coloring
-plot(k, title="Stochastic RSI K", color=colorK, linewidth=2)
+// plot(k, title="Stochastic RSI K", color=colorK, linewidth=2)
 
 
 bool trendChanged = false
@@ -256,19 +265,71 @@ else if((linedUp[1] and down[1]) != (linedUp and down))
     // If previous trend is the same as current one
     // then set trend changed to false
 
+bool canEnter = false
+bool labelPrinted = false
+bool continueSearch = true // we will continue search until there is a trendChange or ifwe find a label printed
+canEnter:=canEnter[1]
+if (trendChanged)
+    canEnter:=true
+else
+    for i = 0 to barRentry // look back an X number of times
+        if (labelPrinted[i]) // if there is a buy or sell label printed
+            canEnter:=false
+            continueSearch := false
+        else if(trendChanged)
+            continueSearch:=false
+
+if (continueSearch)
+    canEnter:=true
+
+        // if ((trendChanged[i] == true) and continueSearch)
+        //     continueSearch:=false
+        // else if(labelPrinted[i])
+        //     continueSearch:=false
+        // else 
+        //     canEnter:=true
+// 1. look back an X number of times
+// 2. if there is a buy or sell label printed
+//     i. You can not re enter
+//     ii. Stop looking because you already can not re enter
+// 3. else if there is a trend change
+//     i. Stop looking further
+// 4. If still searching
+//     i. This means that we never found a reason not to enter and we can now
+
+
+// if the previous x candles had a can enter of false, you can re eenter again
+
+
+// if (canEnter[1])
+//     canEnter:=true
 
 // Check for a bullish candle (close > open) and k_prev < lowThreshold and LaguerreDirection is bullish
 
+
 isBullish = close > open
-if (k_prev < lowThreshold and isBullish and LaguerreDirection and linedUp and up and not trendChanged)
+if (k_prev < lowThreshold and isBullish and LaguerreDirection and linedUp and up and not trendChanged and canEnter)
+    canEnter:=false
+    labelPrinted:=true
     label.new(bar_index, high, text="B", color=color.green, style=label.style_label_down, textcolor=color.white, size=size.normal)
 
 // Check for a bearish candle (close < open) and k_prev > highThreshold and LaguerreDirection is bearish
 isBearish = close < open
-if (k_prev > highThreshold and isBearish and not LaguerreDirection and linedUp and down and not trendChanged)
+if (k_prev > highThreshold and isBearish and not LaguerreDirection and linedUp and down and not trendChanged and canEnter)
+    canEnter:=false
+    labelPrinted:=true
     label.new(bar_index, low, text="S", color=color.red, style=label.style_label_up, textcolor=color.white, size=size.normal)
 
 // Add code so that it only prints one label until the trend changes or not lined up
+
+// Plot candles
+barColor = if (LaguerreDirection and up and linedUp)
+    color.green
+else if (not LaguerreDirection and linedUp and down)
+    color.red
+else
+    color.gray
+plotcandle(open, high, low, close, title='Bar', color = barColor, wickcolor= barColor)
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
