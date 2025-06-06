@@ -1,0 +1,77 @@
+//@version=5
+indicator("RSI Trend Classifier v3 (Stable)", overlay=false, precision=2)
+
+// === INPUTS ===
+rsiLen     = input.int(21, title="RSI Length (Faster)")
+zemaLen    = input.int(21, title="ZEMA Length (Faster)")
+zemaFactor = input.float(2.5, minval=0.5, maxval=5.0, title="ZEMA Factor")
+hmaLen     = input.int(13, title="HMA Length (Faster)")
+useAdaptiveBands = input.bool(true, title="Use Adaptive Bands")
+bandGap     = input.int(4, minval=1, maxval=25, title="Band Gap from 50", tooltip="Upper = 50 + gap, Lower = 50 - gap")
+bandWidth   = input.float(0.1, minval=0.05, maxval=0.3, title="Band Width Multiplier")
+showTrendLabel = input.bool(true, title="Show Floating Trend Label")
+showFastZemaOverlay = input.bool(true, title="Show Fast ZEMA Overlay")
+
+// === FUNCTIONS ===
+zema(src, len, factor) =>
+    ema1 = ta.ema(src, len)
+    ema2 = ta.ema(ema1, len)
+    ema1 + (ema1 - ema2) * factor
+
+hma(src, len) =>
+    half = math.round(len / 2)
+    sqrtl = math.round(math.sqrt(len))
+    ta.wma(2 * ta.wma(src, half) - ta.wma(src, len), sqrtl)
+
+adaptiveVolatility(src, len) =>
+    trEma = ta.ema(ta.tr, len)
+    percentRank = ta.percentrank(trEma, len * 2)
+    percentRank / 100
+
+// === CORE CALCULATIONS ===
+rsi = ta.rsi(close, rsiLen)
+rsiZema = zema(rsi, zemaLen, zemaFactor)
+rsiHma = hma(rsiZema, hmaLen)
+fastZema = zema(rsi, 13, 2.5)  // faster overlay for confirmation
+
+// === VOLATILITY-ADAPTIVE BANDS ===
+volatility = adaptiveVolatility(close, 20)
+baseUpper = 50 + bandGap
+baseLower = 50 - bandGap
+upperBand = useAdaptiveBands ? baseUpper + (volatility * bandWidth * 100) : baseUpper
+lowerBand = useAdaptiveBands ? baseLower - (volatility * bandWidth * 100) : baseLower
+
+// === TREND DETECTION ===
+inRange = rsiZema < upperBand and rsiZema > lowerBand
+trendUp = rsiHma > rsiHma[1]
+trendDown = rsiHma < rsiHma[1]
+
+// === SIGNAL CONDITIONS ===
+bullSignal = trendUp and not inRange and rsiHma > upperBand
+bearSignal = trendDown and not inRange and rsiHma < lowerBand
+
+// === TREND STATE TRACKING ===
+var int lastTrend = 0  // 1 = bullish, -1 = bearish, 0 = neutral
+if bullSignal
+    lastTrend := 1
+else if bearSignal
+    lastTrend := -1
+
+trendColor = lastTrend == 1 ? color.lime : lastTrend == -1 ? color.red : color.gray
+
+// === PLOT MAIN TREND ===
+plot(rsiHma, title="RSI HMA", color=trendColor, linewidth=3)
+
+// === OPTIONAL FAST ZEMA OVERLAY ===
+plot(showFastZemaOverlay ? fastZema : na, title="Fast RSI ZEMA", color=color.orange, linewidth=1)
+
+// === FLOATING TREND LABEL ===
+var label trendLabel = na
+if showTrendLabel and bar_index % 20 == 0
+    label.delete(trendLabel)
+    trendText = lastTrend == 1 ? "Trend: Bullish" : lastTrend == -1 ? "Trend: Bearish" : "Trend: Neutral"
+    trendLabel := label.new(bar_index, 95, trendText, style=label.style_label_down, color=trendColor, textcolor=color.white)
+
+// === ALERTS ===
+alertcondition(bullSignal, title="Bullish Breakout Signal", message="RSI HMA trending up outside range")
+alertcondition(bearSignal, title="Bearish Breakdown Signal", message="RSI HMA trending down outside range")
