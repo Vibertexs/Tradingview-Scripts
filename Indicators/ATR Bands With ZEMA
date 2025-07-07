@@ -1,0 +1,46 @@
+//@version=5
+indicator(title="ATR Bands with ZEMA and MA-based Fill", overlay=true)
+
+// === INPUT PARAMETERS ===
+atrPeriod = input.int(14, title="ATR Period")
+atrMultiplier = input.float(2.0, title="ATR Multiplier")
+zemaBandLen = input.int(10, title="ZEMA Band Smoothing Length")
+
+trendMethod = input.string("ZEMA", title="Trend Line Method", options=["ZEMA", "EMA", "HMA", "SMA"])
+trendLen = input.int(21, title="Trend Line Length")
+trendColor = input.color(color.blue, title="Trend Line Color")
+
+// === ZEMA FUNCTION ===
+zema(src, len) =>
+    ema1 = ta.ema(src, len)
+    ema2 = ta.ema(ema1, len)
+    ema1 + (ema1 - ema2)
+
+// === ATR BANDS (ZEMA-smoothed) ===
+atr = ta.atr(atrPeriod)
+scaledATR = atr * atrMultiplier
+upperRawBand = close + scaledATR
+lowerRawBand = close - scaledATR
+
+smoothedUpperBand = zema(upperRawBand, zemaBandLen)
+smoothedLowerBand = zema(lowerRawBand, zemaBandLen)
+
+// === TREND LINE (selectable MA) ===
+trendLine =    trendMethod == "EMA" ? ta.ema(close, trendLen) :    trendMethod == "HMA" ? ta.hma(close, trendLen) :    trendMethod == "SMA" ? ta.sma(close, trendLen) :    zema(close, trendLen)
+
+// === TREND STATE BASED ON MA VS BANDS ===
+isBullish = trendLine > smoothedUpperBand
+isBearish = trendLine < smoothedLowerBand
+
+// === COLORS ===
+colorUp = color.rgb(200, 200, 255, 85)
+colorDown = color.rgb(255, 180, 220, 85)
+
+// === PLOTS ===
+p1 = plot(smoothedUpperBand, title="ZEMA Upper ATR Band", color=color.new(colorDown, 0), linewidth=2)
+p2 = plot(smoothedLowerBand, title="ZEMA Lower ATR Band", color=color.new(colorUp, 0), linewidth=2)
+plot(trendLine, title="Trend Line", color=trendColor, linewidth=2)
+
+// === FILL BASED ON TREND LINE LOCATION ===
+fill(p1, plot(hl2, title="", display=display.none), color=isBullish ? color.new(colorUp, 60) : na, title="Upper Fill to Candle")
+fill(p2, plot(hl2, title="", display=display.none), color=isBearish ? color.new(colorDown, 60) : na, title="Lower Fill to Candle")
