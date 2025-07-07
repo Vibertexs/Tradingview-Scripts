@@ -1,0 +1,65 @@
+//@version=6
+indicator(title="Chaikin Money Flow with ZEMA Cross", shorttitle="CMF+ZEMA", format=format.price, precision=2, timeframe="", timeframe_gaps=true)
+
+// ZEMA Function (Zero Lag EMA)
+zema(src, len) =>
+    ema1 = ta.ema(src, len)
+    ema2 = ta.ema(ema1, len)
+    ema1 + (ema1 - ema2)
+
+// Check for volume data
+var float cumVol = na
+cumVol := nz(cumVol) + nz(volume)
+if barstate.islast and cumVol == 0
+    runtime.error("No volume is provided by the data vendor.")
+
+// Input for CMF length
+length = input.int(20, minval=1, title="CMF Length")
+
+// Calculate Chaikin Money Flow (CMF)
+ad = high == low ? 0 : ((2 * close - low - high) / (high - low)) * volume
+mf = math.sum(ad, length) / math.sum(volume, length)
+
+// Plot CMF Line (always fully visible)
+plot(mf, color=mf >= 0 ? color.green : color.red, title="CMF", linewidth=2)
+
+// Zero line
+zeroLine = hline(0, color=color.gray, title="Zero", linestyle=hline.style_dashed)
+plot(0, color=color.gray, linewidth=1)
+
+// ZEMA Inputs
+fastLength = input.int(12, "Fast ZEMA Length", minval=1)
+slowLength = input.int(26, "Slow ZEMA Length", minval=1)
+
+// Calculate ZEMAs
+fastZEMA = zema(mf, fastLength)
+slowZEMA = zema(mf, slowLength)
+
+// Plot ZEMAs
+plot(fastZEMA, "Fast ZEMA", color=color.blue, linewidth=2)
+plot(slowZEMA, "Slow ZEMA", color=color.orange, linewidth=2)
+
+// ZEMA Crossover detection
+bullishCross = ta.crossover(fastZEMA, slowZEMA)
+bearishCross = ta.crossunder(fastZEMA, slowZEMA)
+
+// Plot crossover signals
+plotshape(bullishCross, "Bullish Cross", shape.triangleup, location.bottom, color=color.green, size=size.small)
+plotshape(bearishCross, "Bearish Cross", shape.triangledown, location.top, color=color.red, size=size.small)
+
+// Fill background on crossovers
+bgcolor(bullishCross ? color.new(color.green, 90) : na)
+bgcolor(bearishCross ? color.new(color.red, 90) : na)
+
+// Apply fading color between 0.0 and CMF line
+plot_fill_up = plot(mf >= 0 ? mf : na, color=color.new(color.green, 75), style=plot.style_line, linewidth=2)
+plot_fill_down = plot(mf >= 0 ? 0 : na, color=color.new(color.green, 75), style=plot.style_line, linewidth=2)
+fill(plot_fill_up, plot_fill_down, color=color.new(color.green, 75), title="Bullish Zone")
+
+plot_fill_up_red = plot(mf < 0 ? mf : na, color=color.new(color.red, 75), style=plot.style_line, linewidth=2)
+plot_fill_down_red = plot(mf < 0 ? 0 : na, color=color.new(color.red, 75), style=plot.style_line, linewidth=2)
+fill(plot_fill_up_red, plot_fill_down_red, color=color.new(color.red, 75), title="Bearish Zone")
+
+// Alerts
+alertcondition(bullishCross, "Bullish ZEMA Crossover", "Fast ZEMA crossed above Slow ZEMA")
+alertcondition(bearishCross, "Bearish ZEMA Crossover", "Fast ZEMA crossed below Slow ZEMA")
