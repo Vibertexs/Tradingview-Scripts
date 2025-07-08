@@ -1,4 +1,4 @@
-## 📊 NNFX-Inspired Indicator Development
+## 📊 Personal Indicators and Strategies
 
 This repository is inspired by the **No Nonsense Forex (NNFX)** algorithmic trading approach developed by VP. NNFX is a rule-based, mechanical system that removes emotion and guesswork from trading. Instead of relying on discretionary setups or popular retail patterns, it builds a complete strategy from tested components—each with a specific role.
 
@@ -52,7 +52,7 @@ I'm working to test and combine these components into a full NNFX-style bot. Eve
 
 ### 💡 Goals
 
-- Help traders **build rules-based algorithms** without emotional or inconsistent decisions  
+- Help **build rules-based algorithms** without emotional or inconsistent decisions  
 - Provide tools that integrate seamlessly into the **NNFX structure**  
 - Encourage experimentation with **less common indicators** and data-driven testing
 
@@ -61,4 +61,16 @@ I'm working to test and combine these components into a full NNFX-style bot. Eve
 ### 🤝 For You
 
 If you’re trying to build your own algo, this repo can serve as a base or inspiration. I hope the indicators and logic here help you create a strategy that’s clean, logical, and built to last.
+
+## 📬 Contact Me
+
+Have an indicator you'd like reviewed, optimized, or adapted to fit a rules-based strategy?  
+I'm open to exploring ideas, tuning existing indicators, or even building lightweight custom tools — especially if it contributes to structured, algo-friendly trading systems.
+
+Feel free to reach out:
+
+- Instagram: xmilktubx  
+
+I try to respond when possible, and I appreciate every serious suggestion or contribution.
+
 
