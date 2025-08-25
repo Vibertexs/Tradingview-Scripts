@@ -1,24 +1,73 @@
 //@version=5
-indicator(title="ATR Bands + (Dynamic Min Gap)", overlay=true)
+indicator(title="ATR Range Finder", overlay=true)
 
 // === INPUT PARAMETERS ===
-atrPeriod         = input.int(14, title="Short-Term ATR Period")
+atrPeriod         = input.int(21, title="Short-Term ATR Period")
 atrMultiplier     = input.float(2.0, title="Short-Term ATR Multiplier")
-zemaBandLen       = input.int(10, title="ZEMA Band Smoothing Length")
+zemaBandLen       = input.int(30, title="ZEMA Band Smoothing Length")
 
-trendMethod       = input.string("ZEMA", title="Trend Line Method", options=["ZEMA", "EMA", "HMA", "SMA"])
-trendLen          = input.int(21, title="Trend Line Length")
+trendMethod       = input.string("JMA", title="Trend Line Method", options=["ZEMA", "EMA", "HMA", "SMA", "JMA"])
+trendLen          = input.int(200, title="Trend Line Length")
 trendColor        = input.color(color.blue, title="Trend Line Color")
 
 enableLongATR     = input.bool(true, title="Enable Long-Term ATR Minimum Gap")
-longATRPeriod     = input.int(50, title="Long-Term ATR Period")
-longATRMultiplier = input.float(2.0, title="Long-Term ATR Multiplier")
+longATRPeriod     = input.int(200, title="Long-Term ATR Period")
+longATRMultiplier = input.float(3.0, title="Long-Term ATR Multiplier")
+
+// JMA specific inputs
+jmaPeriod = input.int(200, title="JMA Period", minval=1)
+jmaPhase  = input.int(0, title="JMA Phase", minval=-100, maxval=100, step=10)
+jmaFactor = input.float(1, title="JMA Power", minval=0.1, maxval=1.0, step=0.01)
 
 // === ZEMA FUNCTION ===
 zema(src, len) =>
     ema1 = ta.ema(src, len)
     ema2 = ta.ema(ema1, len)
     ema1 + (ema1 - ema2)
+
+// === JMA FUNCTION ===
+jurikMA(src, period, phase, factor) =>
+    var float phase_value = math.min(math.max((phase * 0.01) + 1.5, 0.5), 2.5)
+    var float beta = factor * (period - 1) / ((factor * (period - 1)) + 2)
+    var float len1 = math.max((math.log(math.sqrt(0.5 * (period - 1))) / math.log(2.0)) + 2.0, 0)
+    var float pow1 = math.max(len1 - 2.0, 0.5)
+    var float len2 = math.sqrt(0.5 * (period - 1)) * len1
+    var float pow1Reciprocal = 1.0 / pow1
+    var float avgVoltyAlpha = 2.0 / (math.max(4.0 * period, 65) + 1.0)
+    var float div = 1.0 / (10.0 + 10.0 * (math.min(math.max(period - 10, 0), 100)) / 100.0)
+
+    var float upperBand = src
+    var float lowerBand = src
+    var float ma1 = src
+    var float jma = src
+    var float vSum = 0.0
+    var float det0 = 0.0
+    var float det1 = 0.0
+    var float avgVolty = 0.0
+    var volty_array = array.new_float(11, 0.0)
+    
+    del1 = src - upperBand
+    del2 = src - lowerBand
+    volty = math.abs(del1) == math.abs(del2) ? 0 : math.max(math.abs(del1), math.abs(del2))
+    array.unshift(volty_array, volty)
+    array.pop(volty_array)
+    vSum := vSum + (volty - array.get(volty_array, 10)) * div
+    avgVolty := na(avgVolty) ? vSum : avgVolty + avgVoltyAlpha * (vSum - avgVolty)
+    rvolty = math.min(math.max(avgVolty > 0 ? volty / avgVolty : 1.0, 1.0), math.pow(len1, pow1Reciprocal))
+    pow2 = math.pow(rvolty, pow1)
+    Kv = math.pow(len2 / (len2 + 1), math.sqrt(pow2))
+    upperBand := del1 > 0 ? src : src - Kv * del1
+    lowerBand := del2 < 0 ? src : src - Kv * del2
+    alpha = math.pow(beta, pow2)
+    alphaSquared = alpha * alpha
+    oneMinusAlpha = 1.0 - alpha
+    oneMinusAlphaSquared = oneMinusAlpha * oneMinusAlpha
+    ma1 := src + (alpha * (ma1 - src))
+    det0 := (src - ma1) * (1 - beta) + beta * det0
+    ma2 = ma1 + (phase_value * det0)
+    det1 := ((ma2 - nz(jma, src)) * oneMinusAlphaSquared) + (alphaSquared * nz(det1, 0))
+    jma := nz(jma, src) + det1
+    jma
 
 // === SHORT-TERM ATR BANDS ===
 atrShort = ta.atr(atrPeriod)
@@ -43,25 +92,52 @@ lowerBandRaw = useLongBands ? lowerLong : lowerShort
 smoothedUpperBand = zema(upperBandRaw, zemaBandLen)
 smoothedLowerBand = zema(lowerBandRaw, zemaBandLen)
 
-// === TREND LINE (selectable MA) ===
-trendLine = trendMethod == "EMA" ? ta.ema(close, trendLen) :             trendMethod == "HMA" ? ta.hma(close, trendLen) :             trendMethod == "SMA" ? ta.sma(close, trendLen) :             zema(close, trendLen)
+// === CENTER AND QUARTILE LINES ===
+centerLine = (smoothedUpperBand + smoothedLowerBand) / 2
+line25 = smoothedLowerBand + 0.25 * (smoothedUpperBand - smoothedLowerBand)
+line75 = smoothedLowerBand + 0.75 * (smoothedUpperBand - smoothedLowerBand)
 
-// === TREND STATE BASED ON MA VS BANDS ===
-isBullish = trendLine > smoothedUpperBand
-isBearish = trendLine < smoothedLowerBand
+// === TREND LINE SELECTION WITH JMA OPTION ===
+trendSource = switch trendMethod
+    "EMA" => ta.ema(close, trendLen)
+    "HMA" => ta.hma(close, trendLen)
+    "SMA" => ta.sma(close, trendLen)
+    "JMA" => jurikMA(close, jmaPeriod, jmaPhase, jmaFactor)
+    => zema(close, trendLen)
 
-// === COLORS ===
-colorUp   = color.rgb(200, 200, 255, 85)
-colorDown = color.rgb(255, 180, 220, 85)
+// === PERSISTENT ORANGE CANDLE LOGIC ===
+var bool orangeSignal = false
 
-// === PLOTS ===
-p1 = plot(smoothedUpperBand, title="ZEMA Upper ATR Band", color=color.new(colorDown, 0), linewidth=2)
-p2 = plot(smoothedLowerBand, title="ZEMA Lower ATR Band", color=color.new(colorUp, 0), linewidth=2)
-plot(trendLine, title="Trend Line", color=trendColor, linewidth=2)
+closeOutside = close < line25 or close > line75
+jmaOutside   = trendSource < line25 or trendSource > line75
 
-// === FILL BASED ON TREND LINE LOCATION ===
-fill(p1, plot(hl2, title="", display=display.none), color=isBullish ? color.new(colorUp, 60) : na, title="Upper Fill to Candle")
-fill(p2, plot(hl2, title="", display=display.none), color=isBearish ? color.new(colorDown, 60) : na, title="Lower Fill to Candle")
+if (closeOutside and jmaOutside) or (not (trendSource >= line25 and trendSource <= line75) and orangeSignal)
+    orangeSignal := true
+else if trendSource >= line25 and trendSource <= line75
+    orangeSignal := false
 
-// === OPTIONAL: Plot which band is used (for debugging) ===
-bgcolor(useLongBands ? color.new(color.orange, 90) : na, title="Long ATR Band Used")
+// === FAKE CANDLES OVERLAY ===
+fakeOpen  = open
+fakeHigh  = high
+fakeLow   = low
+fakeClose = close
+
+plotcandle(orangeSignal ? fakeOpen : na,
+           orangeSignal ? fakeHigh : na,
+           orangeSignal ? fakeLow : na,
+           orangeSignal ? fakeClose : na,
+           color=color.orange, bordercolor=color.orange, wickcolor=color.orange, title="Orange Overlay Candles")
+
+plotcandle(not orangeSignal ? fakeOpen : na,
+           not orangeSignal ? fakeHigh : na,
+           not orangeSignal ? fakeLow : na,
+           not orangeSignal ? fakeClose : na,
+           color=color.purple, bordercolor=color.purple, wickcolor=color.purple, title="Purple Overlay Candles")
+
+// === PLOTS FOR BANDS AND TREND ===
+p1 = plot(smoothedUpperBand, title="ZEMA Upper ATR Band", color=color.new(color.red, 0), linewidth=2)
+p2 = plot(smoothedLowerBand, title="ZEMA Lower ATR Band", color=color.new(color.green, 0), linewidth=2)
+plot(centerLine, title="Center Line", color=color.new(color.gray, 50), linewidth=1)
+plot(line25, title="25% Line", color=color.new(color.yellow, 50), linewidth=1)
+plot(line75, title="75% Line", color=color.new(color.yellow, 50), linewidth=1)
+plot(trendSource, title="Trend Line", color=trendColor, linewidth=2)
