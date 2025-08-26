@@ -1,12 +1,12 @@
 //@version=5
-indicator('Laguerre RSI + ZEMA (MTF)', shorttitle='LaRSI+ZEMA MTF', overlay=false)
+indicator('LARSI', shorttitle='LARSI', overlay=false)
 
 // ---------- Inputs ----------
-upperBand = input.int(80, "Upper Band")
-lowerBand = input.int(20, "Lower Band")
+upperBand = input.int(70, "Upper Band")
+lowerBand = input.int(30, "Lower Band")
 src       = input.source(close, "Source")
-alpha     = input.float(title='Alpha (Laguerre)', minval=0.0, maxval=1.0, step=0.1, defval=0.2)
-zemaLen   = input.int(14, "ZEMA Length", minval=1)
+alpha     = input.float(title='Alpha (Laguerre)', minval=0.0, maxval=1.0, step=0.1, defval=0.1)
+zemaLen   = input.int(50, "ZEMA Length", minval=1)
 tf        = input.timeframe("","Timeframe for LaRSI+ZEMA")  // timeframe selector
 
 // ---------- Laguerre RSI function ----------
@@ -37,11 +37,15 @@ zema(_src, _length) =>
     ema1 + d
 
 // ---------- Get MTF series ----------
-lar_mtf = request.security(syminfo.tickerid, tf == "" ? timeframe.period : tf, laguerre_rsi(src, alpha))
+lar_mtf  = request.security(syminfo.tickerid, tf == "" ? timeframe.period : tf, laguerre_rsi(src, alpha))
 zema_mtf = request.security(syminfo.tickerid, tf == "" ? timeframe.period : tf, zema(laguerre_rsi(src, alpha), zemaLen))
 
+// ---------- State Line Logic ----------
+stateLine = zema_mtf > upperBand ? 100 : zema_mtf < lowerBand ? 0 : 50
+
 // ---------- Plots ----------
-plot(lar_mtf,  title='Laguerre RSI (100x)', color=color.blue, linewidth=2)
-plot(zema_mtf, title='ZEMA of LaRSI', color=color.orange, linewidth=2)
+plot(lar_mtf,  title='Laguerre RSI (100x)', color=color.blue, linewidth=2, display = display.none)
+plot(zema_mtf, title='ZEMA of LaRSI', color=color.orange, linewidth=2,display= display.none)
+plot(stateLine, title='State Line', color=color.rgb(238, 221, 67), linewidth=2, style=plot.style_line)
 hline(upperBand, "Upper", color=color.maroon)
 hline(lowerBand, "Lower", color=color.maroon)
