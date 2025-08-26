@@ -1,56 +1,47 @@
 //@version=5
-indicator('Laguerre RSI + JMA (fixed)', shorttitle='LaRSI+JMA', overlay=false)
+indicator('Laguerre RSI + ZEMA (MTF)', shorttitle='LaRSI+ZEMA MTF', overlay=false)
 
 // ---------- Inputs ----------
 upperBand = input.int(80, "Upper Band")
 lowerBand = input.int(20, "Lower Band")
 src       = input.source(close, "Source")
 alpha     = input.float(title='Alpha (Laguerre)', minval=0.0, maxval=1.0, step=0.1, defval=0.2)
+zemaLen   = input.int(14, "ZEMA Length", minval=1)
+tf        = input.timeframe("","Timeframe for LaRSI+ZEMA")  // timeframe selector
 
-// JMA inputs (match style you provided)
-jmaLen   = input.int(14, "JMA Length", minval=1)
-jmaPhase = input.int(50, "JMA Phase", minval=-100, maxval=100)
-jmaPow   = input.float(2.0, "JMA Power", minval=0.1, step=0.1)
+// ---------- Laguerre RSI function ----------
+laguerre_rsi(_src, _alpha) =>
+    gamma = 1 - _alpha
+    var float L0 = 0.0
+    var float L1 = 0.0
+    var float L2 = 0.0
+    var float L3 = 0.0
+    
+    L0 := (1 - gamma) * _src + gamma * nz(L0[1])
+    L1 := -gamma * L0 + nz(L0[1]) + gamma * nz(L1[1])
+    L2 := -gamma * L1 + nz(L1[1]) + gamma * nz(L2[1])
+    L3 := -gamma * L2 + nz(L2[1]) + gamma * nz(L3[1])
+    
+    cu = (L0 > L1 ? L0 - L1 : 0) + (L1 > L2 ? L1 - L2 : 0) + (L2 > L3 ? L2 - L3 : 0)
+    cd = (L0 < L1 ? L1 - L0 : 0) + (L1 < L2 ? L2 - L1 : 0) + (L2 < L3 ? L3 - L2 : 0)
+    
+    temp = cu + cd == 0 ? -1 : cu + cd
+    LaRSI = temp == -1 ? 0 : cu / temp
+    100 * LaRSI
 
-// ---------- Laguerre RSI ----------
-gamma = 1 - alpha
+// ---------- ZEMA function ----------
+zema(_src, _length) =>
+    ema1 = ta.ema(_src, _length)
+    ema2 = ta.ema(ema1, _length)
+    d = ema1 - ema2
+    ema1 + d
 
-var float L0 = 0.0
-var float L1 = 0.0
-var float L2 = 0.0
-var float L3 = 0.0
-
-L0 := (1 - gamma) * src + gamma * nz(L0[1])
-L1 := -gamma * L0 + nz(L0[1]) + gamma * nz(L1[1])
-L2 := -gamma * L1 + nz(L1[1]) + gamma * nz(L2[1])
-L3 := -gamma * L2 + nz(L2[1]) + gamma * nz(L3[1])
-
-cu = (L0 > L1 ? L0 - L1 : 0) + (L1 > L2 ? L1 - L2 : 0) + (L2 > L3 ? L2 - L3 : 0)
-cd = (L0 < L1 ? L1 - L0 : 0) + (L1 < L2 ? L2 - L1 : 0) + (L2 < L3 ? L3 - L2 : 0)
-
-temp = cu + cd == 0 ? -1 : cu + cd
-LaRSI = temp == -1 ? 0 : cu / temp
-LaRSI_plot = 100 * LaRSI
-
-// ---------- JMA (top-level, recursive — same approach as your original) ----------
-phaseRatio = jmaPhase < -100 ? 0.5 : jmaPhase > 100 ? 2.5 : jmaPhase / 100.0 + 1.5
-beta = 0.45 * (jmaLen - 1.0) / (0.45 * (jmaLen - 1.0) + 2.0)
-alphaJ = math.pow(beta, jmaPow)    // matches the original formulation
-
-// persistent state variables (must be top-level so they update each bar)
-var float e0 = na
-var float e1 = na
-var float e2 = na
-var float jma_val = na
-
-// stage updates (initialize carefully for first bars)
-e0 := na(e0[1]) ? LaRSI_plot : (1 - alphaJ) * LaRSI_plot + alphaJ * nz(e0[1])
-e1 := na(e1[1]) ? 0.0 : (LaRSI_plot - e0) * (1 - beta) + beta * nz(e1[1])
-e2 := na(e2[1]) ? 0.0 : (e0 + phaseRatio * e1 - nz(jma_val[1])) * math.pow(1 - alphaJ, 2) + math.pow(alphaJ, 2) * nz(e2[1])
-jma_val := na(jma_val[1]) ? e2 : e2 + nz(jma_val[1])
+// ---------- Get MTF series ----------
+lar_mtf = request.security(syminfo.tickerid, tf == "" ? timeframe.period : tf, laguerre_rsi(src, alpha))
+zema_mtf = request.security(syminfo.tickerid, tf == "" ? timeframe.period : tf, zema(laguerre_rsi(src, alpha), zemaLen))
 
 // ---------- Plots ----------
-plot(LaRSI_plot, title='LaRSI (100x)', color=color.blue, linewidth=2)
-plot(jma_val,    title='JMA of LaRSI', color=color.orange, linewidth=2)
+plot(lar_mtf,  title='Laguerre RSI (100x)', color=color.blue, linewidth=2)
+plot(zema_mtf, title='ZEMA of LaRSI', color=color.orange, linewidth=2)
 hline(upperBand, "Upper", color=color.maroon)
 hline(lowerBand, "Lower", color=color.maroon)
