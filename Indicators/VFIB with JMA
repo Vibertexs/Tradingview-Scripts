@@ -1,0 +1,131 @@
+//@version=5
+indicator("VFIBs (Single JMA, Colored)", overlay=true)
+
+// === INPUTS ===
+bars_vwma_lt = input.int(title="VWMA (Long Term) Bars Back", defval=200)
+bars_atr     = input.int(title="ATR Bars Back", defval=14)
+
+vwma_lt_sma = input.int(title="VWMA (Long Term) SMA Length", defval=7)
+vwma_lt_base_color = input.color(title="VWMA (Long Term) Color", defval=color.teal)
+
+// === INDEPENDENT JMA INPUTS ===
+jma_enabled = input.bool(true, "Enable Independent JMA")
+jma_period  = input.int(50, "JMA Period")
+jma_phase   = input.int(0, "JMA Phase", minval=-100, maxval=100, step=10)
+jma_factor  = input.float(1.0, "JMA Power", minval=0.1, maxval=1.0, step=0.01)
+
+// === CORE VWMA + ATR ===
+mid    = ta.vwma(math.avg(high, low, close), bars_vwma_lt)
+atr    = ta.atr(bars_atr)
+
+// === Hardcoded Fibonacci Multipliers ===
+fib_1 = 1.618
+fib_2 = 2.36
+fib_3 = 3.82
+fib_4 = 5
+fib_5 = 6.18
+fib_6 = 10
+
+// === Long-Term ATR-Fib offsets ===
+tf1 = (atr * fib_1) + mid
+tf2 = (atr * fib_2) + mid
+tf3 = (atr * fib_3) + mid
+tf4 = (atr * fib_4) + mid
+tf5 = (atr * fib_5) + mid
+tf6 = (atr * fib_6) + mid
+bf1 = mid - (atr * fib_1)
+bf2 = mid - (atr * fib_2)
+bf3 = mid - (atr * fib_3)
+bf4 = mid - (atr * fib_4)
+bf5 = mid - (atr * fib_5)
+bf6 = mid - (atr * fib_6)
+
+// === Location function ===
+get_loc() =>
+    val = -6 * math.log(1 * 5)
+    if close < mid
+        if close < bf1
+            val := -6 * math.log(2 * 5)
+        if close < bf2
+            val := -6 * math.log(3 * 5)
+        if close < bf3
+            val := -6 * math.log(4 * 5)
+        if close < bf4
+            val := -6 * math.log(5 * 5)
+        if close < bf5
+            val := -6 * math.log(6 * 5)
+        if close < bf6
+            val := -6 * math.log(7 * 5)
+    else
+        val := 6 * math.log(7 * 5)
+        if close < tf6
+            val := 6 * math.log(6 * 5)
+        if close < tf5
+            val := 6 * math.log(5 * 5)
+        if close < tf4
+            val := 6 * math.log(4 * 5)
+        if close < tf3
+            val := 6 * math.log(3 * 5)
+        if close < tf2
+            val := 6 * math.log(2 * 5)
+        if close < tf1
+            val := 6 * math.log(1 * 5)
+    val
+
+// === JMA FUNCTION ===
+jurikMA(src, period, phase, factor) =>
+    var float phase_value = math.min(math.max((phase * 0.01) + 1.5, 0.5), 2.5)
+    var float beta = factor * (period - 1) / ((factor * (period - 1)) + 2)
+    var float len1 = math.max((math.log(math.sqrt(0.5 * (period - 1))) / math.log(2.0)) + 2.0, 0)
+    var float pow1 = math.max(len1 - 2.0, 0.5)
+    var float len2 = math.sqrt(0.5 * (period - 1)) * len1
+    var float pow1Reciprocal = 1.0 / pow1
+    var float avgVoltyAlpha = 2.0 / (math.max(4.0 * period, 65) + 1.0)
+    var float div = 1.0 / (10.0 + 10.0 * (math.min(math.max(period - 10, 0), 100)) / 100.0)
+    var float upperBand = src
+    var float lowerBand = src
+    var float ma1 = src
+    var float jma = src
+    var float vSum = 0.0
+    var float det0 = 0.0
+    var float det1 = 0.0
+    var float avgVolty = 0.0
+    var volty_array = array.new_float(11, 0.0)
+    
+    del1 = src - upperBand
+    del2 = src - lowerBand
+    volty = math.abs(del1) == math.abs(del2) ? 0 : math.max(math.abs(del1), math.abs(del2))
+    array.unshift(volty_array, volty)
+    array.pop(volty_array)
+    vSum := vSum + (volty - array.get(volty_array, 10)) * div
+    avgVolty := na(avgVolty) ? vSum : avgVolty + avgVoltyAlpha * (vSum - avgVolty)
+    rvolty = math.min(math.max(avgVolty > 0 ? volty / avgVolty : 1.0, 1.0), math.pow(len1, pow1Reciprocal))
+    pow2 = math.pow(rvolty, pow1)
+    Kv = math.pow(len2 / (len2 + 1), math.sqrt(pow2))
+    upperBand := del1 > 0 ? src : src - Kv * del1
+    lowerBand := del2 < 0 ? src : src - Kv * del2
+    alpha = math.pow(beta, pow2)
+    alphaSquared = alpha * alpha
+    oneMinusAlpha = 1.0 - alpha
+    oneMinusAlphaSquared = oneMinusAlpha * oneMinusAlpha
+    ma1 := src + (alpha * (ma1 - src))
+    det0 := (src - ma1) * (1 - beta) + beta * det0
+    ma2 = ma1 + (phase_value * det0)
+    det1 := ((ma2 - nz(jma, src)) * oneMinusAlphaSquared) + (alphaSquared * nz(det1, 0))
+    jma := nz(jma, src) + det1
+    jma
+
+// === Smoothed SMA value ===
+long_sma  = ta.sma(get_loc(), vwma_lt_sma)
+
+// === Independent JMA value ===
+indep_jma  = jma_enabled ? jurikMA(get_loc(), jma_period, jma_phase, jma_factor) : na
+
+// === Dynamic color based on value ===
+indep_jma_color = indep_jma >= 0 ? color.green : color.red
+
+// === PLOTS ===
+plot(long_sma,  color=vwma_lt_base_color, linewidth=3, title="Long-Term SMA")
+plot(indep_jma, color=indep_jma_color, linewidth=3, title="Independent JMA")
+
+hline(0)
