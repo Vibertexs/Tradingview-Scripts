@@ -82,10 +82,9 @@ plot(rsiJMA, "RSI-based JMA", color=rsiJMAColor)
 
 
 // === STATIC BANDS PLOTS ===
-bandColor = color.new(color.orange, 0)
-plot(rsiUpperBandValue, title="RSI Upper Band", color=bandColor, linewidth=1)
-plot(bandMidpoint, title="RSI Midpoint (50)", color=color.new(bandColor, 50), linewidth=1)
-plot(rsiLowerBandValue, title="RSI Lower Band", color=bandColor, linewidth=1)
+
+plot(bandMidpoint, title="RSI Midpoint (50)", color=color.new(color.orange, 50), linewidth=1)
+
 fill(plot(rsiUpperBandValue), plot(rsiLowerBandValue), color=color.rgb(126, 87, 194, 90), title="RSI Background Fill")
 
 
