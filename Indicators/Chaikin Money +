@@ -1,65 +1,71 @@
 //@version=6
-indicator(title="Chaikin Money Flow with ZEMA Cross", shorttitle="CMF+ZEMA", format=format.price, precision=2, timeframe="", timeframe_gaps=true)
+indicator("CMF++", overlay=false, precision=4)
 
-// ZEMA Function (Zero Lag EMA)
+// ----------------------------
+// INPUTS
+// ----------------------------
+tf        = input.timeframe("", "CMF Timeframe (leave empty = current)")
+cmfLength = input.int(50, "CMF Length", minval=1)
+
+jmaPeriod = input.int(20, "JMA Period", minval=1)
+// jmaPhase  = input.int(0, "JMA Phase", minval=-100, maxval=100, step=10)
+jmaPhase  = 100
+
+jmaPower  = input.float(4.0, "JMA Power", minval=1.0, maxval=4.0, step=0.1)
+
+zemaLen   = input.int(200, "ZEMA Length", minval=1)
+
+// ----------------------------
+// CMF CALCULATION
+// ----------------------------
+cmfSource() =>
+    ad = high == low ? 0 : ((2 * close - low - high) / (high - low)) * volume
+    math.sum(ad, cmfLength) / math.sum(volume, cmfLength)
+
+cmfTF = tf == "" ? cmfSource() : request.security(syminfo.tickerid, tf, cmfSource())
+
+// ----------------------------
+// JMA FUNCTION (approximation)
+// ----------------------------
+jma(src, length, phase, power) =>
+    e0 = ta.ema(src, length)
+    e1 = ta.ema(e0, length)
+    e2 = ta.ema(e1, length)
+    coeff = phase * 0.01
+    // Weighted blend with "power" factor for sharpness
+    jmaSeries = (1 + coeff) * (e0 - e1) + e1 + power * (e1 - e2)
+    jmaSeries
+
+cmfJMA = jma(cmfTF, jmaPeriod, jmaPhase, jmaPower)
+
+// ----------------------------
+// ZEMA FUNCTION
+// ----------------------------
 zema(src, len) =>
     ema1 = ta.ema(src, len)
     ema2 = ta.ema(ema1, len)
     ema1 + (ema1 - ema2)
 
-// Check for volume data
-var float cumVol = na
-cumVol := nz(cumVol) + nz(volume)
-if barstate.islast and cumVol == 0
-    runtime.error("No volume is provided by the data vendor.")
+cmfZEMA = zema(cmfTF, zemaLen)
 
-// Input for CMF length
-length = input.int(20, minval=1, title="CMF Length")
+// ----------------------------
+// PLOTS
+// ----------------------------
+plot(cmfTF,   color=color.new(color.gray, 70), title="CMF Raw", linewidth=1)
+plot(cmfJMA,  color=color.orange, title="CMF JMA (fast)", linewidth=2)
+plot(cmfZEMA, color=color.blue, title="CMF ZEMA (slow)", linewidth=2)
+hline(0, color=color.gray, title="Zero")
 
-// Calculate Chaikin Money Flow (CMF)
-ad = high == low ? 0 : ((2 * close - low - high) / (high - low)) * volume
-mf = math.sum(ad, length) / math.sum(volume, length)
+// ----------------------------
+// CROSS DETECTION
+// ----------------------------
+bullishCross = ta.crossunder(cmfZEMA, cmfJMA)
+bearishCross = ta.crossover(cmfZEMA, cmfJMA)
 
-// Plot CMF Line (always fully visible)
-plot(mf, color=mf >= 0 ? color.green : color.red, title="CMF", linewidth=2)
+plotshape(bullishCross, title="Bullish Cross", style=shape.triangleup, 
+          location=location.bottom, color=color.green, size=size.small)
+plotshape(bearishCross, title="Bearish Cross", style=shape.triangledown, 
+          location=location.top, color=color.red, size=size.small)
 
-// Zero line
-zeroLine = hline(0, color=color.gray, title="Zero", linestyle=hline.style_dashed)
-plot(0, color=color.gray, linewidth=1)
-
-// ZEMA Inputs
-fastLength = input.int(12, "Fast ZEMA Length", minval=1)
-slowLength = input.int(26, "Slow ZEMA Length", minval=1)
-
-// Calculate ZEMAs
-fastZEMA = zema(mf, fastLength)
-slowZEMA = zema(mf, slowLength)
-
-// Plot ZEMAs
-plot(fastZEMA, "Fast ZEMA", color=color.blue, linewidth=2)
-plot(slowZEMA, "Slow ZEMA", color=color.orange, linewidth=2)
-
-// ZEMA Crossover detection
-bullishCross = ta.crossover(fastZEMA, slowZEMA)
-bearishCross = ta.crossunder(fastZEMA, slowZEMA)
-
-// Plot crossover signals
-plotshape(bullishCross, "Bullish Cross", shape.triangleup, location.bottom, color=color.green, size=size.small)
-plotshape(bearishCross, "Bearish Cross", shape.triangledown, location.top, color=color.red, size=size.small)
-
-// Fill background on crossovers
-bgcolor(bullishCross ? color.new(color.green, 90) : na)
-bgcolor(bearishCross ? color.new(color.red, 90) : na)
-
-// Apply fading color between 0.0 and CMF line
-plot_fill_up = plot(mf >= 0 ? mf : na, color=color.new(color.green, 75), style=plot.style_line, linewidth=2)
-plot_fill_down = plot(mf >= 0 ? 0 : na, color=color.new(color.green, 75), style=plot.style_line, linewidth=2)
-fill(plot_fill_up, plot_fill_down, color=color.new(color.green, 75), title="Bullish Zone")
-
-plot_fill_up_red = plot(mf < 0 ? mf : na, color=color.new(color.red, 75), style=plot.style_line, linewidth=2)
-plot_fill_down_red = plot(mf < 0 ? 0 : na, color=color.new(color.red, 75), style=plot.style_line, linewidth=2)
-fill(plot_fill_up_red, plot_fill_down_red, color=color.new(color.red, 75), title="Bearish Zone")
-
-// Alerts
-alertcondition(bullishCross, "Bullish ZEMA Crossover", "Fast ZEMA crossed above Slow ZEMA")
-alertcondition(bearishCross, "Bearish ZEMA Crossover", "Fast ZEMA crossed below Slow ZEMA")
+// alertcondition(bullishCross, "Bullish ZEMA/JMA Cross", "Fast ZEMA crossed above Slow JMA")
+// alertcondition(bearishCross, "Bearish ZEMA/JMA Cross", "Fast ZEMA crossed below Slow JMA")
