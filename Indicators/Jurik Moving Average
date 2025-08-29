@@ -1,0 +1,77 @@
+//@version=6
+
+indicator("Jurik Moving Average (JMA)", shorttitle="JMA", overlay=true)
+
+// === Input parameters ===
+period = input.int(14, title="Period", minval=1, tooltip="Number of bars used in the calculation")
+phase = input.int(0, title="Phase", tooltip="Phase shift (-100 to 100). Negative values reduce lag but may cause overshoot", minval=-100, maxval=100, step=10)
+factor = input.float(0.45, title="Power", tooltip="Smoothing factor (0.1-1.0). Lower values create smoother curves. Jurik's default: 0.45", minval=0.1, maxval=1.0, step=0.01)
+source = input.source(close, title="Source")
+
+// === Pre-calculate constants ===
+var float phase_value = math.min(math.max((phase * 0.01) + 1.5, 0.5), 2.5)
+var float beta = factor * (period - 1) / ((factor * (period - 1)) + 2)
+var float len1 = math.max((math.log(math.sqrt(0.5*(period-1))) / math.log(2.0)) + 2.0, 0)
+var float pow1 = math.max(len1 - 2.0, 0.5)
+var float len2 = math.sqrt(0.5*(period-1))*len1
+var float pow1Reciprocal = 1.0 / pow1
+var float avgVoltyAlpha = 2.0 / (math.max(4.0 * period, 65) + 1.0)
+var float div = 1.0/(10.0 + 10.0*(math.min(math.max(period-10,0),100))/100.0)
+
+// === Stateful variables ===
+var float upperBand = source
+var float lowerBand = source
+var float ma1 = source
+var float jma = source
+var float vSum = 0.0
+var float det0 = 0.0
+var float det1 = 0.0
+var float avgVolty = 0.0
+var volty_array = array.new_float(11, 0.0)
+
+// === Volatility calculations ===
+float del1 = source - upperBand
+float del2 = source - lowerBand
+float volty = math.abs(del1) == math.abs(del2) ? 0 : math.max(math.abs(del1), math.abs(del2))
+
+array.unshift(volty_array, volty)
+array.pop(volty_array)
+vSum := vSum + (volty - array.get(volty_array, 10)) * div
+
+avgVolty := na(avgVolty) ? vSum : avgVolty + avgVoltyAlpha * (vSum - avgVolty)
+
+// Relative volatility
+float rvolty = math.min(math.max(avgVolty > 0 ? volty / avgVolty : 1.0, 1.0), math.pow(len1, pow1Reciprocal))
+
+// Adaptive parameters
+float pow2 = math.pow(rvolty, pow1)
+float Kv = math.pow(len2/(len2+1), math.sqrt(pow2))
+
+// Update volatility bands
+upperBand := del1 > 0 ? source : source - Kv * del1
+lowerBand := del2 < 0 ? source : source - Kv * del2
+
+// Dynamic factor alpha
+float alpha = math.pow(beta, pow2)
+float alphaSquared = alpha * alpha
+float oneMinusAlpha = 1.0 - alpha
+float oneMinusAlphaSquared = oneMinusAlpha * oneMinusAlpha
+
+// === JMA core calculation ===
+// Stage 1: adaptive EMA
+ma1 := source + (alpha * (ma1 - source))
+// Stage 2: Kalman smoothing
+det0 := (source - ma1) * (1 - beta) + beta * det0
+float ma2 = ma1 + (phase_value * det0)
+// Stage 3: Jurik adaptive filter
+det1 := ((ma2 - nz(jma, source)) * oneMinusAlphaSquared) + (alphaSquared * nz(det1, 0))
+jma := nz(jma, source) + det1
+
+// === Coloring logic ===
+jmaColor = jma > jma[1] ? color.lime : color.red
+
+// === Plots ===
+plot(jma, title="JMA", color=jmaColor, linewidth=2)
+upperBandPlot = plot(upperBand, title="Jurik Upper Band", color=color.new(color.gray, 50), linewidth=1)
+lowerBandPlot = plot(lowerBand, title="Jurik Lower Band", color=color.new(color.gray, 50), linewidth=1)
+fill(upperBandPlot, lowerBandPlot, color=color.new(color.gray, 70), title="Jurik Volatility Zone")
