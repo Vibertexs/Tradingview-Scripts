@@ -1,0 +1,221 @@
+//@version=5
+indicator("RSI Trends v6 (Enhanced Range Detection)", format=format.price, precision=2)
+
+// === INPUT SETTINGS ===
+rsiLengthInput = input.int(60, minval=1, title="RSI Length")
+rsiSourceInput = input.source(close, "Source")
+jmaLenInput    = input.int(14, title="JMA Length")
+jmaPhaseInput  = input.int(0, minval=-100, maxval=100, step=10, title="JMA Phase")
+jmaPowerInput  = input.float(1, minval=0.1, maxval=1.0, step=0.01, title="JMA Power (Factor)")
+bandGap        = input.int(3, minval=1, maxval=25, title="Gap from 50")
+rsiLookback    = input.int(15, title="Range Look Back Period")
+preserveLastColor = input.bool(true, title="Preserve Last Color When Flat")
+
+// === NEW RANGE DETECTION INPUTS ===
+useDynamicBands = input.bool(true, title="Use Dynamic Range Bands")
+maType = input.string("VWMA", options=["SMA", "EMA", "VWMA", "HMA", "TEMA"], title="MA Type for Range Detection")
+slowMaLength = input.int(200, minval=50, title="Slow MA Length for Range Detection")
+minRangeGap = input.float(2.0, minval=1.0, maxval=10.0, step=0.5, title="Minimum Range Gap")
+flatnessThreshold = input.float(1.5, minval=0.5, maxval=5.0, title="Flatness Threshold")
+rangeStrength = input.int(15, minval=5, maxval=30, title="Range Strength Period")
+
+// === CALCULATE RSI ===
+up = ta.rma(math.max(ta.change(rsiSourceInput), 0), rsiLengthInput)
+down = ta.rma(-math.min(ta.change(rsiSourceInput), 0), rsiLengthInput)
+rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+
+// === FULL JMA CALCULATION ===
+// Pre-calculate constants
+phase_value = math.min(math.max((jmaPhaseInput * 0.01) + 1.5, 0.5), 2.5)
+beta = jmaPowerInput * (jmaLenInput - 1) / ((jmaPowerInput * (jmaLenInput - 1)) + 2)
+len1 = math.max((math.log(math.sqrt(0.5*(jmaLenInput-1))) / math.log(2.0)) + 2.0, 0)
+pow1 = math.max(len1 - 2.0, 0.5)
+len2 = math.sqrt(0.5*(jmaLenInput-1))*len1
+pow1Reciprocal = 1.0 / pow1
+avgVoltyAlpha = 2.0 / (math.max(4.0 * jmaLenInput, 65) + 1.0)
+div = 1.0/(10.0 + 10.0*(math.min(math.max(jmaLenInput-10,0),100))/100.0)
+
+// Global JMA variables
+var float upperBand = na
+var float lowerBand = na
+var float ma1 = na
+var float jma_value = na
+var float vSum = 0.0
+var float det0 = 0.0
+var float det1 = 0.0
+var float avgVolty = 0.0
+var array<float> volty_array = array.new<float>(11, 0.0)
+
+// Initialize
+if barstate.isfirst or na(jma_value)
+    upperBand := rsi
+    lowerBand := rsi
+    ma1 := rsi
+    jma_value := rsi
+    avgVolty := 0.0
+    vSum := 0.0
+    det0 := 0.0
+    det1 := 0.0
+
+// Volatility calculations
+del1 = rsi - upperBand
+del2 = rsi - lowerBand
+volty = math.abs(del1) == math.abs(del2) ? 0 : math.max(math.abs(del1), math.abs(del2))
+
+// Update volatility array
+array.unshift(volty_array, volty)
+if array.size(volty_array) > 11
+    array.pop(volty_array)
+
+// Calculate vSum
+vSum := vSum + (volty - (array.size(volty_array) > 10 ? array.get(volty_array, 10) : 0)) * div
+
+// Update average volatility
+avgVolty := na(avgVolty) ? vSum : avgVolty + avgVoltyAlpha * (vSum - avgVolty)
+
+// Relative volatility
+rvolty = math.min(math.max(avgVolty > 0 ? volty / avgVolty : 1.0, 1.0), math.pow(len1, pow1Reciprocal))
+
+// Adaptive parameters
+pow2 = math.pow(rvolty, pow1)
+Kv = math.pow(len2/(len2+1), math.sqrt(pow2))
+
+// Update volatility bands
+upperBand := del1 > 0 ? rsi : rsi - Kv * del1
+lowerBand := del2 < 0 ? rsi : rsi - Kv * del2
+
+// Dynamic factor alpha
+alpha = math.pow(beta, pow2)
+alphaSquared = alpha * alpha
+oneMinusAlpha = 1.0 - alpha
+oneMinusAlphaSquared = oneMinusAlpha * oneMinusAlpha
+
+// JMA core calculation
+ma1 := rsi + (alpha * (ma1 - rsi))
+det0 := (rsi - ma1) * (1 - beta) + beta * det0
+ma2 = ma1 + (phase_value * det0)
+det1 := ((ma2 - nz(jma_value, rsi)) * oneMinusAlphaSquared) + (alphaSquared * nz(det1, 0))
+jma_value := nz(jma_value, rsi) + det1
+
+// === ENHANCED RANGE DETECTION ===
+// Multiple MA options for different characteristics
+getMa(src, len, maType) =>
+    switch maType
+        "SMA" => ta.sma(src, len)
+        "EMA" => ta.ema(src, len)
+        "VWMA" => ta.vwma(src, len)  // Volume weighted - less reactive to spikes
+        "HMA" => ta.hma(src, len)    // Hull MA - smooth but responsive
+        "TEMA" => 
+            ema1 = ta.ema(src, len)
+            ema2 = ta.ema(ema1, len)
+            ema3 = ta.ema(ema2, len)
+            3 * ema1 - 3 * ema2 + ema3  // Triple EMA - very smooth
+
+// Calculate the selected MA type
+slowMa = getMa(rsi, slowMaLength, maType)
+
+// Calculate dynamic range bands around the slow MA
+dynamicUpperBand = useDynamicBands ? slowMa + minRangeGap : 50 + bandGap
+dynamicLowerBand = useDynamicBands ? slowMa - minRangeGap : 50 - bandGap
+dynamicMidpoint = useDynamicBands ? slowMa : 50
+
+// Measure flatness - standard deviation of JMA over recent periods
+jmaStdDev = ta.stdev(jma_value, rangeStrength)
+isFlat = jmaStdDev < flatnessThreshold
+
+// Enhanced range detection function
+isEnhancedRange() =>
+    // Check if JMA is staying within dynamic bands
+    withinBands = true
+    consecutiveInRange = 0
+    
+    for i = 0 to math.min(rsiLookback, bar_index)
+        jmaVal = jma_value[i]
+        upperBandVal = useDynamicBands ? (getMa(rsi, slowMaLength, maType)[i] + minRangeGap) : (50 + bandGap)
+        lowerBandVal = useDynamicBands ? (getMa(rsi, slowMaLength, maType)[i] - minRangeGap) : (50 - bandGap)
+        
+        if jmaVal >= lowerBandVal and jmaVal <= upperBandVal
+            consecutiveInRange += 1
+        else if consecutiveInRange > 0
+            break
+    
+    // Range conditions:
+    // 1. JMA has been within dynamic bands for sufficient time
+    // 2. Recent movement is relatively flat
+    // 3. No strong directional bias
+    rangeCondition1 = consecutiveInRange >= math.min(10, rsiLookback)
+    rangeCondition2 = isFlat
+    rangeCondition3 = math.abs(jma_value - slowMa) < (minRangeGap * 1.5)
+    
+    rangeCondition1 and rangeCondition2 and rangeCondition3
+
+// Original ping pong detection (kept for comparison)
+isPingPongMarket() =>
+    maxConsecutive = 5
+    aboveCount = 0
+    belowCount = 0
+    for i = 0 to math.min(rsiLookback, bar_index)
+        if jma_value[i] > dynamicMidpoint
+            aboveCount += 1
+            belowCount := 0
+        else if jma_value[i] < dynamicMidpoint
+            belowCount += 1
+            aboveCount := 0
+        if aboveCount > maxConsecutive or belowCount > maxConsecutive
+            false
+    true
+
+// === JMA COLORING WITH ENHANCED TRENDS ===
+var color lastTrendColor = color.yellow
+jmaColor = color.yellow  // Default
+
+// Use enhanced range detection
+if isEnhancedRange()
+    jmaColor := color.fuchsia
+    lastTrendColor := color.fuchsia
+else if jma_value > dynamicUpperBand
+    jmaColor := color.lime
+    lastTrendColor := color.lime
+else if jma_value < dynamicLowerBand
+    jmaColor := color.red
+    lastTrendColor := color.red
+else if preserveLastColor
+    jmaColor := lastTrendColor
+else
+    jmaColor := color.yellow
+
+// === PLOTS ===
+plot(rsi, "RSI", color=color.new(color.blue, 70), linewidth=1)
+plot(jma_value, "JMA with Phase & Power", color=jmaColor, linewidth=4)
+plot(slowMa, "Slow MA", color=color.new(color.white, 60), linewidth=2)
+
+// === DYNAMIC BANDS PLOTS ===
+bandColor = useDynamicBands ? color.new(color.purple, 0) : color.new(color.orange, 0)
+plot(dynamicUpperBand, title="Upper Band", color=bandColor, linewidth=1)
+plot(dynamicMidpoint, title="Midpoint", color=color.new(bandColor, 50), linewidth=1)
+plot(dynamicLowerBand, title="Lower Band", color=bandColor, linewidth=1)
+fill(plot(dynamicUpperBand), plot(dynamicLowerBand), color=color.rgb(126, 87, 194, 90), title="Background Fill")
+
+// Static 50 line for reference
+hline(50, "50 Line", color=color.new(color.gray, 70), linestyle=hline.style_dashed)
+
+// === DEBUG TABLE ===
+var table debug_table = table.new(position.top_right, 2, 6, bgcolor=color.white, border_width=1)
+if barstate.islast
+    table.cell(debug_table, 0, 0, "RSI:", text_color=color.black)
+    table.cell(debug_table, 1, 0, str.tostring(rsi, "#.##"), text_color=color.black)
+    table.cell(debug_table, 0, 1, "JMA:", text_color=color.black)
+    table.cell(debug_table, 1, 1, str.tostring(jma_value, "#.##"), text_color=color.black)
+    table.cell(debug_table, 0, 2, "Slow MA:", text_color=color.black)
+    table.cell(debug_table, 1, 2, str.tostring(slowMa, "#.##"), text_color=color.black)
+    table.cell(debug_table, 0, 3, "Flatness:", text_color=color.black)
+    table.cell(debug_table, 1, 3, str.tostring(jmaStdDev, "#.##"), text_color=color.black)
+    table.cell(debug_table, 0, 4, "Enhanced Range:", text_color=color.black)
+    table.cell(debug_table, 1, 4, isEnhancedRange() ? "YES" : "NO", text_color=color.black)
+    table.cell(debug_table, 0, 5, "Color:", text_color=color.black)
+    table.cell(debug_table, 1, 5, jmaColor == color.lime ? "BULL" : jmaColor == color.red ? "BEAR" : jmaColor == color.fuchsia ? "RANGE" : "NEUTRAL", text_color=color.black)
+
+// === ALERTS ===
+alertcondition(ta.crossover(jma_value, dynamicUpperBand), title="RSI JMA Bullish", message="RSI-JMA crossed above upper band - Bullish trend")
+alertcondition(ta.crossunder(jma_value, dynamicLowerBand), title="RSI JMA Bearish", message="RSI-JMA crossed below lower band - Bearish trend")
+alertcondition(jmaColor == color.fuchsia and jmaColor[1] != color.fuchsia, title="RSI JMA Range", message="RSI-JMA detected ranging market")
