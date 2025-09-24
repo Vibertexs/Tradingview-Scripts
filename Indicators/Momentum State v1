@@ -1,0 +1,80 @@
+//@version=5
+indicator("Momentum State v1", overlay=false, precision=2)
+
+// === INPUTS ===
+rsiLen       = input.int(25, "Momentum Lookback")
+jmaLen       = input.int(14, "JMA Depth")
+jmaPhase     = input.int(-100, "JMA Phase", minval=-100, maxval=100, step=10)
+jmaPower     = input.float(1, "JMA Power", minval=0.1, maxval=1.0, step=0.01)
+
+// === Bands Settings ===
+useDynamicBands = input.bool(true, title="Use Dynamic Range Bands")
+slowMaLength    = input.int(300, minval=50, title="Slow MA Length for Range Detection")
+rangeGap        = input.float(3.0, minval=1.0, maxval=10.0, step=0.5, title="Range Gap (applies to both dynamic and legacy)")
+
+// === Legacy Volatility Bands ===
+volatilityPeriod = input.int(5, "Legacy Volatility Adjustment")
+baseBandWidth    = input.int(4, "Legacy Base Band Width", minval=1, maxval=20)
+
+// === Slope Settings ===
+slopeThreshold  = input.float(0.5, "Slope Threshold for Steep Override", minval = 0, step = 0.1)
+
+// === JMA FUNCTION ===
+jma(_src, _period, _phase, _power) =>
+    phaseV = math.min(math.max((_phase * 0.01) + 1.5, 0.5), 2.5)
+    beta = _power * (_period - 1) / ((_power * (_period - 1)) + 2)
+    len1 = math.max((math.log(math.sqrt(0.5 * (_period - 1))) / math.log(2.0)) + 2.0, 0)
+    pow1 = math.max(len1 - 2.0, 0.5)
+    pow1Recip = 1.0 / pow1
+    alpha = math.pow(beta, pow1Recip)
+    alphaSqr = alpha * alpha
+    oneMinusAlpha = 1.0 - alpha
+    oneMinusAlphaSqr = oneMinusAlpha * oneMinusAlpha
+    var float ma1 = na
+    var float det0 = na
+    var float det1 = na
+    var float _jma = na
+    ma1 := na(ma1) ? _src : _src + (alpha * (ma1 - _src))
+    det0 := na(det0) ? 0.0 : (_src - ma1) * (1 - beta) + beta * det0
+    ma2 = ma1 + (phaseV * det0)
+    det1 := na(det1) ? 0.0 : ((ma2 - nz(_jma, _src)) * oneMinusAlphaSqr) + (alphaSqr * det1)
+    _jma := na(_jma) ? _src : nz(_jma, _src) + det1
+    _jma
+
+// === VWMA helper ===
+getMa(src, len) =>
+    ta.vwma(src, len)
+
+// === Momentum Engine ===
+rsi = ta.rsi(close, rsiLen)
+smoothedMomentum = jma(rsi, jmaLen, jmaPhase, jmaPower)
+
+// === Slope Calculation (Current vs Previous Bar) ===
+slope = smoothedMomentum - smoothedMomentum[1]
+
+// === Bands Calculation ===
+slowMa = getMa(smoothedMomentum, slowMaLength)
+dynamicUpperBand = useDynamicBands ? slowMa + rangeGap : 50 + rangeGap + (ta.stdev(close, volatilityPeriod)/close*100)
+dynamicLowerBand = useDynamicBands ? slowMa - rangeGap : 50 - rangeGap - (ta.stdev(close, volatilityPeriod)/close*100)
+
+// === Determine if Market is Ranging ===
+isRanging = smoothedMomentum >= dynamicLowerBand and smoothedMomentum <= dynamicUpperBand
+
+// === JMA Line Coloring Logic ===
+var color rangeClr     = color.gray
+var color trendingClr  = color.new(color.rgb(4, 231, 98), 0)
+var color steepClr     = color.new(color.rgb(4, 231, 98), 0)
+
+jmaColor = isRanging ? (math.abs(slope) > slopeThreshold ? steepClr : rangeClr) : trendingClr
+
+// === Visualization ===
+// Users can change the colors in the "Style" tab now
+plot(smoothedMomentum, "JMA Momentum", color=jmaColor, linewidth=3)
+plot(dynamicUpperBand, title="Upper Band", color=color.new(color.purple, 10), linewidth=1)
+plot(dynamicLowerBand, title="Lower Band", color=color.new(color.purple, 10), linewidth=1)
+plot(getMa(smoothedMomentum, slowMaLength), title="VWMA of Momentum", color=color.new(color.white, 60), linewidth=2)
+
+// === Alerts ===
+alertcondition(jmaColor == steepClr and jmaColor[1] != steepClr, title="Steep Slope", message="Momentum steep slope inside range")
+alertcondition(isRanging and not isRanging[1], title="Enter Range", message="Momentum entered range")
+alertcondition(not isRanging and isRanging[1], title="Exit Range", message="Momentum exited range")
