@@ -1,0 +1,95 @@
+//@version=6
+
+indicator("Biphasic Momentum Curve", shorttitle="BMC", overlay=false)
+
+src     = input.source(close, "Source")
+length  = input.int(12,  "Fast JMA Length",    minval=1)
+length1 = input.int(26,  "Slow JMA Length",    minval=1)
+length2 = input.int(9,   "Trigger JMA Length", minval=1)
+
+showhistogram = input.bool(true, "Show MACD Histogram?")
+
+// ── JMA controls (shared)
+jmaPhase = input.int(0,    "JMA Phase", minval=-100, maxval=100, step=10)
+jmaPower = input.float(0.45, "JMA Power", minval=0.1, maxval=1.0, step=0.01)
+
+// ── Helpers
+phaseV(ph) =>
+    math.min(math.max((ph * 0.01) + 1.5, 0.5), 2.5)
+
+safeLen(x) => math.max(x, 2)
+
+// ── JMA FAST (length)
+beta_f = jmaPower * (length - 1) / ((jmaPower * (length - 1)) + 2)
+len1_f = math.max((math.log(math.sqrt(0.5 * (safeLen(length) - 1))) / math.log(2.0)) + 2.0, 0)
+pow1_f = math.max(len1_f - 2.0, 0.5)
+alpha_f = math.pow(beta_f, 1.0 / pow1_f)
+alphaSqr_f = alpha_f * alpha_f
+oneMinusAlpha_f = 1.0 - alpha_f
+oneMinusAlphaSqr_f = oneMinusAlpha_f * oneMinusAlpha_f
+phase_f = phaseV(jmaPhase)
+
+var float jma_ma1_f = na
+var float jma_det0_f = na
+var float jma_det1_f = na
+var float JMA12      = na
+
+jma_ma1_f := na(jma_ma1_f) ? src : src + (alpha_f * (jma_ma1_f - src))
+jma_det0_f := na(jma_det0_f) ? 0.0 : (src - jma_ma1_f) * (1 - beta_f) + beta_f * jma_det0_f
+jma_ma2_f  = jma_ma1_f + (phase_f * jma_det0_f)
+jma_det1_f := na(jma_det1_f) ? 0.0 : ((jma_ma2_f - nz(JMA12, src)) * oneMinusAlphaSqr_f) + (alphaSqr_f * jma_det1_f)
+JMA12      := na(JMA12) ? src : nz(JMA12, src) + jma_det1_f
+
+// ── JMA SLOW (length1)
+beta_s = jmaPower * (length1 - 1) / ((jmaPower * (length1 - 1)) + 2)
+len1_s = math.max((math.log(math.sqrt(0.5 * (safeLen(length1) - 1))) / math.log(2.0)) + 2.0, 0)
+pow1_s = math.max(len1_s - 2.0, 0.5)
+alpha_s = math.pow(beta_s, 1.0 / pow1_s)
+alphaSqr_s = alpha_s * alpha_s
+oneMinusAlpha_s = 1.0 - alpha_s
+oneMinusAlphaSqr_s = oneMinusAlpha_s * oneMinusAlpha_s
+phase_s = phaseV(jmaPhase)
+
+var float jma_ma1_s = na
+var float jma_det0_s = na
+var float jma_det1_s = na
+var float JMA26      = na
+
+jma_ma1_s := na(jma_ma1_s) ? src : src + (alpha_s * (jma_ma1_s - src))
+jma_det0_s := na(jma_det0_s) ? 0.0 : (src - jma_ma1_s) * (1 - beta_s) + beta_s * jma_det0_s
+jma_ma2_s  = jma_ma1_s + (phase_s * jma_det0_s)
+jma_det1_s := na(jma_det1_s) ? 0.0 : ((jma_ma2_s - nz(JMA26, src)) * oneMinusAlphaSqr_s) + (alphaSqr_s * jma_det1_s)
+JMA26      := na(JMA26) ? src : nz(JMA26, src) + jma_det1_s
+
+// ── MACD line from JMAs
+src2 = JMA12 - JMA26
+
+// ── JMA TRIGGER (length2) on src2
+beta_t = jmaPower * (length2 - 1) / ((jmaPower * (length2 - 1)) + 2)
+len1_t = math.max((math.log(math.sqrt(0.5 * (safeLen(length2) - 1))) / math.log(2.0)) + 2.0, 0)
+pow1_t = math.max(len1_t - 2.0, 0.5)
+alpha_t = math.pow(beta_t, 1.0 / pow1_t)
+alphaSqr_t = alpha_t * alpha_t
+oneMinusAlpha_t = 1.0 - alpha_t
+oneMinusAlphaSqr_t = oneMinusAlpha_t * oneMinusAlpha_t
+phase_t = phaseV(jmaPhase)
+
+var float jma_ma1_t = na
+var float jma_det0_t = na
+var float jma_det1_t = na
+var float MATR       = na  // trigger
+
+jma_ma1_t := na(jma_ma1_t) ? src2 : src2 + (alpha_t * (jma_ma1_t - src2))
+jma_det0_t := na(jma_det0_t) ? 0.0 : (src2 - jma_ma1_t) * (1 - beta_t) + beta_t * jma_det0_t
+jma_ma2_t  = jma_ma1_t + (phase_t * jma_det0_t)
+jma_det1_t := na(jma_det1_t) ? 0.0 : ((jma_ma2_t - nz(MATR, src2)) * oneMinusAlphaSqr_t) + (alphaSqr_t * jma_det1_t)
+MATR       := na(MATR) ? src2 : nz(MATR, src2) + jma_det1_t
+
+// ── Plots
+hist = src2 - MATR
+plot(showhistogram ? hist : na, title="Histogram", style=plot.style_columns,
+     color=(hist >= 0 ? (hist[1] < hist ? color.lime : color.new(color.lime, 40))
+                      : (hist[1] < hist ? color.new(color.red, 20) : color.red)))
+plot(src2, title="MACD (JMA fast - JMA slow)", color=#42e650, linewidth=2)
+plot(MATR, title="Trigger (JMA on MACD)",     color=#E60000, linewidth=2)
+  
