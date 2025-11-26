@@ -1,0 +1,53 @@
+//@version=5
+indicator("Bar Range Volatility Regime", shorttitle = "RangeVolRegime", overlay = false)
+
+// ─── Inputs ────────────────────────────────────────────────────────────────────
+lenBase   = input.int(100, "Base Length (μ, σ)", minval = 10)
+lenLook   = input.int(10,  "Current Window Y",  minval = 1)
+
+useZscore = input.bool(true, "Use Z-Score Mode?",
+     tooltip = "ON = (avgRangeY - μ) / σ\nOFF = avgRangeY / μ (ratio mode)")
+
+// For z-score mode, something like 1 / -1 is typical.
+// For ratio mode you'd use High≈1.5, Low≈0.7 etc.
+highThresh = input.float(1.0,  "High Vol Threshold", step = 0.1)
+lowThresh  = input.float(-1.0, "Low Vol Threshold",  step = 0.1)
+
+// ─── Core Calculations ─────────────────────────────────────────────────────────
+
+// 1. Bar height (range)
+barRange = high - low
+
+// 2. Base stats over lenBase bars
+mu  = ta.sma(barRange, lenBase)       // average bar range (μ)
+sig = ta.stdev(barRange, lenBase)     // std dev of bar range (σ)
+
+// 3. Average range over current Y bars
+avgRangeY = ta.sma(barRange, lenLook)
+
+// 4. Z-score and ratio versions
+z     = sig != 0.0 ? (avgRangeY - mu) / sig : 0.0
+ratio = mu  != 0.0 ? avgRangeY / mu        : 1.0
+
+// Value we actually use, depending on mode
+val = useZscore ? z : ratio
+
+// 5. Regime logic
+isHighVol = val > highThresh
+isLowVol  = val < lowThresh
+
+// ─── Plots ────────────────────────────────────────────────────────────────────
+
+// Main line (either z-score or ratio)
+plot(val, title = "Volatility Value", color = color.white, linewidth = 2)
+
+// Baseline: 0 for z-score, 1 for ratio mode
+baseline = useZscore ? 0.0 : 1.0
+hline(baseline, "Baseline", color = color.new(color.gray, 60), linestyle = hline.style_dotted)
+
+// Thresholds
+hline(highThresh, "High Vol Threshold", color = color.new(color.red, 40), linestyle = hline.style_dashed)
+hline(lowThresh,  "Low Vol Threshold",  color = color.new(color.green, 40), linestyle = hline.style_dashed)
+
+// Background coloring for regimes
+bgcolor(     isHighVol ? color.new(color.red, 85) : isLowVol  ? color.new(color.green, 85) :na)
