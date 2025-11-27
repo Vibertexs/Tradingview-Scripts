@@ -1,0 +1,72 @@
+//@version=5
+
+// Idea from IEEE paper: https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=11122132
+
+indicator("Fractal Trend Demo (Paper Idea)", overlay = true, max_bars_back = 5000)
+
+//──────────────────── Inputs
+left  = input.int(3,  "Fractal left bars",  minval = 1)
+right = input.int(3,  "Fractal right bars", minval = 1)
+showFractals = input.bool(true, "Show fractal highs/lows")
+showTrendBg  = input.bool(true, "Highlight trend zones")
+
+//──────────────────── Fractals (repainting by design)
+ph = ta.pivothigh(high, left, right)   // pivot high price, or na
+pl = ta.pivotlow(low,  left, right)    // pivot low price, or na
+
+isNewHigh = not na(ph)
+isNewLow  = not na(pl)
+
+// Plot fractal points so you can see the swing structure
+plotshape(showFractals and isNewHigh,
+     title="Fractal High",
+     style=shape.triangledown,
+     location=location.abovebar,
+     color=color.red,
+     size=size.tiny)
+
+plotshape(showFractals and isNewLow,
+     title="Fractal Low",
+     style=shape.triangleup,
+     location=location.belowbar,
+     color=color.lime,
+     size=size.tiny)
+
+//──────────────────── Track last two highs & lows
+var float lastHigh = na
+var float prevHigh = na
+var float lastLow  = na
+var float prevLow  = na
+
+
+if isNewHigh
+    prevHigh := lastHigh
+    lastHigh := ph
+
+if isNewLow
+    prevLow := lastLow
+    lastLow := pl
+
+//──────────────────── Simple “paper-style” trend logic
+// Uptrend = higher high AND higher low (using fractals)
+// Downtrend = lower high AND lower low
+
+have2Highs = not na(lastHigh) and not na(prevHigh)
+have2Lows  = not na(lastLow)  and not na(prevLow)
+
+upTrend   = have2Highs and have2Lows and (lastHigh > prevHigh) and (lastLow > prevLow)
+downTrend = have2Highs and have2Lows and (lastHigh < prevHigh) and (lastLow < prevLow)
+
+// persistent trend state so the zone continues
+var int trendState = 0     //  1 = up, -1 = down, 0 = none
+
+if upTrend
+    trendState := 1
+else if downTrend
+    trendState := -1
+
+//──────────────────── Highlight so you can “see the effect after”
+bgcolor(
+     showTrendBg and trendState == 1 ? color.new(color.green, 85) :
+     showTrendBg and trendState == -1 ? color.new(color.red, 85) :
+     na)
