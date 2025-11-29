@@ -1,0 +1,61 @@
+//@version=5
+indicator("Chop / Mean-Reversion (Long & Short Windows)", overlay = false, max_bars_back = 5000)
+
+//-------------------- Inputs
+lenLong    = input.int(50, "Long window length (bars)",  minval = 5)
+lenShort   = input.int(20, "Short window length (bars)", minval = 3)
+smoothLen  = input.int(3,  "Smoothing length",           minval = 1)
+chopThr    = input.float(0.6, "Chop threshold (0-1)",    step = 0.05)
+// Internal exit threshold a bit lower than entry to avoid flicker
+chopThrExit = chopThr * 0.8
+
+//-------------------- Helper: chop score for a given length
+f_chop(len) =>
+    float path = na
+    if bar_index > len + 1
+        path := 0.0
+        // sum of absolute close-to-close changes
+        for i = 0 to len - 1
+            path += math.abs(close[i] - close[i + 1])
+    float hi  = ta.highest(high, len)
+    float lo  = ta.lowest(low,  len)
+    float box = hi - lo
+
+    float efficiency = na
+    float chopScore  = na
+    if not na(path) and path > 0 and box > 0
+        efficiency := box / path
+        // clamp [0,1]
+        efficiency := math.min(math.max(efficiency, 0.0), 1.0)
+        chopScore  := 1.0 - efficiency
+    chopScore
+
+//-------------------- 1) Long- and short-window chop scores
+rawChopLong  = f_chop(lenLong)
+rawChopShort = f_chop(lenShort)
+
+// Optional smoothing
+chopLong  = smoothLen > 1 ? ta.sma(rawChopLong,  smoothLen) : rawChopLong
+chopShort = smoothLen > 1 ? ta.sma(rawChopShort, smoothLen) : rawChopShort
+
+//-------------------- 2) State machine: are we in a choppy regime?
+
+var bool isChoppy = false
+
+if not isChoppy
+    // Enter choppy state when both long & short say "very zig-zag"
+    if not na(chopLong) and not na(chopShort) and chopLong > chopThr and chopShort > chopThr
+        isChoppy := true
+else
+    // Exit choppy as soon as short-window chop calms down enough
+    if not na(chopShort) and chopShort < chopThrExit
+        isChoppy := false
+
+//-------------------- 3) Plots
+
+plot(chopLong,  "Chop (long window)",  color = color.new(color.aqua,   0))
+plot(chopShort, "Chop (short window)", color = color.new(color.orange, 0))
+hline(chopThr, "Entry threshold", color = color.new(color.gray, 70), linestyle = hline.style_dotted)
+
+// Background = final choppy flag
+bgcolor(isChoppy ? color.new(color.orange, 85) : na)
