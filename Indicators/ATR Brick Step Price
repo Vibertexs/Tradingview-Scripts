@@ -1,0 +1,30 @@
+//@version=6
+indicator("ATR Brick Step Price", overlay = true)
+
+// ─── Inputs ──────────────────────────────────────────────────────────────────
+int   atrLen  = input.int(14,  "ATR Length",     minval = 1)
+float atrMult = input.float(1, "ATR Multiplier", minval = 0.0001, step = 0.1)
+series float src = input.source(close, "Source")
+
+// ─── Brick size from ATR ─────────────────────────────────────────────────────
+float brickSizeRaw = ta.atr(atrLen) * atrMult
+float brickSize    = brickSizeRaw > 0 ? brickSizeRaw : na
+
+// ─── Time-synced brick price series ──────────────────────────────────────────
+var float brickPrice = na
+
+if barstate.isfirst
+    brickPrice := src
+else
+    float prev = brickPrice[1]
+    float diff = src - prev
+    float bricksFloat = not na(brickSize) and brickSize > 0 ? math.floor(math.abs(diff) / brickSize) : 0.0
+    float dir        = diff > 0 ? 1.0 : diff < 0 ? -1.0 : 0.0
+    brickPrice := bricksFloat >= 1 and dir != 0 ? prev + dir * bricksFloat * brickSize : prev
+
+// ─── Color by direction (single-line ternary chain) ─────────────────────────
+color brickColor = brickPrice > brickPrice[1] ? color.new(color.green, 0) : brickPrice < brickPrice[1] ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+// ─── Plots ───────────────────────────────────────────────────────────────────
+plot(src,        "Source",          color = color.new(color.gray, 80))
+plot(brickPrice, "ATR Brick Price", color = brickColor, style = plot.style_stepline, linewidth = 2)
