@@ -1,24 +1,23 @@
 //@version=6
-indicator("JMA Schmitt Filter", overlay=true)
+indicator("JMA Schmitt Filter", overlay=true, max_bars_back=5000)
 
-// ─────────────────── Inputs
+// ─────────────────── Input groups
 groupF = "Fast JMA"
 groupS = "Slow JMA"
-groupH = "Hysteresis (ATR)"
+groupH = "Hysteresis (Band)"
+groupC = "CVD / Delta"
 
-src = input.source(close, "Source")
-
-// Fast JMA
+// ─────────────────── Fast JMA inputs
 fastLen   = input.int(14,       "Fast Period",  minval=1, group=groupF)
 fastPhase = input.int(0,        "Fast Phase",   minval=-100, maxval=100, step=10, group=groupF)
 fastPower = input.float(0.45,   "Fast Power",   minval=0.1,  maxval=1.0, step=0.01, group=groupF)
 
-// Slow JMA
+// ─────────────────── Slow JMA inputs
 slowLen   = input.int(28,       "Slow Period",  minval=1, group=groupS)
 slowPhase = input.int(0,        "Slow Phase",   minval=-100, maxval=100, step=10, group=groupS)
 slowPower = input.float(0.45,   "Slow Power",   minval=0.1,  maxval=1.0, step=0.01, group=groupS)
 
-// Hysteresis
+// ─────────────────── Hysteresis / Band inputs
 atrLen      = input.int(14,     "ATR Length",              minval=1, group=groupH)
 bandMult    = input.float(0.6,  "Band Multiplier",         minval=0.0, step=0.1, group=groupH)
 minBars     = input.int(0,      "Min bars between flips",  minval=0, group=groupH)
@@ -27,20 +26,36 @@ slopeLen    = input.int(20,     "Slope lookback", minval=1, group=groupH)
 slopeLambda = input.float(1.0,  "Slope boost strength", minval=0.0, step=0.1, group=groupH)
 showBand    = input.bool(true,  "Plot decision band", group=groupH)
 
-// ─────────────────── Helper to compute phaseV
+// ─────────────────── CVD / Delta config
+useCvd = input.bool(true, "Use CVD (instead of close)", group=groupC)
+
+// Approximate per-bar volume delta
+float volDelta = close > open ? volume : close < open ? -volume : 0.0
+
+// Cumulative volume delta (CVD)
+var float cvd = 0.0
+cvd := nz(cvd[1]) + volDelta
+
+// Price source (for non-CVD mode)
+float srcPrice = close
+
+// This is the series we feed into both JMAs: either CVD or close
+float src = useCvd ? cvd : srcPrice
+
+// ─────────────────── Helper: map phase input to internal phaseV
 phaseV(ph) =>
     math.min(math.max((ph * 0.01) + 1.5, 0.5), 2.5)
 
-// ─────────────────── FAST JMA (separate state)
-phaseV_fast = phaseV(fastPhase)
-beta_f = fastPower * (fastLen - 1) / ((fastPower * (fastLen - 1)) + 2)
-len1_f = math.max((math.log(math.sqrt(0.5 * (fastLen - 1))) / math.log(2.0)) + 2.0, 0)
-pow1_f = math.max(len1_f - 2.0, 0.5)
-pow1Recip_f = 1.0 / pow1_f
-alpha_f = math.pow(beta_f, pow1Recip_f)
-alphaSqr_f = alpha_f * alpha_f
-oneMinusAlpha_f = 1.0 - alpha_f
-oneMinusAlphaSqr_f = oneMinusAlpha_f * oneMinusAlpha_f
+// ─────────────────── FAST JMA (on src)
+phaseV_fast          = phaseV(fastPhase)
+beta_f               = fastPower * (fastLen - 1) / ((fastPower * (fastLen - 1)) + 2)
+len1_f               = math.max((math.log(math.sqrt(0.5 * (fastLen - 1))) / math.log(2.0)) + 2.0, 0)
+pow1_f               = math.max(len1_f - 2.0, 0.5)
+pow1Recip_f          = 1.0 / pow1_f
+alpha_f              = math.pow(beta_f, pow1Recip_f)
+alphaSqr_f           = alpha_f * alpha_f
+oneMinusAlpha_f      = 1.0 - alpha_f
+oneMinusAlphaSqr_f   = oneMinusAlpha_f * oneMinusAlpha_f
 
 var float ma1_f  = na
 var float det0_f = na
@@ -53,16 +68,16 @@ ma2_f  = ma1_f + (phaseV_fast * det0_f)
 det1_f := na(det1_f) ? 0.0 : ((ma2_f - nz(jma_f, src)) * oneMinusAlphaSqr_f) + (alphaSqr_f * det1_f)
 jma_f  := na(jma_f)  ? src : nz(jma_f, src) + det1_f
 
-// ─────────────────── SLOW JMA (separate state)
-phaseV_slow = phaseV(slowPhase)
-beta_s = slowPower * (slowLen - 1) / ((slowPower * (slowLen - 1)) + 2)
-len1_s = math.max((math.log(math.sqrt(0.5 * (slowLen - 1))) / math.log(2.0)) + 2.0, 0)
-pow1_s = math.max(len1_s - 2.0, 0.5)
-pow1Recip_s = 1.0 / pow1_s
-alpha_s = math.pow(beta_s, pow1Recip_s)
-alphaSqr_s = alpha_s * alpha_s
-oneMinusAlpha_s = 1.0 - alpha_s
-oneMinusAlphaSqr_s = oneMinusAlpha_s * oneMinusAlpha_s
+// ─────────────────── SLOW JMA (on src)
+phaseV_slow          = phaseV(slowPhase)
+beta_s               = slowPower * (slowLen - 1) / ((slowPower * (slowLen - 1)) + 2)
+len1_s               = math.max((math.log(math.sqrt(0.5 * (slowLen - 1))) / math.log(2.0)) + 2.0, 0)
+pow1_s               = math.max(len1_s - 2.0, 0.5)
+pow1Recip_s          = 1.0 / pow1_s
+alpha_s              = math.pow(beta_s, pow1Recip_s)
+alphaSqr_s           = alpha_s * alpha_s
+oneMinusAlpha_s      = 1.0 - alpha_s
+oneMinusAlphaSqr_s   = oneMinusAlpha_s * oneMinusAlpha_s
 
 var float ma1_s  = na
 var float det0_s = na
@@ -82,23 +97,35 @@ col_slow = jma_s > jma_s[1] ? color.orange : color.red
 plot(jma_f, "JMA Fast", color=col_fast, linewidth=2)
 plot(jma_s, "JMA Slow", color=col_slow, linewidth=2)
 
-// ─────────────────── ATR-band Hysteresis Decision (Schmitt Trigger)
-atr   = ta.atr(atrLen)
-D     = jma_f - jma_s
+// ─────────────────── ATR / band base: price ATR or CVD-ATR
+float atr_price = ta.atr(atrLen)                           // classic ATR on price
+float trCvd     = math.abs(cvd - nz(cvd[1]))               // "true range" analogue for CVD
+float atr_cvd   = ta.rma(trCvd, atrLen)                    // ATR-like on CVD
+float atr       = useCvd ? atr_cvd : atr_price             // choose based on mode
 
-// Slope-aware boost (optional). Normalize slope by ATR to stay scale-aware.
+// ─────────────────── Slope-aware boost (on slow JMA of src)
 lr_now  = ta.linreg(jma_s, slopeLen, 0)
 lr_prev = ta.linreg(jma_s, slopeLen, 1)
 slope   = lr_now - lr_prev
 norm    = atr != 0.0 ? math.abs(slope) / atr : math.abs(slope)
 boost   = slopeAware ? (1.0 + slopeLambda * math.max(0.0, 1.0 - norm)) : 1.0
 
-band  = bandMult * atr * boost
-upper =  band
-lower = -band
+// ─────────────────── Delta-strength factor: weak delta → wider band, strong delta → tighter band
+float absDelta      = ta.rma(math.abs(volDelta), atrLen)
+float baselineDelta = ta.rma(absDelta, atrLen * 2)
+float absDeltaN     = baselineDelta != 0.0 ? absDelta / baselineDelta : 1.0
+float absDeltaNCl   = math.min(math.max(absDeltaN, 0.25), 4.0) // clamp to avoid extremes
+float deltaBoost    = 1.0 / absDeltaNCl                         // >1 when delta weak, <1 when strong
 
-// State machine with hysteresis
-var int pos = 0            // +1 long, -1 short, 0 neutral (startup)
+// Final band
+float band  = bandMult * atr * boost * deltaBoost
+float upper =  band
+float lower = -band
+
+// ─────────────────── Schmitt Trigger state machine on JMA spread
+float D = jma_f - jma_s
+
+var int pos       = 0       // +1 long, -1 short, 0 neutral (startup)
 var int barsSince = 100000
 barsSince += 1
 
@@ -115,18 +142,22 @@ if barsSince >= minBars
         bear := true
         barsSince := 0
 
-// ─────────────────── Plot decision band (must be global-scope calls)
+// ─────────────────── Plot decision band (around slow JMA)
 uPlot = plot(showBand ? jma_s + band : na, "Upper band", color=color.new(color.gray, 70), linewidth=1)
-lPlot = plot(showBand ? jma_s - band : na, "Lower band", color=color.new(color.gray, 70), linewidth=1)
+lPlot = plot(showBand ? jma_s - band : na, "Lower band", color=color.new(color.gray, 92), linewidth=1)
 fill(uPlot, lPlot, color=color.new(color.gray, 92))
 
-// Signal markers at the fast JMA
+// ─────────────────── Signal markers (on fast JMA)
 plotshape(bull ? jma_f : na, title="Buy",  style=shape.triangleup,   location=location.absolute, size=size.tiny, color=color.new(color.lime, 0), text="BUY")
 plotshape(bear ? jma_f : na, title="Sell", style=shape.triangledown, location=location.absolute, size=size.tiny, color=color.new(color.red, 0),  text="SELL")
 
 // Alerts for automation
-alertcondition(bull, "Buy: Fast JMA > Slow JMA + band",  "Flip LONG: fast JMA cleared slow JMA + ATR band.")
-alertcondition(bear, "Sell: Fast JMA < Slow JMA - band", "Flip SHORT: fast JMA cleared slow JMA - ATR band.")
+alertcondition(bull, "Buy: Fast JMA > Slow JMA + band",  "Flip LONG: fast JMA cleared slow JMA + band.")
+alertcondition(bear, "Sell: Fast JMA < Slow JMA - band", "Flip SHORT: fast JMA cleared slow JMA - band.")
 
-// Optional regime background
-bgcolor(pos == 1 ? color.new(color.lime, 92) : pos == -1 ? color.new(color.red, 92) : na)
+// ─────────────────── Regime-based candle colors
+bool inBand = (D <= upper) and (D >= lower)   // |D| <= band  → inside band (ranging)
+
+// One-line assignment for regime-based barcolor
+color regimeColor = inBand ? color.yellow : pos == 1 ? color.lime : pos == -1 ? color.red : na
+barcolor(regimeColor, title="Regime candles")
