@@ -1,35 +1,43 @@
 //@version=5
-indicator(title="ATR Range Finder (MTF + Source)", overlay=true)
+indicator(title="ATR Range Finder (MTF + Source, Auto Mult)", overlay=true)
 
 // === INPUT PARAMETERS ===
-src            = input.source(close, "Source")
-tf             = input.timeframe("", "Timeframe (leave blank = chart TF)")
+src = input.source(close, "Source")
+tf  = input.timeframe("", "Timeframe (leave blank = chart TF)")
 
-atrPeriod         = input.int(21, title="Short-Term ATR Period")
-atrMultiplier     = input.float(2.0, title="Short-Term ATR Multiplier")
-zemaBandLen       = input.int(30, title="ZEMA Band Smoothing Length")
+// ATR periods (short / long)
+atrPeriod     = input.int(21,  title="Short-Term ATR Period")
+longATRPeriod = input.int(200, title="Long-Term ATR Period")
 
-trendMethod       = input.string("JMA", title="Trend Line Method", options=["ZEMA", "EMA", "HMA", "SMA", "JMA"])
-trendLen          = input.int(200, title="Trend Line Length")
-trendColor        = input.color(color.blue, title="Trend Line Color")
+// Auto range coverage
+targetPctInput = input.float(70.0, "Target % bars inside band", minval=50.0, maxval=99.0, step=0.5)
+calibLen       = input.int(500, "Auto-calibration lookback (bars)", minval=50, maxval=2000)
+steps          = input.int(25, "Auto-calibration resolution (internal steps)", minval=10, maxval=50)
 
-enableLongATR     = input.bool(true, title="Enable Long-Term ATR Minimum Gap")
-longATRPeriod     = input.int(200, title="Long-Term ATR Period")
-longATRMultiplier = input.float(3.0, title="Long-Term ATR Multiplier")
+// ZEMA band smoothing
+zemaBandLen = input.int(30, title="ZEMA Band Smoothing Length")
+
+// Trend line
+trendMethod = input.string("JMA", title="Trend Line Method", options=["ZEMA", "EMA", "HMA", "SMA", "JMA"])
+trendLen    = input.int(200, title="Trend Line Length")
+trendColor  = input.color(color.blue, title="Trend Line Color")
+
+// Long ATR band usage
+enableLongATR = input.bool(true, title="Enable Long-Term ATR Minimum Gap")
 
 // JMA specific inputs
 jmaPeriod = input.int(200, title="JMA Period", minval=1)
-jmaPhase  = input.int(0, title="JMA Phase", minval=-100, maxval=100, step=10)
+jmaPhase  = input.int(0,   title="JMA Phase", minval=-100, maxval=100, step=10)
 jmaFactor = input.float(1, title="JMA Power", minval=0.1, maxval=1.0, step=0.01)
 
 // === ZEMA FUNCTION ===
-zema(src, len) =>
-    ema1 = ta.ema(src, len)
+zema(src_, len) =>
+    ema1 = ta.ema(src_, len)
     ema2 = ta.ema(ema1, len)
     ema1 + (ema1 - ema2)
 
 // === JMA FUNCTION (approx) ===
-jurikMA(src, period, phase, factor) =>
+jurikMA(src_, period, phase, factor) =>
     var float phase_value = math.min(math.max((phase * 0.01) + 1.5, 0.5), 2.5)
     var float beta = factor * (period - 1) / ((factor * (period - 1)) + 2)
     var float len1 = math.max((math.log(math.sqrt(0.5 * (period - 1))) / math.log(2.0)) + 2.0, 0)
@@ -39,18 +47,18 @@ jurikMA(src, period, phase, factor) =>
     var float avgVoltyAlpha = 2.0 / (math.max(4.0 * period, 65) + 1.0)
     var float div = 1.0 / (10.0 + 10.0 * (math.min(math.max(period - 10, 0), 100)) / 100.0)
 
-    var float upperBand = src
-    var float lowerBand = src
-    var float ma1 = src
-    var float jma = src
+    var float upperBand = src_
+    var float lowerBand = src_
+    var float ma1 = src_
+    var float jma = src_
     var float vSum = 0.0
     var float det0 = 0.0
     var float det1 = 0.0
     var float avgVolty = 0.0
     var volty_array = array.new_float(11, 0.0)
     
-    del1 = src - upperBand
-    del2 = src - lowerBand
+    del1 = src_ - upperBand
+    del2 = src_ - lowerBand
     volty = math.abs(del1) == math.abs(del2) ? 0 : math.max(math.abs(del1), math.abs(del2))
     array.unshift(volty_array, volty)
     array.pop(volty_array)
@@ -59,17 +67,17 @@ jurikMA(src, period, phase, factor) =>
     rvolty = math.min(math.max(avgVolty > 0 ? volty / avgVolty : 1.0, 1.0), math.pow(len1, pow1Reciprocal))
     pow2 = math.pow(rvolty, pow1)
     Kv = math.pow(len2 / (len2 + 1), math.sqrt(pow2))
-    upperBand := del1 > 0 ? src : src - Kv * del1
-    lowerBand := del2 < 0 ? src : src - Kv * del2
+    upperBand := del1 > 0 ? src_ : src_ - Kv * del1
+    lowerBand := del2 < 0 ? src_ : src_ - Kv * del2
     alpha = math.pow(beta, pow2)
     alphaSquared = alpha * alpha
     oneMinusAlpha = 1.0 - alpha
     oneMinusAlphaSquared = oneMinusAlpha * oneMinusAlpha
-    ma1 := src + (alpha * (ma1 - src))
-    det0 := (src - ma1) * (1 - beta) + beta * det0
+    ma1 := src_ + (alpha * (ma1 - src_))
+    det0 := (src_ - ma1) * (1 - beta) + beta * det0
     ma2 = ma1 + (phase_value * det0)
-    det1 := ((ma2 - nz(jma, src)) * oneMinusAlphaSquared) + (alphaSquared * nz(det1, 0))
-    jma := nz(jma, src) + det1
+    det1 := ((ma2 - nz(jma, src_)) * oneMinusAlphaSquared) + (alphaSquared * nz(det1, 0))
+    jma := nz(jma, src_) + det1
     jma
 
 // === REQUEST SECURITY FOR MTF ===
@@ -77,22 +85,62 @@ source       = request.security(syminfo.tickerid, tf == "" ? timeframe.period : 
 atrShort_mtf = request.security(syminfo.tickerid, tf == "" ? timeframe.period : tf, ta.atr(atrPeriod))
 atrLong_mtf  = request.security(syminfo.tickerid, tf == "" ? timeframe.period : tf, ta.atr(longATRPeriod))
 
-// === SHORT-TERM ATR BANDS ===
-rangeShort = atrShort_mtf * atrMultiplier
-upperShort = source + rangeShort
-lowerShort = source - rangeShort
+// === TREND LINE (used for both logic + calibration) ===
+trendSource = trendMethod == "EMA" ? ta.ema(source, trendLen) :
+     trendMethod == "HMA" ? ta.hma(source, trendLen) :
+     trendMethod == "SMA" ? ta.sma(source, trendLen) :
+     trendMethod == "JMA" ? jurikMA(source, jmaPeriod, jmaPhase, jmaFactor) :
+     zema(source, trendLen)
+
+// === AUTO ATR MULTIPLIER FROM TARGET COVERAGE ===
+targetPct = targetPctInput / 100.0
+var float atrMultEff = 2.0  // fallback / initial guess
+
+n = math.min(calibLen, bar_index)
+if n > 10
+    // 1) Find max normalized deviation using multiplier = 1
+    float maxNorm = 0.0
+    for i = 0 to n - 1
+        atrVal = atrShort_mtf[i]
+        if atrVal > 0
+            normDev = math.abs(source[i] - trendSource[i]) / atrVal
+            maxNorm := math.max(maxNorm, normDev)
+
+    // 2) Grid search multiplier that best matches target percentage
+    float bestM    = atrMultEff
+    float bestDiff = 1.0
+    for s = 1 to steps
+        mCand = maxNorm * s / steps
+        int countInside = 0
+        for i = 0 to n - 1
+            atrVal2 = atrShort_mtf[i]
+            if atrVal2 > 0
+                normDev2 = math.abs(source[i] - trendSource[i]) / atrVal2
+                if normDev2 <= mCand
+                    countInside += 1
+        pctInside = countInside * 1.0 / n
+        diff = math.abs(pctInside - targetPct)
+        if diff < bestDiff
+            bestDiff := diff
+            bestM    := mCand
+    atrMultEff := bestM
+
+// === SHORT-TERM ATR BANDS (centered on trend) ===
+rangeShort = atrShort_mtf * atrMultEff
+upperShort = trendSource + rangeShort
+lowerShort = trendSource - rangeShort
 widthShort = upperShort - lowerShort
 
-// === LONG-TERM ATR BANDS ===
-rangeLong = atrLong_mtf * longATRMultiplier
-upperLong = source + rangeLong
-lowerLong = source - rangeLong
+// === LONG-TERM ATR BANDS (same multiplier, different ATR) ===
+rangeLong = atrLong_mtf * atrMultEff
+upperLong = trendSource + rangeLong
+lowerLong = trendSource - rangeLong
 widthLong = upperLong - lowerLong
 
-// === DYNAMIC BAND SELECTION ===
-useLongBands  = enableLongATR and (widthLong > widthShort)
-upperBandRaw  = useLongBands ? upperLong : upperShort
-lowerBandRaw  = useLongBands ? lowerLong : lowerShort
+// === DYNAMIC BAND SELECTION (same multiplier for both) ===
+useLongBands = enableLongATR and (widthLong > widthShort)
+upperBandRaw = useLongBands ? upperLong : upperShort
+lowerBandRaw = useLongBands ? lowerLong : lowerShort
 
 // === ZEMA SMOOTHING OF BANDS ===
 smoothedUpperBand = zema(upperBandRaw, zemaBandLen)
@@ -101,19 +149,14 @@ smoothedLowerBand = zema(lowerBandRaw, zemaBandLen)
 // === CENTER ===
 centerLine = (smoothedUpperBand + smoothedLowerBand) / 2.0
 
-// === TREND LINE CHOICE ===
-trendSource = trendMethod == "EMA" ? ta.ema(source, trendLen) : trendMethod == "HMA" ? ta.hma(source, trendLen) : trendMethod == "SMA" ? ta.sma(source, trendLen) : trendMethod == "JMA" ? jurikMA(source, jmaPeriod, jmaPhase, jmaFactor) : zema(source, trendLen)
-
-// === ORANGE vs PURPLE LOGIC (FIXED) ===
-// "Between" means inside the band: lower <= price <= upper
+// === ORANGE vs PURPLE LOGIC (unchanged, but bands now auto-sized) ===
 priceBetweenQ  = source >= smoothedLowerBand and source <= smoothedUpperBand
 priceOutsideQ  = not priceBetweenQ
 
 maBetweenQ     = trendSource >= smoothedLowerBand and trendSource <= smoothedUpperBand
 maOutsideQ     = not maBetweenQ
-maOutsideOuter = maOutsideQ  // kept as alias
+maOutsideOuter = maOutsideQ
 
-// Keep the same structural idea as your original trigger:
 triggerOrange  = (priceBetweenQ and maOutsideOuter) or (priceOutsideQ and maOutsideQ)
 
 // Persistent orange while MA stays outside the band
