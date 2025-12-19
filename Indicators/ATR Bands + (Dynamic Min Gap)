@@ -1,7 +1,10 @@
 //@version=5
-indicator(title="ATR Range Finder", overlay=true)
+indicator(title="ATR Range Finder (MTF + Source)", overlay=true)
 
 // === INPUT PARAMETERS ===
+src            = input.source(close, "Source")
+tf             = input.timeframe("", "Timeframe (leave blank = chart TF)")
+
 atrPeriod         = input.int(21, title="Short-Term ATR Period")
 atrMultiplier     = input.float(2.0, title="Short-Term ATR Multiplier")
 zemaBandLen       = input.int(30, title="ZEMA Band Smoothing Length")
@@ -25,7 +28,7 @@ zema(src, len) =>
     ema2 = ta.ema(ema1, len)
     ema1 + (ema1 - ema2)
 
-// === JMA FUNCTION ===
+// === JMA FUNCTION (approx) ===
 jurikMA(src, period, phase, factor) =>
     var float phase_value = math.min(math.max((phase * 0.01) + 1.5, 0.5), 2.5)
     var float beta = factor * (period - 1) / ((factor * (period - 1)) + 2)
@@ -69,75 +72,72 @@ jurikMA(src, period, phase, factor) =>
     jma := nz(jma, src) + det1
     jma
 
+// === REQUEST SECURITY FOR MTF ===
+source       = request.security(syminfo.tickerid, tf == "" ? timeframe.period : tf, src)
+atrShort_mtf = request.security(syminfo.tickerid, tf == "" ? timeframe.period : tf, ta.atr(atrPeriod))
+atrLong_mtf  = request.security(syminfo.tickerid, tf == "" ? timeframe.period : tf, ta.atr(longATRPeriod))
+
 // === SHORT-TERM ATR BANDS ===
-atrShort = ta.atr(atrPeriod)
-rangeShort = atrShort * atrMultiplier
-upperShort = close + rangeShort
-lowerShort = close - rangeShort
+rangeShort = atrShort_mtf * atrMultiplier
+upperShort = source + rangeShort
+lowerShort = source - rangeShort
 widthShort = upperShort - lowerShort
 
 // === LONG-TERM ATR BANDS ===
-atrLong = ta.atr(longATRPeriod)
-rangeLong = atrLong * longATRMultiplier
-upperLong = close + rangeLong
-lowerLong = close - rangeLong
+rangeLong = atrLong_mtf * longATRMultiplier
+upperLong = source + rangeLong
+lowerLong = source - rangeLong
 widthLong = upperLong - lowerLong
 
 // === DYNAMIC BAND SELECTION ===
-useLongBands = enableLongATR and (widthLong > widthShort)
-upperBandRaw = useLongBands ? upperLong : upperShort
-lowerBandRaw = useLongBands ? lowerLong : lowerShort
+useLongBands  = enableLongATR and (widthLong > widthShort)
+upperBandRaw  = useLongBands ? upperLong : upperShort
+lowerBandRaw  = useLongBands ? lowerLong : lowerShort
 
-// === ZEMA SMOOTHING ===
+// === ZEMA SMOOTHING OF BANDS ===
 smoothedUpperBand = zema(upperBandRaw, zemaBandLen)
 smoothedLowerBand = zema(lowerBandRaw, zemaBandLen)
 
-// === CENTER AND QUARTILE LINES ===
-centerLine = (smoothedUpperBand + smoothedLowerBand) / 2
-line25 = smoothedLowerBand + 0.25 * (smoothedUpperBand - smoothedLowerBand)
-line75 = smoothedLowerBand + 0.75 * (smoothedUpperBand - smoothedLowerBand)
+// === CENTER ===
+centerLine = (smoothedUpperBand + smoothedLowerBand) / 2.0
 
-// === TREND LINE SELECTION WITH JMA OPTION ===
-trendSource = switch trendMethod
-    "EMA" => ta.ema(close, trendLen)
-    "HMA" => ta.hma(close, trendLen)
-    "SMA" => ta.sma(close, trendLen)
-    "JMA" => jurikMA(close, jmaPeriod, jmaPhase, jmaFactor)
-    => zema(close, trendLen)
+// === TREND LINE CHOICE ===
+trendSource = trendMethod == "EMA" ? ta.ema(source, trendLen) : trendMethod == "HMA" ? ta.hma(source, trendLen) : trendMethod == "SMA" ? ta.sma(source, trendLen) : trendMethod == "JMA" ? jurikMA(source, jmaPeriod, jmaPhase, jmaFactor) : zema(source, trendLen)
 
-// === PERSISTENT ORANGE CANDLE LOGIC ===
+// === ORANGE vs PURPLE LOGIC (FIXED) ===
+// "Between" means inside the band: lower <= price <= upper
+priceBetweenQ  = source >= smoothedLowerBand and source <= smoothedUpperBand
+priceOutsideQ  = not priceBetweenQ
+
+maBetweenQ     = trendSource >= smoothedLowerBand and trendSource <= smoothedUpperBand
+maOutsideQ     = not maBetweenQ
+maOutsideOuter = maOutsideQ  // kept as alias
+
+// Keep the same structural idea as your original trigger:
+triggerOrange  = (priceBetweenQ and maOutsideOuter) or (priceOutsideQ and maOutsideQ)
+
+// Persistent orange while MA stays outside the band
 var bool orangeSignal = false
+orangeSignal := triggerOrange or (orangeSignal and not maBetweenQ)
 
-closeOutside = close < line25 or close > line75
-jmaOutside   = trendSource < line25 or trendSource > line75
+// === BACKGROUND HIGHLIGHT WHEN LONG ATR IS ACTIVE ===
+bgcolor(useLongBands ? color.new(color.teal, 85) : na, title="Long ATR Background")
 
-if (closeOutside and jmaOutside) or (not (trendSource >= line25 and trendSource <= line75) and orangeSignal)
-    orangeSignal := true
-else if trendSource >= line25 and trendSource <= line75
-    orangeSignal := false
-
-// === FAKE CANDLES OVERLAY ===
-fakeOpen  = open
-fakeHigh  = high
-fakeLow   = low
-fakeClose = close
-
-plotcandle(orangeSignal ? fakeOpen : na,
-           orangeSignal ? fakeHigh : na,
-           orangeSignal ? fakeLow : na,
-           orangeSignal ? fakeClose : na,
+// === OVERLAY CANDLES ===
+plotcandle(orangeSignal ? open : na,
+           orangeSignal ? high : na,
+           orangeSignal ? low  : na,
+           orangeSignal ? close: na,
            color=color.orange, bordercolor=color.orange, wickcolor=color.orange, title="Orange Overlay Candles")
 
-plotcandle(not orangeSignal ? fakeOpen : na,
-           not orangeSignal ? fakeHigh : na,
-           not orangeSignal ? fakeLow : na,
-           not orangeSignal ? fakeClose : na,
+plotcandle(not orangeSignal ? open : na,
+           not orangeSignal ? high : na,
+           not orangeSignal ? low  : na,
+           not orangeSignal ? close: na,
            color=color.purple, bordercolor=color.purple, wickcolor=color.purple, title="Purple Overlay Candles")
 
-// === PLOTS FOR BANDS AND TREND ===
-p1 = plot(smoothedUpperBand, title="ZEMA Upper ATR Band", color=color.new(color.red, 0), linewidth=2)
-p2 = plot(smoothedLowerBand, title="ZEMA Lower ATR Band", color=color.new(color.green, 0), linewidth=2)
-plot(centerLine, title="Center Line", color=color.new(color.gray, 50), linewidth=1)
-plot(line25, title="25% Line", color=color.new(color.yellow, 50), linewidth=1)
-plot(line75, title="75% Line", color=color.new(color.yellow, 50), linewidth=1)
-plot(trendSource, title="Trend Line", color=trendColor, linewidth=2)
+// === BAND & TREND PLOTS ===
+plot(smoothedUpperBand, title="ZEMA Upper ATR Band", color=color.new(color.red, 0), linewidth=2)
+plot(smoothedLowerBand, title="ZEMA Lower ATR Band", color=color.new(color.green, 0), linewidth=2)
+plot(centerLine,        title="Center Line",          color=color.new(color.gray, 50), linewidth=1)
+plot(trendSource,       title="Trend Line",           color=trendColor, linewidth=2)
