@@ -1,32 +1,57 @@
-//@version=5
-indicator("RSI Trends v7 (Enhanced Range Detection)", format=format.price, precision=2)
+//@version=6
+indicator("RSI Sideways v8", shorttitle="RSI Sideways v4", overlay=false, format=format.price, precision=2, max_bars_back=5000)
 
-// === INPUT SETTINGS ===
-timeFrameInput = input.timeframe("", title="Select Timeframe (leave blank = chart TF)")
-rsiLengthInput = input.int(60, minval=1, title="RSI Length")
-rsiSourceInput = input.source(close, "Source")
-jmaLenInput    = input.int(14, title="JMA Length")
-jmaPhaseInput  = input.int(0, minval=-100, maxval=100, step=10, title="JMA Phase")
-jmaPowerInput  = input.float(1, minval=0.1, maxval=1.0, step=0.01, title="JMA Power (Factor)")
-bandGap       = input.int(3, minval=1, maxval=25, title="Gap from 50")
-rsiLookback   = input.int(15, title="Range Look Back Period")
-preserveLastColor = input.bool(true, title="Preserve Last Color When Flat")
+// ───────────────────── Inputs (MINIMAL)
+timeFrameInput = input.timeframe("", "Timeframe (blank = chart TF)")
+rsiLen         = input.int(60, minval=2, title="RSI Length")
 
-// === NEW RANGE DETECTION INPUTS ===
-useDynamicBands = input.bool(true, title="Use Dynamic Range Bands")
-maType = input.string("VWMA", options=["SMA", "EMA", "VWMA", "HMA", "TEMA"], title="MA Type for Range Detection")
-slowMaLength = input.int(200, minval=50, title="Slow MA Length for Range Detection")
-minRangeGap = input.float(2.0, minval=1.0, maxval=10.0, step=0.5, title="Minimum Range Gap")
-flatnessThreshold = input.float(1.5, minval=0.5, maxval=5.0, title="Flatness Threshold")
-rangeStrength = input.int(15, minval=5, maxval=30, title="Range Strength Period")
+enum Strength
+    very_low
+    low
+    normal
+    high
+    very_high
 
-// === RSI Calculation Function ===
-rsiCalc(src, len) =>
-    up = ta.rma(math.max(ta.change(src), 0), len)
-    down = ta.rma(-math.min(ta.change(src), 0), len)
-    down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+adaptability = input.enum(Strength.normal, "Adaptability")
+sensitivity  = input.enum(Strength.normal, "Sensitivity")
 
-// === JMA Calculation Function ===
+src = input.source(close, "Source")
+
+// ───────────────────── Fixed design choices (NO input)
+const string MA_TYPE = "VWMA"
+const int    JMA_LEN = 14
+const int    JMA_PHASE = 0
+const float  JMA_POWER = 1.0
+
+// ───────────────────── Params derived from Adaptability/Sensitivity
+var int slowMaLength = 200
+var int volDevLen    = 50
+var int flatLen      = 20
+var int slopeLen     = 5
+
+switch adaptability
+    Strength.very_low  => slowMaLength := 320, volDevLen := 90, flatLen := 30, slopeLen := 8
+    Strength.low       => slowMaLength := 260, volDevLen := 70, flatLen := 26, slopeLen := 6
+    Strength.normal    => slowMaLength := 200, volDevLen := 50, flatLen := 20, slopeLen := 5
+    Strength.high      => slowMaLength := 150, volDevLen := 40, flatLen := 16, slopeLen := 4
+    Strength.very_high => slowMaLength := 110, volDevLen := 30, flatLen := 12, slopeLen := 3
+
+var float volDevFactor     = 1.5
+var float minBandHalfWidth = 2.0
+var float flatThreshold    = 1.5
+var int   enterBars        = 3
+var int   exitBars         = 2
+var float slopeThrPerBar   = 0.25
+var int   slopeConfirmBars = 3
+
+switch sensitivity
+    Strength.very_low  => volDevFactor := 1.9, minBandHalfWidth := 2.8, flatThreshold := 1.2, enterBars := 5, exitBars := 3, slopeThrPerBar := 0.35, slopeConfirmBars := 4
+    Strength.low       => volDevFactor := 1.7, minBandHalfWidth := 2.4, flatThreshold := 1.35, enterBars := 4, exitBars := 3, slopeThrPerBar := 0.30, slopeConfirmBars := 4
+    Strength.normal    => volDevFactor := 1.5, minBandHalfWidth := 2.0, flatThreshold := 1.5, enterBars := 3, exitBars := 2, slopeThrPerBar := 0.25, slopeConfirmBars := 3
+    Strength.high      => volDevFactor := 1.3, minBandHalfWidth := 1.7, flatThreshold := 1.7, enterBars := 2, exitBars := 2, slopeThrPerBar := 0.20, slopeConfirmBars := 3
+    Strength.very_high => volDevFactor := 1.1, minBandHalfWidth := 1.4, flatThreshold := 1.9, enterBars := 1, exitBars := 1, slopeThrPerBar := 0.15, slopeConfirmBars := 2
+
+// ───────────────────── JMA
 jmaCalc(src, length, phase, power) =>
     phase_value = math.min(math.max((phase * 0.01) + 1.5, 0.5), 2.5)
     beta = power * (length - 1) / ((power * (length - 1)) + 2)
@@ -67,130 +92,100 @@ jmaCalc(src, length, phase, power) =>
     upperBand := del1 > 0 ? src : src - Kv * del1
     lowerBand := del2 < 0 ? src : src - Kv * del2
     alpha = math.pow(beta, pow2)
-    alphaSquared = alpha * alpha
-    oneMinusAlpha = 1.0 - alpha
-    oneMinusAlphaSquared = oneMinusAlpha * oneMinusAlpha
+    alpha2 = alpha * alpha
+    oma = 1.0 - alpha
+    oma2 = oma * oma
     ma1 := src + (alpha * (ma1 - src))
     det0 := (src - ma1) * (1 - beta) + beta * det0
     ma2 = ma1 + (phase_value * det0)
-    det1 := ((ma2 - nz(jma_value, src)) * oneMinusAlphaSquared) + (alphaSquared * nz(det1, 0))
+    det1 := ((ma2 - nz(jma_value, src)) * oma2) + (alpha2 * nz(det1, 0))
     jma_value := nz(jma_value, src) + det1
     jma_value
 
-// === TEMA function for "TEMA" MA type ===
-tema(src, len) =>
-    ema1 = ta.ema(src, len)
-    ema2 = ta.ema(ema1, len)
-    ema3 = ta.ema(ema2, len)
-    3 * ema1 - 3 * ema2 + ema3
+// ───────────────────── MA (fixed VWMA)
+getMa(src, len) => ta.vwma(src, len)
 
-// === MA Selector ===
-getMa(src, len, mt) =>
-    switch mt
-        "SMA"  => ta.sma(src, len)
-        "EMA"  => ta.ema(src, len)
-        "VWMA" => ta.vwma(src, len)
-        "HMA"  => ta.hma(src, len)
-        "TEMA" => tema(src, len)
-        => na
-
-// === REQUEST DATA FROM CUSTOM TIMEFRAME OR CHART ===
+// ───────────────────── Security pack
 tf = timeFrameInput == "" ? timeframe.period : timeFrameInput
-rsi = request.security(syminfo.tickerid, tf, rsiCalc(rsiSourceInput, rsiLengthInput))
-jma_value = request.security(syminfo.tickerid, tf, jmaCalc(rsi, jmaLenInput, jmaPhaseInput, jmaPowerInput))
-slowMa = request.security(syminfo.tickerid, tf, getMa(rsi, slowMaLength, maType))
 
-// === DYNAMIC RANGE BANDS ===
-dynamicUpperBand = useDynamicBands ? slowMa + minRangeGap : 50 + bandGap
-dynamicLowerBand = useDynamicBands ? slowMa - minRangeGap : 50 - bandGap
-dynamicMidpoint = useDynamicBands ? slowMa : 50
+f_pack() =>
+    r    = ta.rsi(src, rsiLen)
+    j    = jmaCalc(r, JMA_LEN, JMA_PHASE, JMA_POWER)
+    slow = getMa(r, slowMaLength)
+    mid  = slow
+    wVol = volDevFactor * ta.stdev(j, volDevLen)
+    hw   = math.max(minBandHalfWidth, wVol)
+    upB  = mid + hw
+    loB  = mid - hw
+    flat = ta.stdev(j, flatLen)
+    insideJ = (j >= loB and j <= upB)
+    slopePerBar = slopeLen > 0 ? (j - nz(j[slopeLen], j)) / slopeLen : 0.0
+    [r, j, slow, upB, mid, loB, flat, insideJ, slopePerBar]
 
-// === FLATNESS ===
-jmaStdDev = ta.stdev(jma_value, rangeStrength)
-isFlat = jmaStdDev < flatnessThreshold
+// ONE LINE (as requested)
+[rsi, jma_value, slowMa, upperBand, midBand, lowerBand, flatVal, insideNow, slopePerBar] = request.security(syminfo.tickerid, tf, f_pack())
 
-// === RANGE DETECTION FUNCTION ===
-isEnhancedRange() =>
-    consecutiveInRange = 0
-    for i = 0 to math.min(rsiLookback, bar_index)
-        jmaVal = jma_value[i]
-        upperBandVal = useDynamicBands ? (getMa(rsi, slowMaLength, maType)[i] + minRangeGap) : (50 + bandGap)
-        lowerBandVal = useDynamicBands ? (getMa(rsi, slowMaLength, maType)[i] - minRangeGap) : (50 - bandGap)
-        if jmaVal >= lowerBandVal and jmaVal <= upperBandVal
-            consecutiveInRange += 1
-        else if consecutiveInRange > 0
-            break
-    rangeCondition1 = consecutiveInRange >= math.min(10, rsiLookback)
-    rangeCondition2 = isFlat
-    rangeCondition3 = math.abs(jma_value - slowMa) < (minRangeGap * 1.5)
-    rangeCondition1 and rangeCondition2 and rangeCondition3
+// ───────────────────── Sideways detector (inside + flat + persistence)
+flatOK = flatVal < flatThreshold
 
-// === PING PONG DETECTION FUNCTION ===
-isPingPongMarket() =>
-    maxConsecutive = 5
-    aboveCount = 0
-    belowCount = 0
-    for i = 0 to math.min(rsiLookback, bar_index)
-        if jma_value[i] > dynamicMidpoint
-            aboveCount += 1
-            belowCount := 0
-        else if jma_value[i] < dynamicMidpoint
-            belowCount += 1
-            aboveCount := 0
-        if aboveCount > maxConsecutive or belowCount > maxConsecutive
-            false
-    true
+var bool sideways = false
+var int  inCnt = 0
+var int  outCnt = 0
 
-// === JMA COLORING WITH ENHANCED TRENDS ===
-var color lastTrendColor = color.yellow
-jmaColor = color.yellow
-
-if isEnhancedRange()
-    jmaColor := color.fuchsia
-    lastTrendColor := color.fuchsia
-else if jma_value > dynamicUpperBand
-    jmaColor := color.lime
-    lastTrendColor := color.lime
-else if jma_value < dynamicLowerBand
-    jmaColor := color.red
-    lastTrendColor := color.red
-else if preserveLastColor
-    jmaColor := lastTrendColor
+if insideNow and flatOK
+    inCnt += 1
+    outCnt := 0
 else
-    jmaColor := color.yellow
+    outCnt += 1
+    inCnt := 0
 
-// === PLOTS ===
+brokeOutBands = (jma_value > upperBand) or (jma_value < lowerBand)
+
+if not sideways and inCnt >= enterBars
+    sideways := true
+if sideways and (brokeOutBands or outCnt >= exitBars)
+    sideways := false
+
+// ───────────────────── State machine: slope escape ONLY when Yellow/Purple
+const int ST_NEUTRAL = 0
+const int ST_SIDEWAY = 1
+const int ST_UP      = 2
+const int ST_DOWN    = -2
+
+var int state = ST_NEUTRAL
+prevState = nz(state[1], ST_NEUTRAL)
+
+steepUpNow   = insideNow and slopePerBar >  slopeThrPerBar
+steepDownNow = insideNow and slopePerBar < -slopeThrPerBar
+
+var int slopeUpCnt = 0
+var int slopeDnCnt = 0
+slopeUpCnt := (prevState==ST_NEUTRAL or prevState==ST_SIDEWAY) ? (steepUpNow ? nz(slopeUpCnt[1]) + 1 : 0) : 0
+slopeDnCnt := (prevState==ST_NEUTRAL or prevState==ST_SIDEWAY) ? (steepDownNow ? nz(slopeDnCnt[1]) + 1 : 0) : 0
+
+if prevState == ST_UP
+    state := (jma_value < lowerBand) ? ST_DOWN : (sideways ? ST_SIDEWAY : ST_UP)
+else if prevState == ST_DOWN
+    state := (jma_value > upperBand) ? ST_UP : (sideways ? ST_SIDEWAY : ST_DOWN)
+else
+    state := (jma_value > upperBand) ? ST_UP : (jma_value < lowerBand) ? ST_DOWN : (sideways ? ST_SIDEWAY : ST_NEUTRAL)
+    if insideNow and slopeUpCnt >= slopeConfirmBars
+        state := ST_UP
+    else if insideNow and slopeDnCnt >= slopeConfirmBars
+        state := ST_DOWN
+
+jmaColor = state==ST_SIDEWAY ? color.purple : state==ST_UP ? color.lime : state==ST_DOWN ? color.red : color.yellow
+
+// ───────────────────── Plots
 plot(rsi, "RSI", color=color.new(color.blue, 70), linewidth=1)
-plot(jma_value, "JMA with Phase & Power", color=jmaColor, linewidth=4)
-plot(slowMa, "Slow MA", color=color.new(color.white, 60), linewidth=2)
+plot(jma_value, "RSI JMA", color=jmaColor, linewidth=4)
+plot(slowMa, "Slow MA (RSI)", color=color.new(color.white, 60), linewidth=2)
 
-// === DYNAMIC BANDS AND FILL ===
-bandColor = useDynamicBands ? color.new(color.purple, 0) : color.new(color.orange, 0)
-plot(dynamicUpperBand, title="Upper Band", color=bandColor, linewidth=1)
-plot(dynamicMidpoint, title="Midpoint", color=color.new(bandColor, 50), linewidth=1)
-plot(dynamicLowerBand, title="Lower Band", color=bandColor, linewidth=1)
-fill(plot(dynamicUpperBand), plot(dynamicLowerBand), color=color.rgb(126, 87, 194, 90), title="Background Fill")
+pU = plot(upperBand, "Upper Band", color=color.new(color.purple, 0), linewidth=1)
+pM = plot(midBand,   "Mid",        color=color.new(color.purple, 50), linewidth=1)
+pL = plot(lowerBand, "Lower Band", color=color.new(color.purple, 0), linewidth=1)
+fill(pU, pL, color=color.rgb(126, 87, 194, 90), title="Band Fill")
 
-// === STATIC 50 LINE ===
 hline(50, "50 Line", color=color.new(color.gray, 70), linestyle=hline.style_dashed)
 
-// === DEBUG TABLE ===
-var table debug_table = table.new(position.top_right, 2, 6, bgcolor=color.white, border_width=1)
-if barstate.islast
-    table.cell(debug_table, 0, 0, "RSI:", text_color=color.black)
-    table.cell(debug_table, 1, 0, str.tostring(rsi, "#.##"), text_color=color.black)
-    table.cell(debug_table, 0, 1, "JMA:", text_color=color.black)
-    table.cell(debug_table, 1, 1, str.tostring(jma_value, "#.##"), text_color=color.black)
-    table.cell(debug_table, 0, 2, "Slow MA:", text_color=color.black)
-    table.cell(debug_table, 1, 2, str.tostring(slowMa, "#.##"), text_color=color.black)
-    table.cell(debug_table, 0, 3, "Flatness:", text_color=color.black)
-    table.cell(debug_table, 1, 3, str.tostring(jmaStdDev, "#.##"), text_color=color.black)
-    table.cell(debug_table, 0, 4, "Enhanced Range:", text_color=color.black)
-    table.cell(debug_table, 1, 4, isEnhancedRange() ? "YES" : "NO", text_color=color.black)
-    table.cell(debug_table, 0, 5, "Color:", text_color=color.black)
-    table.cell(debug_table, 1, 5, jmaColor == color.lime ? "BULL" : jmaColor == color.red ? "BEAR" : jmaColor == color.fuchsia ? "RANGE" : "NEUTRAL", text_color=color.black)
-
-// === ALERTS ===
-alertcondition(ta.crossover(jma_value, dynamicUpperBand), title="RSI JMA Bullish", message="RSI-JMA crossed above upper band - Bullish trend")
-alertcondition(ta.crossunder(jma_value, dynamicLowerBand), title="RSI JMA Bearish", message="RSI-JMA crossed below lower band - Bearish trend")
-alertcondition(jmaColor == color.fuchsia and jmaColor[1] != color.fuchsia, title="RSI JMA Range", message="RSI-JMA detected ranging market")
+plot(state==ST_SIDEWAY ? 0 : state==ST_UP ? 1 : state==ST_DOWN ? -1 : na, "STREAM Regime (1/-1/0)", display=display.data_window)
