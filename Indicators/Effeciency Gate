@@ -1,0 +1,39 @@
+//@version=6
+indicator("Efficiency Gate (R², Auto Threshold)", overlay=false, max_bars_back=5000)
+
+// ── Inputs (MAX 3)
+src = input.source(close, "Source")
+len = input.int(60, "Length", minval=10)
+k   = input.float(0.50, "k (Mean + k·StDev)", step=0.05)
+
+// ── Efficiency metric: R² = corr(src, time)^2  ∈ [0,1]
+x  = float(bar_index)
+r  = ta.correlation(src, x, len)
+r2 = na(r) ? na : r * r
+
+// ── Fixed smoothing (no extra inputs)
+smoothLen = 10
+eff = ta.ema(r2, smoothLen)
+
+// ── Auto threshold: mean + k·stdev (rolling)
+mu  = ta.sma(eff, len)
+sig = ta.stdev(eff, len)
+thr = na(mu) or na(sig) ? na : mu + k * sig
+
+// ── Hysteresis (fixed band) to prevent flip-flop
+band   = 0.03
+enterT = thr + band
+exitT  = thr - band
+
+var bool trendOK = false
+if not na(eff) and not na(thr)
+    if trendOK and eff < exitT
+        trendOK := false
+    else if not trendOK and eff > enterT
+        trendOK := true
+
+// ── Plots
+plot(eff, "Efficiency (R² smoothed)", linewidth=2)
+plot(thr, "Auto Threshold (μ + k·σ)", style=plot.style_line, linewidth=1)
+plot(trendOK ? 1 : 0, "Gate (1=trade)", style=plot.style_stepline, linewidth=2)
+bgcolor(trendOK ? na : color.new(color.red, 85))
