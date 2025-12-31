@@ -1,58 +1,40 @@
 //@version=6
-indicator("RSI Sideways v8", shorttitle="RSI Sideways v4", overlay=false, format=format.price, precision=2, max_bars_back=5000)
+indicator("RSI Sideways v9", overlay=false, format=format.price, precision=2, max_bars_back=5000)
 
-// ───────────────────── Inputs (MINIMAL)
-timeFrameInput = input.timeframe("", "Timeframe (blank = chart TF)")
-rsiLen         = input.int(60, minval=2, title="RSI Length")
+// ───────────────────── Input groups
+groupTF = "Timeframe / Source"
+groupRS = "RSI"
+groupJM = "JMA (RSI Smoothing)"
+groupMA = "Slow MA (RSI Baseline)"
+groupBD = "Bands"
+groupPS = "Persistence / Hysteresis"
 
-enum Strength
-    very_low
-    low
-    normal
-    high
-    very_high
+// ───────────────────── Inputs
+timeFrameInput = input.timeframe("", "Timeframe (blank = chart TF)", group=groupTF)
+src            = input.source(close, "Source", group=groupTF)
 
-adaptability = input.enum(Strength.normal, "Adaptability")
-sensitivity  = input.enum(Strength.normal, "Sensitivity")
+// RSI
+rsiLen = input.int(60, minval=2, title="RSI Length", group=groupRS)
 
-src = input.source(close, "Source")
+// JMA params
+jmaLen   = input.int(14,  "JMA Length", minval=1, group=groupJM)
+jmaPhase = input.int(0,   "JMA Phase",  minval=-100, maxval=100, step=10, group=groupJM)
+jmaPower = input.float(1.0, "JMA Power", minval=0.1, maxval=5.0, step=0.05, group=groupJM)
 
-// ───────────────────── Fixed design choices (NO input)
-const string MA_TYPE = "VWMA"
-const int    JMA_LEN = 14
-const int    JMA_PHASE = 0
-const float  JMA_POWER = 1.0
+// Slow MA
+slowMaLength = input.int(200, "Slow MA Length", minval=5, group=groupMA)
 
-// ───────────────────── Params derived from Adaptability/Sensitivity
-var int slowMaLength = 200
-var int volDevLen    = 50
-var int flatLen      = 20
-var int slopeLen     = 5
+// Bands (volatility-adaptive)
+volDevLen        = input.int(50,  "Vol Dev Length (stdev)", minval=5, group=groupBD)
+volDevFactor     = input.float(1.5, "VolDev Factor (× stdev)", minval=0.1, step=0.1, group=groupBD)
+minBandHalfWidth = input.float(2.0, "Min Band Half-Width",     minval=0.0, step=0.1, group=groupBD)
 
-switch adaptability
-    Strength.very_low  => slowMaLength := 320, volDevLen := 90, flatLen := 30, slopeLen := 8
-    Strength.low       => slowMaLength := 260, volDevLen := 70, flatLen := 26, slopeLen := 6
-    Strength.normal    => slowMaLength := 200, volDevLen := 50, flatLen := 20, slopeLen := 5
-    Strength.high      => slowMaLength := 150, volDevLen := 40, flatLen := 16, slopeLen := 4
-    Strength.very_high => slowMaLength := 110, volDevLen := 30, flatLen := 12, slopeLen := 3
-
-var float volDevFactor     = 1.5
-var float minBandHalfWidth = 2.0
-var float flatThreshold    = 1.5
-var int   enterBars        = 3
-var int   exitBars         = 2
-var float slopeThrPerBar   = 0.25
-var int   slopeConfirmBars = 3
-
-switch sensitivity
-    Strength.very_low  => volDevFactor := 1.9, minBandHalfWidth := 2.8, flatThreshold := 1.2, enterBars := 5, exitBars := 3, slopeThrPerBar := 0.35, slopeConfirmBars := 4
-    Strength.low       => volDevFactor := 1.7, minBandHalfWidth := 2.4, flatThreshold := 1.35, enterBars := 4, exitBars := 3, slopeThrPerBar := 0.30, slopeConfirmBars := 4
-    Strength.normal    => volDevFactor := 1.5, minBandHalfWidth := 2.0, flatThreshold := 1.5, enterBars := 3, exitBars := 2, slopeThrPerBar := 0.25, slopeConfirmBars := 3
-    Strength.high      => volDevFactor := 1.3, minBandHalfWidth := 1.7, flatThreshold := 1.7, enterBars := 2, exitBars := 2, slopeThrPerBar := 0.20, slopeConfirmBars := 3
-    Strength.very_high => volDevFactor := 1.1, minBandHalfWidth := 1.4, flatThreshold := 1.9, enterBars := 1, exitBars := 1, slopeThrPerBar := 0.15, slopeConfirmBars := 2
+// Persistence / Hysteresis
+enterBars = input.int(3, "Enter Bars (inside)", minval=1, group=groupPS)
+exitBars  = input.int(2, "Exit Bars (outside)", minval=1, group=groupPS)
 
 // ───────────────────── JMA
-jmaCalc(src, length, phase, power) =>
+jmaCalc(_src, length, phase, power) =>
     phase_value = math.min(math.max((phase * 0.01) + 1.5, 0.5), 2.5)
     beta = power * (length - 1) / ((power * (length - 1)) + 2)
     len1 = math.max((math.log(math.sqrt(0.5*(length-1))) / math.log(2.0)) + 2.0, 0)
@@ -70,16 +52,16 @@ jmaCalc(src, length, phase, power) =>
     var float avgVolty = 0.0
     var array<float> volty_array = array.new_float(11, 0.0)
     if barstate.isfirst or na(jma_value)
-        upperBand := src
-        lowerBand := src
-        ma1 := src
-        jma_value := src
+        upperBand := _src
+        lowerBand := _src
+        ma1 := _src
+        jma_value := _src
         avgVolty := 0.0
         vSum := 0.0
         det0 := 0.0
         det1 := 0.0
-    del1 = src - upperBand
-    del2 = src - lowerBand
+    del1 = _src - upperBand
+    del2 = _src - lowerBand
     volty = math.abs(del1) == math.abs(del2) ? 0 : math.max(math.abs(del1), math.abs(del2))
     array.unshift(volty_array, volty)
     if array.size(volty_array) > 11
@@ -89,50 +71,49 @@ jmaCalc(src, length, phase, power) =>
     rvolty = math.min(math.max(avgVolty > 0 ? volty / avgVolty : 1.0, 1.0), math.pow(len1, pow1Reciprocal))
     pow2 = math.pow(rvolty, pow1)
     Kv = math.pow(math.sqrt(0.5*(length-1))*len1/(math.sqrt(0.5*(length-1))*len1+1), math.sqrt(pow2))
-    upperBand := del1 > 0 ? src : src - Kv * del1
-    lowerBand := del2 < 0 ? src : src - Kv * del2
+    upperBand := del1 > 0 ? _src : _src - Kv * del1
+    lowerBand := del2 < 0 ? _src : _src - Kv * del2
     alpha = math.pow(beta, pow2)
     alpha2 = alpha * alpha
     oma = 1.0 - alpha
     oma2 = oma * oma
-    ma1 := src + (alpha * (ma1 - src))
-    det0 := (src - ma1) * (1 - beta) + beta * det0
+    ma1 := _src + (alpha * (ma1 - _src))
+    det0 := (_src - ma1) * (1 - beta) + beta * det0
     ma2 = ma1 + (phase_value * det0)
-    det1 := ((ma2 - nz(jma_value, src)) * oma2) + (alpha2 * nz(det1, 0))
-    jma_value := nz(jma_value, src) + det1
+    det1 := ((ma2 - nz(jma_value, _src)) * oma2) + (alpha2 * nz(det1, 0))
+    jma_value := nz(jma_value, _src) + det1
     jma_value
 
-// ───────────────────── MA (fixed VWMA)
-getMa(src, len) => ta.vwma(src, len)
+// ───────────────────── Slow MA (VWMA)
+getMa(_src, _len) => ta.vwma(_src, _len)
 
 // ───────────────────── Security pack
 tf = timeFrameInput == "" ? timeframe.period : timeFrameInput
 
 f_pack() =>
     r    = ta.rsi(src, rsiLen)
-    j    = jmaCalc(r, JMA_LEN, JMA_PHASE, JMA_POWER)
+    j    = jmaCalc(r, jmaLen, jmaPhase, jmaPower)
     slow = getMa(r, slowMaLength)
+
     mid  = slow
     wVol = volDevFactor * ta.stdev(j, volDevLen)
     hw   = math.max(minBandHalfWidth, wVol)
     upB  = mid + hw
     loB  = mid - hw
-    flat = ta.stdev(j, flatLen)
+
     insideJ = (j >= loB and j <= upB)
-    slopePerBar = slopeLen > 0 ? (j - nz(j[slopeLen], j)) / slopeLen : 0.0
-    [r, j, slow, upB, mid, loB, flat, insideJ, slopePerBar]
+    [r, j, slow, upB, mid, loB, insideJ]
 
-// ONE LINE (as requested)
-[rsi, jma_value, slowMa, upperBand, midBand, lowerBand, flatVal, insideNow, slopePerBar] = request.security(syminfo.tickerid, tf, f_pack())
+// ONE LINE
+[rsi, jma_value, slowMa, upperBand, midBand, lowerBand, insideNow] =
+     request.security(syminfo.tickerid, tf, f_pack())
 
-// ───────────────────── Sideways detector (inside + flat + persistence)
-flatOK = flatVal < flatThreshold
-
+// ───────────────────── Sideways detector (inside + persistence only)
 var bool sideways = false
 var int  inCnt = 0
 var int  outCnt = 0
 
-if insideNow and flatOK
+if insideNow
     inCnt += 1
     outCnt := 0
 else
@@ -146,7 +127,7 @@ if not sideways and inCnt >= enterBars
 if sideways and (brokeOutBands or outCnt >= exitBars)
     sideways := false
 
-// ───────────────────── State machine: slope escape ONLY when Yellow/Purple
+// ───────────────────── State machine
 const int ST_NEUTRAL = 0
 const int ST_SIDEWAY = 1
 const int ST_UP      = 2
@@ -155,24 +136,12 @@ const int ST_DOWN    = -2
 var int state = ST_NEUTRAL
 prevState = nz(state[1], ST_NEUTRAL)
 
-steepUpNow   = insideNow and slopePerBar >  slopeThrPerBar
-steepDownNow = insideNow and slopePerBar < -slopeThrPerBar
-
-var int slopeUpCnt = 0
-var int slopeDnCnt = 0
-slopeUpCnt := (prevState==ST_NEUTRAL or prevState==ST_SIDEWAY) ? (steepUpNow ? nz(slopeUpCnt[1]) + 1 : 0) : 0
-slopeDnCnt := (prevState==ST_NEUTRAL or prevState==ST_SIDEWAY) ? (steepDownNow ? nz(slopeDnCnt[1]) + 1 : 0) : 0
-
 if prevState == ST_UP
     state := (jma_value < lowerBand) ? ST_DOWN : (sideways ? ST_SIDEWAY : ST_UP)
 else if prevState == ST_DOWN
     state := (jma_value > upperBand) ? ST_UP : (sideways ? ST_SIDEWAY : ST_DOWN)
 else
     state := (jma_value > upperBand) ? ST_UP : (jma_value < lowerBand) ? ST_DOWN : (sideways ? ST_SIDEWAY : ST_NEUTRAL)
-    if insideNow and slopeUpCnt >= slopeConfirmBars
-        state := ST_UP
-    else if insideNow and slopeDnCnt >= slopeConfirmBars
-        state := ST_DOWN
 
 jmaColor = state==ST_SIDEWAY ? color.purple : state==ST_UP ? color.lime : state==ST_DOWN ? color.red : color.yellow
 
@@ -188,4 +157,16 @@ fill(pU, pL, color=color.rgb(126, 87, 194, 90), title="Band Fill")
 
 hline(50, "50 Line", color=color.new(color.gray, 70), linestyle=hline.style_dashed)
 
+// ───────────────────── Numbers (Data Window)
+plot(state, "STATE (0 neutral, 1 sideways, 2 up, -2 down)", display=display.data_window)
+plot(sideways ? 1 : 0, "SidewaysFlag (1/0)", display=display.data_window)
+plot(insideNow ? 1 : 0, "InsideBandsNow (1/0)", display=display.data_window)
+plot(inCnt, "InCnt (inside consecutive)", display=display.data_window)
+plot(outCnt, "OutCnt (outside consecutive)", display=display.data_window)
+plot(upperBand - midBand, "BandHalfWidth (hw)", display=display.data_window)
+plot(volDevFactor, "volDevFactor", display=display.data_window)
+plot(minBandHalfWidth, "minBandHalfWidth", display=display.data_window)
+
+// Stream (kept)
 plot(state==ST_SIDEWAY ? 0 : state==ST_UP ? 1 : state==ST_DOWN ? -1 : na, "STREAM Regime (1/-1/0)", display=display.data_window)
+
