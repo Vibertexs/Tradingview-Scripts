@@ -1,0 +1,89 @@
+//@version=6
+indicator("Flow MA", overlay=true, max_bars_back=5000, max_lines_count=500)
+
+//──────────────────────────────── Simplified Inputs
+period = input.int(14, "Period", minval=1, tooltip="Base period for JMA calculation")
+phase  = input.int(0,  "Phase", minval=-100, maxval=100, step=10, tooltip="Shifts JMA response. Negative=lag, Positive=overshoot")
+
+//──────────────────────────────── Fixed parameters (optimized defaults)
+power        = 0.45    // Sweet spot for smoothness
+useSqrtBoost = true    // Sublinear volume weighting
+maxBoost     = 3.0     // Reasonable cap on volume acceleration
+minEffPeriod = 5       // Prevents collapse on spikes
+ratioSmooth  = 5       // Smooth volume transitions
+
+//──────────────────────────────── Clamp helper
+clamp(x, lo, hi) =>
+    math.min(math.max(x, lo), hi)
+
+//──────────────────────────────── JMA function
+jma_func(_src, _period, _phase, _power) =>
+    p = math.max(_period, 1)
+
+    phaseV = math.min(math.max((_phase * 0.01) + 1.5, 0.5), 2.5)
+    beta   = _power * (p - 1) / ((_power * (p - 1)) + 2)
+    len1   = math.max((math.log(math.sqrt(0.5 * (p - 1))) / math.log(2.0)) + 2.0, 0.0)
+    pow1   = math.max(len1 - 2.0, 0.5)
+    alpha  = math.pow(beta, 1.0 / pow1)
+
+    alphaSqr         = alpha * alpha
+    oneMinusAlpha    = 1.0 - alpha
+    oneMinusAlphaSqr = oneMinusAlpha * oneMinusAlpha
+
+    var float ma1  = na
+    var float det0 = na
+    var float det1 = na
+    var float jma  = na
+
+    ma1  := na(ma1)  ? _src : _src + (alpha * (ma1 - _src))
+    det0 := na(det0) ? 0.0  : (_src - ma1) * (1 - beta) + beta * det0
+    ma2   = ma1 + (phaseV * det0)
+    det1 := na(det1) ? 0.0  : ((ma2 - nz(jma, _src)) * oneMinusAlphaSqr) + (alphaSqr * det1)
+    jma  := na(jma)  ? _src : nz(jma, _src) + det1
+
+    jma
+
+//──────────────────────────────── Business-time weight (always on)
+vAvg = ta.sma(volume, period)
+ratio = (not na(vAvg) and vAvg > 0.0) ? (volume / vAvg) : 1.0
+ratioSm = ta.ema(ratio, ratioSmooth)
+boostRaw = useSqrtBoost ? math.sqrt(ratioSm) : ratioSm
+boost = clamp(boostRaw, 1.0, maxBoost)
+effPeriodRaw = period / boost
+effPeriodInt = int(math.round(effPeriodRaw))
+effPeriod = int(clamp(effPeriodInt, minEffPeriod, 300))
+
+//──────────────────────────────── POC proxy (intrabar max-volume close from 1min)
+[ltVolArr, ltCloseArr] = request.security_lower_tf(
+     syminfo.tickerid,
+     "1",
+     [volume, close]
+)
+
+float poc = na
+if ltVolArr.size() > 0
+    float maxVol = array.max(ltVolArr)
+    int   idxMax = array.indexof(ltVolArr, maxVol)
+    poc := idxMax >= 0 ? array.get(ltCloseArr, idxMax) : na
+else
+    poc := na
+
+pocSrc = na(poc) ? close : poc
+
+//──────────────────────────────── JMA on POC source
+jPOC = jma_func(pocSrc, effPeriod, phase, power)
+
+//──────────────────────────────── Plot
+jmaColor = jPOC > jPOC[1] ? color.lime : color.red
+plot(jPOC, "JMA (POC Source, Auto BT)", color=jmaColor, linewidth=2)
+
+//──────────────────────────────── Plot POC segments
+if barstate.isnew
+    if not na(poc[1])
+        line.new(
+            bar_index - 1, poc[1],
+            bar_index,     poc[1],
+            extend = extend.none,
+            color  = color.new(color.gray, 0),
+            width  = 1
+        )
