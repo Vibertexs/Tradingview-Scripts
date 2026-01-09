@@ -1,89 +1,82 @@
 //@version=6
-indicator("Flow MA", overlay=true, max_bars_back=5000, max_lines_count=500)
+indicator("Flow MA", overlay=true, max_bars_back=5000)
 
-//──────────────────────────────── Simplified Inputs
-period = input.int(14, "Period", minval=1, tooltip="Base period for JMA calculation")
-phase  = input.int(0,  "Phase", minval=-100, maxval=100, step=10, tooltip="Shifts JMA response. Negative=lag, Positive=overshoot")
+//──────────────────────────────── Inputs
+grp_main = "Core Settings"
+srcInput = input.source(close, "Source", group=grp_main)
+period   = input.int(20, "Period", minval=2, group=grp_main)
+// Phase is hard-coded to -100
+// Power is hard-coded to 0.1
 
-//──────────────────────────────── Fixed parameters (optimized defaults)
-power        = 0.45    // Sweet spot for smoothness
-useSqrtBoost = true    // Sublinear volume weighting
-maxBoost     = 3.0     // Reasonable cap on volume acceleration
-minEffPeriod = 5       // Prevents collapse on spikes
-ratioSmooth  = 5       // Smooth volume transitions
+grp_lock = "Range Lock Logic"
+lockMult = input.float(0.6, "Lock Threshold", minval=0.1, maxval=2.0, step=0.1, group=grp_lock, tooltip="Lower = stays flat more often. Higher = follows price more.")
 
-//──────────────────────────────── Clamp helper
-clamp(x, lo, hi) =>
-    math.min(math.max(x, lo), hi)
-
-//──────────────────────────────── JMA function
-jma_func(_src, _period, _phase, _power) =>
-    p = math.max(_period, 1)
-
-    phaseV = math.min(math.max((_phase * 0.01) + 1.5, 0.5), 2.5)
-    beta   = _power * (p - 1) / ((_power * (p - 1)) + 2)
-    len1   = math.max((math.log(math.sqrt(0.5 * (p - 1))) / math.log(2.0)) + 2.0, 0.0)
-    pow1   = math.max(len1 - 2.0, 0.5)
-    alpha  = math.pow(beta, 1.0 / pow1)
-
-    alphaSqr         = alpha * alpha
-    oneMinusAlpha    = 1.0 - alpha
-    oneMinusAlphaSqr = oneMinusAlpha * oneMinusAlpha
-
-    var float ma1  = na
-    var float det0 = na
-    var float det1 = na
-    var float jma  = na
-
-    ma1  := na(ma1)  ? _src : _src + (alpha * (ma1 - _src))
-    det0 := na(det0) ? 0.0  : (_src - ma1) * (1 - beta) + beta * det0
-    ma2   = ma1 + (phaseV * det0)
-    det1 := na(det1) ? 0.0  : ((ma2 - nz(jma, _src)) * oneMinusAlphaSqr) + (alphaSqr * det1)
-    jma  := na(jma)  ? _src : nz(jma, _src) + det1
-
+//──────────────────────────────── The Engine
+jma_v13(src, _len) =>
+    // 1. Hard-coded Parameters for Maximum Stability
+    _ph    = -100.0 
+    _pwr   = 0.1
+    
+    len    = math.max(_len, 2)
+    ph_val = 0.5 // Mathematical result of -100 phase
+    beta   = 0.45 * (len - 1) / (0.45 * (len - 1) + 2)
+    
+    // 2. Volatility Brain
+    var float vSum = 0.0
+    var volty_arr = array.new_float(10, 0.0)
+    
+    float del1 = src - nz(src[1], src)
+    float volty = math.abs(del1)
+    
+    array.unshift(volty_arr, volty)
+    float old_volty = array.pop(volty_arr)
+    vSum := vSum + (volty - old_volty)
+    
+    float avgVolty = ta.sma(vSum * 0.1, 65)
+    
+    // 3. Relative Volatility
+    float rvolty = (not na(avgVolty) and avgVolty > 0) ? volty / avgVolty : 1.0
+    rvolty := math.min(math.max(rvolty, 0.1), math.pow(len, 10.0))
+    
+    // 4. Adaptive Alpha
+    float pow_alpha = math.pow(rvolty, _pwr)
+    float alpha = math.pow(beta, pow_alpha)
+    
+    // 5. State Variables
+    var float ma1 = 0.0
+    var float det0 = 0.0
+    var float det1 = 0.0
+    var float jma = 0.0
+    
+    // 6. RANGE LOCK LOGIC (Source-Aware)
+    // We calculate the average of the selected source over the period
+    float rangeAvg = ta.sma(src, len)
+    
+    // If Relative Volatility is low (Choppy), we use the Range Average
+    // If it's high (Trend), we use the raw Source price
+    float gatedSrc = rvolty < lockMult ? rangeAvg : src
+    
+    // 7. Calculation Cycle
+    ma1  := (1 - alpha) * gatedSrc + alpha * nz(ma1[1], gatedSrc)
+    det0 := (gatedSrc - ma1) * (1 - beta) + beta * nz(det0[1])
+    float ma2 = ma1 + ph_val * det0
+    
+    float alphaSqr = math.pow(1 - alpha, 2)
+    det1 := (ma2 - nz(jma[1], gatedSrc)) * alphaSqr + math.pow(alpha, 2) * nz(det1[1])
+    jma  := nz(jma[1], gatedSrc) + det1
     jma
 
-//──────────────────────────────── Business-time weight (always on)
-vAvg = ta.sma(volume, period)
-ratio = (not na(vAvg) and vAvg > 0.0) ? (volume / vAvg) : 1.0
-ratioSm = ta.ema(ratio, ratioSmooth)
-boostRaw = useSqrtBoost ? math.sqrt(ratioSm) : ratioSm
-boost = clamp(boostRaw, 1.0, maxBoost)
-effPeriodRaw = period / boost
-effPeriodInt = int(math.round(effPeriodRaw))
-effPeriod = int(clamp(effPeriodInt, minEffPeriod, 300))
+//──────────────────────────────── Execution
+jmaVal = jma_v13(srcInput, period)
 
-//──────────────────────────────── POC proxy (intrabar max-volume close from 1min)
-[ltVolArr, ltCloseArr] = request.security_lower_tf(
-     syminfo.tickerid,
-     "1",
-     [volume, close]
-)
+//──────────────────────────────── Coloring
+float slope = jmaVal - nz(jmaVal[1], jmaVal)
+// Dynamic noise floor for color changes
+float noiseFloor = ta.stdev(slope, 30) * 0.15
 
-float poc = na
-if ltVolArr.size() > 0
-    float maxVol = array.max(ltVolArr)
-    int   idxMax = array.indexof(ltVolArr, maxVol)
-    poc := idxMax >= 0 ? array.get(ltCloseArr, idxMax) : na
-else
-    poc := na
+color jmaColor = slope > noiseFloor ? color.lime : 
+                 slope < -noiseFloor ? color.red : 
+                 color.gray
 
-pocSrc = na(poc) ? close : poc
-
-//──────────────────────────────── JMA on POC source
-jPOC = jma_func(pocSrc, effPeriod, phase, power)
-
-//──────────────────────────────── Plot
-jmaColor = jPOC > jPOC[1] ? color.lime : color.red
-plot(jPOC, "JMA (POC Source, Auto BT)", color=jmaColor, linewidth=2)
-
-//──────────────────────────────── Plot POC segments
-if barstate.isnew
-    if not na(poc[1])
-        line.new(
-            bar_index - 1, poc[1],
-            bar_index,     poc[1],
-            extend = extend.none,
-            color  = color.new(color.gray, 0),
-            width  = 1
-        )
+//──────────────────────────────── Plotting
+plot(jmaVal, "Source JMA", color=jmaColor, linewidth=3)
