@@ -1,82 +1,112 @@
 //@version=6
-indicator("Flow MA", overlay=true, max_bars_back=5000)
+indicator("Flow MA - Hybrid Intelligence", overlay=true)
 
 //──────────────────────────────── Inputs
-grp_main = "Core Settings"
-srcInput = input.source(close, "Source", group=grp_main)
-period   = input.int(20, "Period", minval=2, group=grp_main)
-// Phase is hard-coded to -100
-// Power is hard-coded to 0.1
+intelligence = input.int(20, "Intelligence Period", minval=5, maxval=200,
+  tooltip="Period for all calculations - fractal dimension, efficiency ratio, and base smoothing")
 
-grp_lock = "Range Lock Logic"
-lockMult = input.float(0.6, "Lock Threshold", minval=0.1, maxval=2.0, step=0.1, group=grp_lock, tooltip="Lower = stays flat more often. Higher = follows price more.")
+erPower = input.float(2.0, "ER Adaptability", minval=0.5, maxval=4.0, step=0.5,
+  tooltip="How aggressively efficiency ratio controls adaptation. Higher = more extreme switching between fast/slow")
 
-//──────────────────────────────── The Engine
-jma_v13(src, _len) =>
-    // 1. Hard-coded Parameters for Maximum Stability
-    _ph    = -100.0 
-    _pwr   = 0.1
+//──────────────────────────────── THE HYBRID ENGINE
+flow_hybrid(src, intel, erAdapt) =>
     
-    len    = math.max(_len, 2)
-    ph_val = 0.5 // Mathematical result of -100 phase
-    beta   = 0.45 * (len - 1) / (0.45 * (len - 1) + 2)
+    // ═══════════════════════════════════════════════════════
+    // PART 1: FRACTAL DIMENSION (from FRAMA)
+    // ═══════════════════════════════════════════════════════
     
-    // 2. Volatility Brain
-    var float vSum = 0.0
-    var volty_arr = array.new_float(10, 0.0)
+    len = intel
+    half = len / 2
     
-    float del1 = src - nz(src[1], src)
-    float volty = math.abs(del1)
+    // Split period into two halves and measure ranges
+    float n1 = (ta.highest(high, half) - ta.lowest(low, half)) / half
+    float n2 = (ta.highest(high[half], half) - ta.lowest(low[half], half)) / half
+    float n3 = (ta.highest(high, len) - ta.lowest(low, len)) / len
     
-    array.unshift(volty_arr, volty)
-    float old_volty = array.pop(volty_arr)
-    vSum := vSum + (volty - old_volty)
+    // Calculate fractal dimension: 1.0 = trend, 2.0 = range
+    float dimension = (n1 > 0 and n2 > 0 and n3 > 0) ? 
+                      (math.log(n1 + n2) - math.log(n3)) / math.log(2.0) : 1.5
+    dimension := math.min(math.max(dimension, 1.0), 2.0)
     
-    float avgVolty = ta.sma(vSum * 0.1, 65)
+    // ═══════════════════════════════════════════════════════
+    // PART 2: EFFICIENCY RATIO (from KAMA)
+    // ═══════════════════════════════════════════════════════
     
-    // 3. Relative Volatility
-    float rvolty = (not na(avgVolty) and avgVolty > 0) ? volty / avgVolty : 1.0
-    rvolty := math.min(math.max(rvolty, 0.1), math.pow(len, 10.0))
+    // Signal: Net directional change
+    float signal = math.abs(src - src[len])
     
-    // 4. Adaptive Alpha
-    float pow_alpha = math.pow(rvolty, _pwr)
-    float alpha = math.pow(beta, pow_alpha)
+    // Noise: Total path traveled
+    float noise = 0.0
+    for i = 0 to len - 1
+        noise += math.abs(src[i] - src[i + 1])
     
-    // 5. State Variables
-    var float ma1 = 0.0
-    var float det0 = 0.0
-    var float det1 = 0.0
-    var float jma = 0.0
+    // Efficiency: 1.0 = perfect trend, 0.0 = pure chop
+    float efficiency = (noise > 0) ? signal / noise : 0.0
     
-    // 6. RANGE LOCK LOGIC (Source-Aware)
-    // We calculate the average of the selected source over the period
-    float rangeAvg = ta.sma(src, len)
+    // ═══════════════════════════════════════════════════════
+    // PART 3: JMA FOUNDATION
+    // ═══════════════════════════════════════════════════════
     
-    // If Relative Volatility is low (Choppy), we use the Range Average
-    // If it's high (Trend), we use the raw Source price
-    float gatedSrc = rvolty < lockMult ? rangeAvg : src
+    float power = 0.45
+    float beta = power * (len - 1) / ((power * (len - 1)) + 2)
+    float len1 = math.max(math.log(math.sqrt(0.5 * (len - 1))) / math.log(2.0) + 2.0, 0)
+    float pow1 = math.max(len1 - 2.0, 0.5)
     
-    // 7. Calculation Cycle
-    ma1  := (1 - alpha) * gatedSrc + alpha * nz(ma1[1], gatedSrc)
-    det0 := (gatedSrc - ma1) * (1 - beta) + beta * nz(det0[1])
-    float ma2 = ma1 + ph_val * det0
+    // ═══════════════════════════════════════════════════════
+    // PART 4: HYBRID ADAPTIVE ALPHA
+    // ═══════════════════════════════════════════════════════
     
-    float alphaSqr = math.pow(1 - alpha, 2)
-    det1 := (ma2 - nz(jma[1], gatedSrc)) * alphaSqr + math.pow(alpha, 2) * nz(det1[1])
-    jma  := nz(jma[1], gatedSrc) + det1
-    jma
+    // FRAMA: fractal dimension determines base speed
+    float framaAlpha = math.exp(-4.6 * (dimension - 1.0))
+    framaAlpha := math.min(math.max(framaAlpha, 0.01), 1.0)
+    
+    // KAMA: efficiency ratio acts as the SELECTOR
+    // This is the key - ER decides HOW MUCH to use FRAMA vs JMA
+    // erPower controls how aggressively this selection happens
+    float kamaWeight = math.pow(efficiency, erAdapt)
+    
+    // JMA: stable baseline
+    float jmaAlpha = math.pow(beta, 1.0 / pow1)
+    
+    // HYBRID: blend based on powered efficiency
+    float alpha = kamaWeight * framaAlpha + (1.0 - kamaWeight) * jmaAlpha
+    alpha := math.min(math.max(alpha, 0.01), 0.95)
+    
+    // ═══════════════════════════════════════════════════════
+    // PART 5: DUAL-STAGE SMOOTHING
+    // ═══════════════════════════════════════════════════════
+    
+    var float ma1 = na
+    var float det0 = na
+    var float det1 = na
+    var float result = na
+    
+    ma1 := na(ma1) ? src : src + (alpha * (ma1 - src))
+    det0 := na(det0) ? 0.0 : (src - ma1) * (1.0 - beta) + beta * det0
+    float ma2 = ma1 + 1.5 * det0
+    
+    float alphaSq = alpha * alpha
+    float oneMinusAlphaSq = (1.0 - alpha) * (1.0 - alpha)
+    det1 := na(det1) ? 0.0 : (ma2 - nz(result, src)) * oneMinusAlphaSq + alphaSq * det1
+    result := na(result) ? src : nz(result, src) + det1
+    
+    [result, dimension, efficiency, alpha]
 
 //──────────────────────────────── Execution
-jmaVal = jma_v13(srcInput, period)
+[flowMA, fractalD, efficiencyER, adaptiveAlpha] = flow_hybrid(close, intelligence, erPower)
+
+//──────────────────────────────── Market State Detection
+bool isTrending = fractalD < 1.4 and efficiencyER > 0.3
+bool isRanging = fractalD > 1.6 or efficiencyER < 0.15
 
 //──────────────────────────────── Coloring
-float slope = jmaVal - nz(jmaVal[1], jmaVal)
-// Dynamic noise floor for color changes
-float noiseFloor = ta.stdev(slope, 30) * 0.15
+float momentum = flowMA - nz(flowMA[1], flowMA)
 
-color jmaColor = slope > noiseFloor ? color.lime : 
-                 slope < -noiseFloor ? color.red : 
-                 color.gray
+color maColor = 
+  isTrending and momentum > 0 ? color.rgb(0, 255, 0) :
+  isTrending and momentum < 0 ? color.rgb(255, 0, 0) :
+  not isTrending and not isRanging ? color.rgb(255, 165, 0) :
+  color.rgb(128, 128, 128)
 
 //──────────────────────────────── Plotting
-plot(jmaVal, "Source JMA", color=jmaColor, linewidth=3)
+plot(flowMA, "Flow MA", color=maColor, linewidth=3)
