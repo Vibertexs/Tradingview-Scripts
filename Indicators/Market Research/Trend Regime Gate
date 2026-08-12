@@ -1,0 +1,67 @@
+//@version=6
+// Trend Regime Gate v3 — DISPLAY MIRROR of engine/regimes/gate_v3.py
+// Python is the source of truth; if this and the Python disagree, the
+// Python wins and this file gets fixed.
+//
+// ONE tunable: Timescale. Everything else is derived from it or is a
+// structural constant anchored outside the optimization loop (sweep
+// plateaus / statistical anchors — see docs/DECISIONS.md). The ATR
+// expansion veto from earlier drafts was ablated out: it reduced Sharpe
+// on both test harnesses. Resist the urge to add inputs here.
+indicator("Trend Regime Gate v3", overlay=false, precision=3)
+
+// ─────────────────── The tunable
+int ts = input.int(50, "Timescale (bars)", minval=20, maxval=200)
+
+// ─────────────────── Derived (rescale automatically with timescale)
+int fast_len = math.max(math.round(ts * 0.4), 5)
+int norm_len = ts * 4
+int min_hold = math.max(math.round(ts / 6.0), 3)
+
+// ─────────────────── Structural constants (NOT tunables)
+float ON_THR     = 0.60                      // sweep plateau
+float OFF_THR    = 0.40                      // ON - fixed 0.20 hysteresis
+float FLOOR_Z    = 1.2                       // random walk ⇒ ER·√n ≈ 1.0
+float eff_floor  = FLOOR_Z / math.sqrt(ts)
+
+// ─────────────────── Coherence: R² of price vs time, fast OR slow
+float r2_fast   = math.pow(nz(ta.correlation(close, bar_index, fast_len)), 2)
+float r2_slow   = math.pow(nz(ta.correlation(close, bar_index, ts)), 2)
+float coherence = math.max(r2_fast, r2_slow)
+
+// ─────────────────── Efficiency: SLOW window only (AUC 0.88 vs 0.74 fast)
+calc_eff(int len) =>
+    float s = math.abs(close - nz(close[len], close))
+    float n = 0.0
+    for i = 0 to len - 1
+        n += math.abs(nz(close[i], close) - nz(close[i + 1], close))
+    n > 0 ? s / n : 0.0
+
+float eff_raw = calc_eff(ts)
+float eff_pct = nz(ta.percentrank(eff_raw, norm_len)) / 100.0
+
+// ─────────────────── Gate: weakest link + hysteresis + min-hold
+float composite  = math.min(coherence, eff_pct)
+bool  can_open   = composite > ON_THR and eff_raw >= eff_floor
+bool  must_close = composite < OFF_THR
+
+var bool trade_on = false
+var int  hold     = 0
+hold += 1
+bool warm = bar_index > norm_len + ts
+if warm and hold >= min_hold
+    if not trade_on and can_open
+        trade_on := true
+        hold     := 0
+    else if trade_on and must_close
+        trade_on := false
+        hold     := 0
+
+// ─────────────────── Plots
+plot(coherence, "Coherence",        color=color.new(#a78bfa, 10), linewidth=2)
+plot(eff_pct,   "Efficiency %rank", color=color.new(#22c55e, 10), linewidth=2)
+plot(composite, "Composite",        color=color.new(#e2e8f0, 40), linewidth=1)
+hline(0.60, "Open",  color=color.new(#22c55e, 60), linestyle=hline.style_dashed)
+hline(0.40, "Close", color=color.new(#ef4444, 60), linestyle=hline.style_dashed)
+bgcolor(trade_on and warm ? color.new(#22c55e, 90) : color.new(#ef4444, 96))
+plot(trade_on ? 1 : 0, title="Gate State", display=display.data_window)
