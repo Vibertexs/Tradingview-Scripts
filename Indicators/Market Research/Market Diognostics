@@ -1,0 +1,141 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════
+//  MARKET STATE DIAGNOSTIC v2
+//
+//  v2 adds smoothing to the trend percentile line, switchable between a
+//  plain EMA and the Flow MA.
+//
+//  A NOTE ON USING FLOW MA HERE
+//  Flow MA adapts its smoothing constant using an efficiency ratio. The
+//  trend percentile IS an efficiency ratio. So Flow MA smoothing means
+//  the ER drives both the input and the adaptation - the filter speeds
+//  up precisely when the thing it is measuring is already high. That is
+//  not wrong, but it is circular, and the resulting line will look
+//  "sharper" for reasons that have nothing to do with the market.
+//  The EMA option is the honest default. Flow MA is provided for
+//  comparison. Toggle between them and see whether any conclusion
+//  actually depends on the choice - if it does, distrust it.
+//
+//  Purpose is unchanged: LOOK, don't decide. Nothing here trades.
+//  The number that answers the question is the autocorrelation readout
+//  in the Data Window, not the shape of the line.
+// ═══════════════════════════════════════════════════════════════════════
+indicator("Market State Diagnostic v2", overlay=false, precision=2)
+
+int   n        = input.int(50, "Measurement window (bars)", minval=10, maxval=300)
+int   rank_len = input.int(1000, "Percentile lookback", minval=200, maxval=3000)
+int   ac_lag   = input.int(1, "Autocorrelation lag (bars)", minval=1, maxval=50,
+     tooltip="Lag 1 on a Daily chart = 1 day.")
+
+string smooth_mode = input.string("EMA", "Trend line smoothing",
+     options=["None", "EMA", "Flow MA"], group="Smoothing")
+int    smooth_len  = input.int(14, "Smoothing length", minval=2, maxval=40,
+     group="Smoothing",
+     tooltip="Keep <= 40. Flow MA's alpha clamps at 0.95, which is reached "+
+             "at length 40 - every longer setting produces an IDENTICAL filter.")
+float  er_power    = input.float(1.0, "Flow MA erPower", minval=0.5, maxval=4.0,
+     step=0.5, group="Smoothing",
+     tooltip="LOW values make the adaptation ACTIVE. At erPower 4 the adaptive "+
+             "term gets ~0.25% weight and you are running a fixed-alpha JMA.")
+
+// ═══ REALIZED VOLATILITY ═════════════════════════════════════════════
+float ret    = math.log(close / nz(close[1], close))
+float rv     = ta.stdev(ret, n) * math.sqrt(n)
+float rv_pct = nz(ta.percentrank(rv, rank_len)) / 100.0
+
+// ═══ EFFICIENCY RATIO ═════════════════════════════════════════════════
+calc_er(int len) =>
+    float sig = math.abs(close - nz(close[len], close))
+    float noi = 0.0
+    for i = 0 to len - 1
+        noi += math.abs(nz(close[i], close) - nz(close[i + 1], close))
+    noi > 0.0 ? sig / noi : 0.0
+
+float er        = calc_er(n)
+float er_pct_raw = nz(ta.percentrank(er, rank_len)) / 100.0
+
+// ═══ FLOW MA — operates on the percentile series, not on price ════════
+// Fractal dimension needs a high/low range, which a 0..1 series does not
+// have, so dimension is derived from the series' own rolling extremes.
+flow_ma(float src, simple int length, float erp) =>
+    int   half = math.max(length / 2, 1)
+    float n1 = (ta.highest(src, half) - ta.lowest(src, half)) / half
+    float n2 = (ta.highest(src[half], half) - ta.lowest(src[half], half)) / half
+    float n3 = (ta.highest(src, length) - ta.lowest(src, length)) / length
+    float dim = (n1 > 0 and n2 > 0 and n3 > 0) ? (math.log(n1 + n2) - math.log(n3)) / math.log(2.0) : 1.5
+    dim := math.min(math.max(dim, 1.0), 2.0)
+
+    float sig = math.abs(src - nz(src[length], src))
+    float noi = 0.0
+    for i = 0 to length - 1
+        noi += math.abs(nz(src[i], src) - nz(src[i + 1], src))
+    float eff = noi > 0.0 ? sig / noi : 0.0
+
+    float power = 0.45
+    float beta  = power * (length - 1) / ((power * (length - 1)) + 2.0)
+    float len1  = math.max(math.log(math.sqrt(0.5 * (length - 1))) / math.log(2.0) + 2.0, 0.0)
+    float pow1  = math.max(len1 - 2.0, 0.5)
+
+    float frama_a = math.min(math.max(1.0 - math.exp(-4.6 * (dim - 1.0)), 0.01), 1.0)
+    float kama_w  = math.pow(eff, erp)
+    float jma_a   = math.pow(beta, 1.0 / pow1)
+    float alpha   = math.min(math.max(kama_w * frama_a + (1.0 - kama_w) * jma_a, 0.01), 0.95)
+
+    var float ma1 = na
+    var float d0  = na
+    var float d1  = na
+    var float res = na
+    ma1 := na(ma1) ? src : src + alpha * (ma1 - src)
+    d0  := na(d0)  ? 0.0 : (src - ma1) * (1.0 - beta) + beta * d0
+    float ma2 = ma1 + 1.5 * d0
+    d1  := na(d1)  ? 0.0 : (ma2 - nz(res, src)) * math.pow(1.0 - alpha, 2) + math.pow(alpha, 2) * d1
+    res := na(res) ? src : res + d1
+    res
+
+// Both branches called unconditionally — a ternary that skips a ta.*
+// call breaks its internal state (and returning a tuple from one is
+// illegal in Pine v6, error CE10163).
+float er_ema  = ta.ema(er_pct_raw, smooth_len)
+float er_flow = flow_ma(er_pct_raw, smooth_len, er_power)
+float er_pct  = smooth_mode == "None" ? er_pct_raw : smooth_mode == "EMA" ? er_ema : er_flow
+er_pct := math.min(math.max(er_pct, 0.0), 1.0)   // Flow MA overshoots; clip to [0,1]
+
+// ═══ AUTOCORRELATION — the actual answer ═════════════════════════════
+// Computed on the RAW series for both, so the comparison is not
+// contaminated by smoothing. Smoothing always inflates autocorrelation:
+// a smoothed series is partly a copy of its own past by construction.
+float rv_ac = ta.correlation(rv_pct,     rv_pct[ac_lag],     rank_len)
+float er_ac = ta.correlation(er_pct_raw, er_pct_raw[ac_lag], rank_len)
+float er_ac_smoothed = ta.correlation(er_pct, er_pct[ac_lag], rank_len)
+
+bool warm = bar_index > rank_len + n + smooth_len
+
+// ═══ DISPLAY ══════════════════════════════════════════════════════════
+color VOL = #38bdf8
+color EFF = #a78bfa
+
+plot(warm ? rv_pct : na, "Vol percentile", color=color.new(VOL, 10), linewidth=2)
+plot(warm and smooth_mode != "None" ? er_pct_raw : na, "Trend raw",
+     color=color.new(EFF, 78), linewidth=1)
+plot(warm ? er_pct : na, "Trend percentile", color=color.new(EFF, 0), linewidth=2)
+
+hline(0.5, "mid",  color=color.new(#94a3b8, 70), linestyle=hline.style_dotted)
+hline(0.8, "high", color=color.new(#94a3b8, 85), linestyle=hline.style_dashed)
+hline(0.2, "low",  color=color.new(#94a3b8, 85), linestyle=hline.style_dashed)
+
+bool vol_persist = rv_pct > 0.6 and rv_pct[ac_lag] > 0.6
+plot(warm and vol_persist ? 0.0 : na, "Persistent high-vol",
+     color=color.new(VOL, 0), linewidth=4, style=plot.style_linebr)
+
+// ═══ ENGINE OUTPUTS ═══════════════════════════════════════════════════
+plot(rv,          "realized_vol_raw",       display=display.data_window)
+plot(rv_pct,      "vol_percentile",         display=display.data_window)
+plot(er_pct_raw,  "trend_percentile_raw",   display=display.data_window)
+plot(er_pct,      "trend_percentile_smooth", display=display.data_window)
+plot(rv_ac,       "vol_autocorr",           display=display.data_window)
+plot(er_ac,       "trend_autocorr_RAW",     display=display.data_window)
+plot(er_ac_smoothed, "trend_autocorr_smoothed (INFLATED)", display=display.data_window)
+
+// COMPARE vol_autocorr AGAINST trend_autocorr_RAW. Ignore the smoothed
+// version for that comparison - smoothing manufactures autocorrelation
+// by construction, so it is not evidence of persistence in the market.
