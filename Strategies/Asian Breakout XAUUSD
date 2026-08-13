@@ -1,0 +1,191 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════
+//  STRATEGY 4 — ASIAN RANGE BREAK-AND-RETRACE  (EUR/USD 15M)
+//
+//  VISUAL COMPANION to asian_retrace.py. The PYTHON IS THE AUTHORITY for
+//  every reported number. This exists so the setups can be eyeballed on a
+//  chart — to catch a session-boundary or timezone error that a table of
+//  bps would hide.
+//
+//  ── RULES ───────────────────────────────────────────────────────────
+//    Asian range  00:00-07:00 London high/low
+//    Break        close outside that range during 08:00-16:00 London
+//    Extension    furthest price reached since the break
+//    Entry        limit at: extension -/+ X% of the Asian range
+//    Direction    up-break -> long, down-break -> short
+//    Max          2 trades/day, flat at 21:00 London
+//
+//  ── WHY A LIMIT ORDER, NOT A MARKET ORDER ───────────────────────────
+//  The order is placed at the close of bar i using the extension through
+//  bar i, and fills during bar i+1 at the limit price. That is exactly
+//  the Python rule A3: the trigger level never derives from the same bar
+//  that triggers it. A market order on the touch bar would be look-ahead.
+//
+//  ── ASSUMPTIONS (mirroring A1-A7 in the Python) ─────────────────────
+//    A1  End of day = 21:00 London (FX rollover). Exit fires on the
+//        20:45 bar and fills at the 21:00 open.
+//    A2  Break AND fill must both land inside 08:00-16:00. Orders stop
+//        being placed after 15:30 so the last possible fill is 15:45.
+//    A4  Fill at the limit price. TradingView fills limits at the limit,
+//        never better, which matches.
+//    A5  Stop/target ties: TradingView's emulator resolves these itself.
+//        The Python takes the stop. On ambiguous bars the two can differ
+//        — one more reason the Python is the authority.
+//    A6  One position at a time.
+//    A7  A pending setup persists until it fills or 16:00.
+//
+//  ── DEFAULTS ARE THE PRE-REGISTERED PRIMARY TEST ────────────────────
+//  Retrace 50%, NO stop, NO target, exit end of day. Stops and targets
+//  are present but OFF, because the brief runs them only if the primary
+//  is not null. Turning them on is Phase 2/3, not the headline.
+//
+//  Cost default 0.534 bps round trip = the realised EUR/USD spread
+//  measured from Dukascopy tick bid/ask, not an assumption.
+// ═══════════════════════════════════════════════════════════════════════
+strategy("Asian Range Break-and-Retrace",
+     overlay                 = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.0267,
+     slippage                = 0,
+     pyramiding              = 0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = false)
+
+// ─────────────────── Frozen parameters
+string TZ = "Europe/London"
+
+float retracePct = input.float(50.0, "Retrace % of Asian range", minval=0.0, maxval=100.0, step=5.0,
+     group="Frozen — pre-registered", tooltip="Primary test is 50. The gradient 0/25/50/75 is the secondary test.")
+int   maxTrades  = input.int(2, "Max trades per day", minval=1, maxval=4,
+     group="Frozen — pre-registered")
+
+// ─────────────────── Phase 2 / 3, OFF by default
+bool  useStop   = input.bool(false, "Phase 2 — use stop", group="Phase 2/3 — off for the primary test")
+float stopPct   = input.float(50.0, "Stop % of Asian range", minval=5.0, maxval=200.0, step=5.0,
+     group="Phase 2/3 — off for the primary test")
+bool  useTarget = input.bool(false, "Phase 3 — use target", group="Phase 2/3 — off for the primary test",
+     tooltip="Requires a stop: R is the stop distance.")
+float targetR   = input.float(1.0, "Target (R multiples)", minval=0.5, maxval=5.0, step=0.5,
+     group="Phase 2/3 — off for the primary test")
+
+// ─────────────────── Display
+bool showRange = input.bool(true, "Show Asian range", group="Display")
+bool showTrig  = input.bool(true, "Show extension and trigger", group="Display")
+
+// ─────────────────── London clock
+int lonH  = hour(time, TZ)
+int lonM  = minute(time, TZ)
+int hm    = lonH * 100 + lonM
+int lonD  = dayofmonth(time, TZ)
+
+bool newDay   = lonD != lonD[1]
+bool inAsia   = hm < 700
+bool inWindow = hm >= 800 and hm < 1600
+bool canPlace = inWindow and hm <= 1530     // A2: last fill lands on 15:45
+bool isEod    = hm == 2045                  // A1: fills at the 21:00 open
+
+// ─────────────────── State
+var float asiaHi   = na
+var float asiaLo   = na
+var int   asiaBars = 0
+var int   entries  = 0
+var int   dirSetup = 0
+var float ext      = na
+
+if newDay
+    asiaHi   := na
+    asiaLo   := na
+    asiaBars := 0
+    entries  := 0
+    dirSetup := 0
+    ext      := na
+
+// Asian range accumulates only before 07:00, so it is always complete
+// before the 08:00 window opens. No look-ahead is possible here.
+if inAsia
+    asiaHi   := na(asiaHi) ? high : math.max(asiaHi, high)
+    asiaLo   := na(asiaLo) ? low  : math.min(asiaLo, low)
+    asiaBars := asiaBars + 1
+
+float rng   = (na(asiaHi) or na(asiaLo)) ? na : asiaHi - asiaLo
+bool  rngOk = not na(rng) and rng > 0 and asiaBars >= 20   // 28 expected
+
+// ─────────────────── Setup detection and extension tracking
+float trig = na
+
+if rngOk and inWindow and strategy.position_size == 0
+    if dirSetup == 0 and entries < maxTrades
+        if close > asiaHi
+            dirSetup := 1
+            ext      := high
+        else if close < asiaLo
+            dirSetup := -1
+            ext      := low
+    else if dirSetup != 0
+        // Not filled on this bar, so extend. Order for the NEXT bar is
+        // priced off the extension through THIS bar — rule A3.
+        ext := dirSetup > 0 ? math.max(ext, high) : math.min(ext, low)
+
+if dirSetup != 0 and not na(ext) and rngOk
+    trig := dirSetup > 0 ? ext - retracePct / 100.0 * rng
+                         : ext + retracePct / 100.0 * rng
+
+// ─────────────────── Orders
+// Re-issuing the same ID each bar modifies the resting limit price.
+if canPlace and dirSetup != 0 and not na(trig) and strategy.position_size == 0 and entries < maxTrades
+    if dirSetup > 0
+        strategy.entry("ARR", strategy.long, limit=trig)
+    else
+        strategy.entry("ARR", strategy.short, limit=trig)
+
+// A7: a pending setup dies at the window close, never carries overnight.
+if not canPlace and strategy.position_size == 0
+    strategy.cancel("ARR")
+if not inWindow
+    dirSetup := 0
+
+// Count the fill and clear the setup so a second one can form.
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    entries  := entries + 1
+    dirSetup := 0
+
+// Phase 2/3 bracket. R is the stop distance, so a target needs a stop.
+if strategy.position_size != 0 and useStop and rngOk
+    float sd = stopPct / 100.0 * rng
+    float ep = strategy.position_avg_price
+    bool  isLong = strategy.position_size > 0
+    float sp = isLong ? ep - sd : ep + sd
+    float tp = isLong ? ep + targetR * sd : ep - targetR * sd
+    if useTarget
+        strategy.exit("bracket", "ARR", stop=sp, limit=tp)
+    else
+        strategy.exit("bracket", "ARR", stop=sp)
+
+// A1: flat at end of day, unconditionally.
+if isEod and strategy.position_size != 0
+    strategy.close("ARR", comment="EOD")
+
+// ─────────────────── Display
+color UP   = #22c55e
+color DN   = #ef4444
+color GREY = #94a3b8
+
+plot(showRange and rngOk ? asiaHi : na, "Asian high", color=color.new(UP, 30),
+     style=plot.style_linebr, linewidth=1)
+plot(showRange and rngOk ? asiaLo : na, "Asian low", color=color.new(DN, 30),
+     style=plot.style_linebr, linewidth=1)
+plot(showTrig and dirSetup != 0 ? ext : na, "Extension", color=color.new(GREY, 20),
+     style=plot.style_linebr, linewidth=1)
+plot(showTrig and dirSetup != 0 ? trig : na, "Entry trigger",
+     color=dirSetup > 0 ? UP : DN, style=plot.style_linebr, linewidth=2)
+
+bgcolor(inAsia and rngOk ? color.new(GREY, 94) : na, title="Asian session")
+bgcolor(inWindow ? color.new(#3b82f6, 95) : na, title="Break window")
+
+// ─────────────────── Monitor
+plot(strategy.closedtrades, "closed_trades", display=display.data_window)
+plot(entries, "entries_today", display=display.data_window)
+plot(rngOk ? rng / close * 10000 : na, "asian_range_bps", display=display.data_window)
