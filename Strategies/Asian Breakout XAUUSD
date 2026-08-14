@@ -1,191 +1,646 @@
 //@version=6
-// ═══════════════════════════════════════════════════════════════════════
-//  STRATEGY 4 — ASIAN RANGE BREAK-AND-RETRACE  (EUR/USD 15M)
-//
-//  VISUAL COMPANION to asian_retrace.py. The PYTHON IS THE AUTHORITY for
-//  every reported number. This exists so the setups can be eyeballed on a
-//  chart — to catch a session-boundary or timezone error that a table of
-//  bps would hide.
-//
-//  ── RULES ───────────────────────────────────────────────────────────
-//    Asian range  00:00-07:00 London high/low
-//    Break        close outside that range during 08:00-16:00 London
-//    Extension    furthest price reached since the break
-//    Entry        limit at: extension -/+ X% of the Asian range
-//    Direction    up-break -> long, down-break -> short
-//    Max          2 trades/day, flat at 21:00 London
-//
-//  ── WHY A LIMIT ORDER, NOT A MARKET ORDER ───────────────────────────
-//  The order is placed at the close of bar i using the extension through
-//  bar i, and fills during bar i+1 at the limit price. That is exactly
-//  the Python rule A3: the trigger level never derives from the same bar
-//  that triggers it. A market order on the touch bar would be look-ahead.
-//
-//  ── ASSUMPTIONS (mirroring A1-A7 in the Python) ─────────────────────
-//    A1  End of day = 21:00 London (FX rollover). Exit fires on the
-//        20:45 bar and fills at the 21:00 open.
-//    A2  Break AND fill must both land inside 08:00-16:00. Orders stop
-//        being placed after 15:30 so the last possible fill is 15:45.
-//    A4  Fill at the limit price. TradingView fills limits at the limit,
-//        never better, which matches.
-//    A5  Stop/target ties: TradingView's emulator resolves these itself.
-//        The Python takes the stop. On ambiguous bars the two can differ
-//        — one more reason the Python is the authority.
-//    A6  One position at a time.
-//    A7  A pending setup persists until it fills or 16:00.
-//
-//  ── DEFAULTS ARE THE PRE-REGISTERED PRIMARY TEST ────────────────────
-//  Retrace 50%, NO stop, NO target, exit end of day. Stops and targets
-//  are present but OFF, because the brief runs them only if the primary
-//  is not null. Turning them on is Phase 2/3, not the headline.
-//
-//  Cost default 0.534 bps round trip = the realised EUR/USD spread
-//  measured from Dukascopy tick bid/ask, not an assumption.
-// ═══════════════════════════════════════════════════════════════════════
-strategy("Asian Range Break-and-Retrace",
-     overlay                 = true,
-     initial_capital         = 10000,
-     default_qty_type        = strategy.fixed,
-     default_qty_value       = 1,
-     commission_type         = strategy.commission.percent,
-     commission_value        = 0.0267,
-     slippage                = 0,
-     pyramiding              = 0,
-     calc_on_every_tick      = false,
-     process_orders_on_close = false)
+strategy(
+     "Asian Range Break-and-Retrace v3",
+     overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.00267,
+     pyramiding = 0,
+     calc_on_every_tick = false,
+     calc_on_order_fills = false,
+     process_orders_on_close = false,
+     backtest_fill_limits_assumption = 1,
+     use_bar_magnifier = true,
+     max_boxes_count = 500
+)
 
-// ─────────────────── Frozen parameters
+
+// =====================================================================
+// SETTINGS
+// =====================================================================
+
 string TZ = "Europe/London"
 
-float retracePct = input.float(50.0, "Retrace % of Asian range", minval=0.0, maxval=100.0, step=5.0,
-     group="Frozen — pre-registered", tooltip="Primary test is 50. The gradient 0/25/50/75 is the secondary test.")
-int   maxTrades  = input.int(2, "Max trades per day", minval=1, maxval=4,
-     group="Frozen — pre-registered")
+// Monday-Friday.
+// Asian:  00:00-07:00 London
+// London: 08:00-16:00 London
+string ASIA_SESSION = "0000-0700:23456"
+string LONDON_SESSION = "0800-1600:23456"
 
-// ─────────────────── Phase 2 / 3, OFF by default
-bool  useStop   = input.bool(false, "Phase 2 — use stop", group="Phase 2/3 — off for the primary test")
-float stopPct   = input.float(50.0, "Stop % of Asian range", minval=5.0, maxval=200.0, step=5.0,
-     group="Phase 2/3 — off for the primary test")
-bool  useTarget = input.bool(false, "Phase 3 — use target", group="Phase 2/3 — off for the primary test",
-     tooltip="Requires a stop: R is the stop distance.")
-float targetR   = input.float(1.0, "Target (R multiples)", minval=0.5, maxval=5.0, step=0.5,
-     group="Phase 2/3 — off for the primary test")
 
-// ─────────────────── Display
-bool showRange = input.bool(true, "Show Asian range", group="Display")
-bool showTrig  = input.bool(true, "Show extension and trigger", group="Display")
+// Entry
+float retracePct = input.float(
+     50.0,
+     "Retrace % of Asian range",
+     minval = 0.0,
+     maxval = 100.0,
+     step = 5.0,
+     group = "Entry"
+)
 
-// ─────────────────── London clock
-int lonH  = hour(time, TZ)
-int lonM  = minute(time, TZ)
-int hm    = lonH * 100 + lonM
-int lonD  = dayofmonth(time, TZ)
+int maxTrades = input.int(
+     2,
+     "Max trades per day",
+     minval = 1,
+     maxval = 4,
+     group = "Entry"
+)
 
-bool newDay   = lonD != lonD[1]
-bool inAsia   = hm < 700
-bool inWindow = hm >= 800 and hm < 1600
-bool canPlace = inWindow and hm <= 1530     // A2: last fill lands on 15:45
-bool isEod    = hm == 2045                  // A1: fills at the 21:00 open
 
-// ─────────────────── State
-var float asiaHi   = na
-var float asiaLo   = na
-var int   asiaBars = 0
-var int   entries  = 0
-var int   dirSetup = 0
-var float ext      = na
+// Stop
+bool useStop = input.bool(
+     true,
+     "Use Stop Loss",
+     group = "Stop Loss"
+)
 
-if newDay
-    asiaHi   := na
-    asiaLo   := na
-    asiaBars := 0
-    entries  := 0
-    dirSetup := 0
-    ext      := na
+float stopPct = input.float(
+     50.0,
+     "Stop distance (% of Asian range)",
+     minval = 5.0,
+     maxval = 200.0,
+     step = 5.0,
+     group = "Stop Loss"
+)
 
-// Asian range accumulates only before 07:00, so it is always complete
-// before the 08:00 window opens. No look-ahead is possible here.
+
+// Target
+string targetMode = input.string(
+     "Extension",
+     "Take Profit",
+     options = ["Off", "Extension", "R multiple"],
+     group = "Take Profit"
+)
+
+float targetR = input.float(
+     1.0,
+     "Target R multiple",
+     minval = 0.25,
+     maxval = 5.0,
+     step = 0.25,
+     group = "Take Profit"
+)
+
+
+// End of day
+bool useEodExit = input.bool(
+     true,
+     "Close at 21:00 London",
+     group = "Time Exit"
+)
+
+
+// Display
+bool showSessions = input.bool(
+     true,
+     "Draw Asian & London sessions",
+     group = "Display"
+)
+
+bool showAsianLevels = input.bool(
+     true,
+     "Show Asian High / Low",
+     group = "Display"
+)
+
+bool showOrders = input.bool(
+     true,
+     "Show Entry / SL / TP",
+     group = "Display"
+)
+
+
+// =====================================================================
+// SESSION DETECTION
+// =====================================================================
+
+bool inAsia = not na(time(timeframe.period, ASIA_SESSION, TZ))
+bool inLondon = not na(time(timeframe.period, LONDON_SESSION, TZ))
+
+bool asiaStart = inAsia and not inAsia[1]
+bool asiaEnd = not inAsia and inAsia[1]
+
+bool londonStart = inLondon and not inLondon[1]
+bool londonEnd = not inLondon and inLondon[1]
+
+
+// Do not place an order on the final London bar.
+//
+// 15m:
+// last placement = 15:30 close
+// possible fill = 15:45-16:00
+//
+// 5m:
+// last placement = 15:50 close
+// possible fill = 15:55-16:00
+int closeHourLondon = hour(time_close, TZ)
+
+bool canPlace = inLondon and closeHourLondon < 16
+
+
+// 21:00 London closing bar.
+// Works automatically on 5m and 15m.
+int barCloseHour = hour(time_close, TZ)
+int barCloseMinute = minute(time_close, TZ)
+
+bool eodBar = barCloseHour == 21 and barCloseMinute == 0
+
+
+// =====================================================================
+// ASIAN RANGE
+// =====================================================================
+
+var float asiaHigh = na
+var float asiaLow = na
+var bool asiaReady = false
+
+
+if asiaStart
+
+    asiaHigh := high
+    asiaLow := low
+    asiaReady := false
+
+
+else if inAsia
+
+    asiaHigh := math.max(asiaHigh, high)
+    asiaLow := math.min(asiaLow, low)
+
+
+if asiaEnd
+    asiaReady := true
+
+
+float asiaRange = na
+
+if asiaReady
+    asiaRange := asiaHigh - asiaLow
+
+
+bool rangeOK = asiaReady and not na(asiaRange) and asiaRange > 0
+
+
+// =====================================================================
+// SESSION BOXES
+// =====================================================================
+
+var box asiaBox = na
+var box londonBox = na
+
+var float londonHigh = na
+var float londonLow = na
+
+
+// ---------------- ASIAN BOX
+
+if asiaStart
+
+    if showSessions
+        asiaBox := box.new(
+             left = bar_index,
+             top = high,
+             right = bar_index,
+             bottom = low,
+             bgcolor = color.new(color.gray, 90),
+             border_color = color.new(color.gray, 55)
+        )
+
+
 if inAsia
-    asiaHi   := na(asiaHi) ? high : math.max(asiaHi, high)
-    asiaLo   := na(asiaLo) ? low  : math.min(asiaLo, low)
-    asiaBars := asiaBars + 1
 
-float rng   = (na(asiaHi) or na(asiaLo)) ? na : asiaHi - asiaLo
-bool  rngOk = not na(rng) and rng > 0 and asiaBars >= 20   // 28 expected
+    if showSessions and not na(asiaBox)
 
-// ─────────────────── Setup detection and extension tracking
-float trig = na
+        box.set_right(asiaBox, bar_index)
+        box.set_top(asiaBox, asiaHigh)
+        box.set_bottom(asiaBox, asiaLow)
 
-if rngOk and inWindow and strategy.position_size == 0
-    if dirSetup == 0 and entries < maxTrades
-        if close > asiaHi
-            dirSetup := 1
-            ext      := high
-        else if close < asiaLo
-            dirSetup := -1
-            ext      := low
-    else if dirSetup != 0
-        // Not filled on this bar, so extend. Order for the NEXT bar is
-        // priced off the extension through THIS bar — rule A3.
-        ext := dirSetup > 0 ? math.max(ext, high) : math.min(ext, low)
 
-if dirSetup != 0 and not na(ext) and rngOk
-    trig := dirSetup > 0 ? ext - retracePct / 100.0 * rng
-                         : ext + retracePct / 100.0 * rng
+// ---------------- LONDON BOX
 
-// ─────────────────── Orders
-// Re-issuing the same ID each bar modifies the resting limit price.
-if canPlace and dirSetup != 0 and not na(trig) and strategy.position_size == 0 and entries < maxTrades
-    if dirSetup > 0
-        strategy.entry("ARR", strategy.long, limit=trig)
-    else
-        strategy.entry("ARR", strategy.short, limit=trig)
+if londonStart
 
-// A7: a pending setup dies at the window close, never carries overnight.
-if not canPlace and strategy.position_size == 0
+    londonHigh := high
+    londonLow := low
+
+    if showSessions
+        londonBox := box.new(
+             left = bar_index,
+             top = high,
+             right = bar_index,
+             bottom = low,
+             bgcolor = color.new(color.blue, 92),
+             border_color = color.new(color.blue, 65)
+        )
+
+
+else if inLondon
+
+    londonHigh := math.max(londonHigh, high)
+    londonLow := math.min(londonLow, low)
+
+
+if inLondon
+
+    if showSessions and not na(londonBox)
+
+        box.set_right(londonBox, bar_index)
+        box.set_top(londonBox, londonHigh)
+        box.set_bottom(londonBox, londonLow)
+
+
+// =====================================================================
+// DAILY STRATEGY STATE
+// =====================================================================
+
+var int tradesToday = 0
+
+// 0  = no setup
+// 1  = long setup
+// -1 = short setup
+var int setupDir = 0
+
+var float extension = na
+
+var float entryLevel = na
+var float stopLevel = na
+var float targetLevel = na
+
+
+// Reset on each new Asian session.
+if asiaStart
+
+    tradesToday := 0
+
+    setupDir := 0
+    extension := na
+
+    if strategy.position_size == 0
+
+        strategy.cancel("ARR")
+        strategy.cancel("ARR-X")
+
+        entryLevel := na
+        stopLevel := na
+        targetLevel := na
+
+
+// =====================================================================
+// DETECT BREAKOUT
+// =====================================================================
+
+if rangeOK and inLondon and strategy.position_size == 0
+
+    if setupDir == 0 and tradesToday < maxTrades
+
+        // Upside breakout.
+        if close > asiaHigh
+
+            setupDir := 1
+            extension := high
+
+
+        // Downside breakout.
+        else if close < asiaLow
+
+            setupDir := -1
+            extension := low
+
+
+    // ---------------------------------------------------------------
+    // Once breakout exists, keep tracking the furthest extension.
+    // ---------------------------------------------------------------
+
+    else if setupDir == 1
+
+        extension := math.max(extension, high)
+
+
+    else if setupDir == -1
+
+        extension := math.min(extension, low)
+
+
+// =====================================================================
+// ENTRY TRIGGER
+//
+// ORIGINAL STRATEGY LOGIC:
+//
+// LONG:
+// extension - X% of Asian range
+//
+// SHORT:
+// extension + X% of Asian range
+// =====================================================================
+
+float trigger = na
+
+
+if setupDir == 1 and rangeOK
+
+    trigger := extension - retracePct / 100.0 * asiaRange
+
+
+if setupDir == -1 and rangeOK
+
+    trigger := extension + retracePct / 100.0 * asiaRange
+
+
+// =====================================================================
+// PLACE ENTRY + PREDEFINED SL / TP
+// =====================================================================
+
+if canPlace and setupDir != 0 and not na(trigger)
+
+    if strategy.position_size == 0 and tradesToday < maxTrades
+
+        // -------------------------------------------------------------
+        // ENTRY
+        // -------------------------------------------------------------
+
+        entryLevel := trigger
+
+
+        // -------------------------------------------------------------
+        // STOP
+        // -------------------------------------------------------------
+
+        stopLevel := na
+
+        if useStop
+
+            float stopDistance = stopPct / 100.0 * asiaRange
+
+            if setupDir == 1
+                stopLevel := entryLevel - stopDistance
+
+            if setupDir == -1
+                stopLevel := entryLevel + stopDistance
+
+
+        // -------------------------------------------------------------
+        // TARGET
+        // -------------------------------------------------------------
+
+        targetLevel := na
+
+
+        // Retest the breakout extension.
+        if targetMode == "Extension"
+
+            targetLevel := extension
+
+
+        // R-multiple target.
+        if targetMode == "R multiple"
+
+            if useStop and not na(stopLevel)
+
+                float risk = math.abs(entryLevel - stopLevel)
+
+                if setupDir == 1
+                    targetLevel := entryLevel + targetR * risk
+
+                if setupDir == -1
+                    targetLevel := entryLevel - targetR * risk
+
+
+        // -------------------------------------------------------------
+        // LONG ENTRY
+        // -------------------------------------------------------------
+
+        if setupDir == 1
+
+            strategy.entry(
+                 "ARR",
+                 strategy.long,
+                 limit = entryLevel
+            )
+
+
+        // -------------------------------------------------------------
+        // SHORT ENTRY
+        // -------------------------------------------------------------
+
+        if setupDir == -1
+
+            strategy.entry(
+                 "ARR",
+                 strategy.short,
+                 limit = entryLevel
+            )
+
+
+        // -------------------------------------------------------------
+        // SL + TP
+        //
+        // These are created BEFORE the entry fills.
+        // -------------------------------------------------------------
+
+        bool hasStop = useStop and not na(stopLevel)
+        bool hasTarget = targetMode != "Off" and not na(targetLevel)
+
+
+        if hasStop and hasTarget
+
+            strategy.exit(
+                 "ARR-X",
+                 from_entry = "ARR",
+                 stop = stopLevel,
+                 limit = targetLevel
+            )
+
+
+        else if hasStop
+
+            strategy.exit(
+                 "ARR-X",
+                 from_entry = "ARR",
+                 stop = stopLevel
+            )
+
+
+        else if hasTarget
+
+            strategy.exit(
+                 "ARR-X",
+                 from_entry = "ARR",
+                 limit = targetLevel
+            )
+
+
+// =====================================================================
+// COUNT ACTUAL FILLS
+// =====================================================================
+
+int totalTrades = strategy.closedtrades + strategy.opentrades
+int previousTotalTrades = nz(totalTrades[1], 0)
+
+bool newTradeFilled = totalTrades > previousTotalTrades
+
+
+if newTradeFilled
+
+    tradesToday += totalTrades - previousTotalTrades
+
+    setupDir := 0
+    extension := na
+
+
+// =====================================================================
+// END OF LONDON SESSION
+//
+// Kill any entry that never filled.
+// Do NOT cancel SL/TP if a position is already open.
+// =====================================================================
+
+if londonEnd
+
     strategy.cancel("ARR")
-if not inWindow
-    dirSetup := 0
 
-// Count the fill and clear the setup so a second one can form.
-if strategy.position_size != 0 and strategy.position_size[1] == 0
-    entries  := entries + 1
-    dirSetup := 0
+    if strategy.position_size == 0
 
-// Phase 2/3 bracket. R is the stop distance, so a target needs a stop.
-if strategy.position_size != 0 and useStop and rngOk
-    float sd = stopPct / 100.0 * rng
-    float ep = strategy.position_avg_price
-    bool  isLong = strategy.position_size > 0
-    float sp = isLong ? ep - sd : ep + sd
-    float tp = isLong ? ep + targetR * sd : ep - targetR * sd
-    if useTarget
-        strategy.exit("bracket", "ARR", stop=sp, limit=tp)
-    else
-        strategy.exit("bracket", "ARR", stop=sp)
+        strategy.cancel("ARR-X")
 
-// A1: flat at end of day, unconditionally.
-if isEod and strategy.position_size != 0
-    strategy.close("ARR", comment="EOD")
+        setupDir := 0
+        extension := na
 
-// ─────────────────── Display
-color UP   = #22c55e
-color DN   = #ef4444
-color GREY = #94a3b8
+        entryLevel := na
+        stopLevel := na
+        targetLevel := na
 
-plot(showRange and rngOk ? asiaHi : na, "Asian high", color=color.new(UP, 30),
-     style=plot.style_linebr, linewidth=1)
-plot(showRange and rngOk ? asiaLo : na, "Asian low", color=color.new(DN, 30),
-     style=plot.style_linebr, linewidth=1)
-plot(showTrig and dirSetup != 0 ? ext : na, "Extension", color=color.new(GREY, 20),
-     style=plot.style_linebr, linewidth=1)
-plot(showTrig and dirSetup != 0 ? trig : na, "Entry trigger",
-     color=dirSetup > 0 ? UP : DN, style=plot.style_linebr, linewidth=2)
 
-bgcolor(inAsia and rngOk ? color.new(GREY, 94) : na, title="Asian session")
-bgcolor(inWindow ? color.new(#3b82f6, 95) : na, title="Break window")
+// =====================================================================
+// 21:00 LONDON EXIT
+// =====================================================================
 
-// ─────────────────── Monitor
-plot(strategy.closedtrades, "closed_trades", display=display.data_window)
-plot(entries, "entries_today", display=display.data_window)
-plot(rngOk ? rng / close * 10000 : na, "asian_range_bps", display=display.data_window)
+if useEodExit and eodBar
+
+    strategy.cancel("ARR")
+
+    setupDir := 0
+    extension := na
+
+    if strategy.position_size != 0
+
+        strategy.cancel("ARR-X")
+
+        strategy.close(
+             "ARR",
+             comment = "21:00 London",
+             immediately = true
+        )
+
+
+// =====================================================================
+// CLEAR OLD TRADE LEVELS AFTER EXIT
+// =====================================================================
+
+bool tradeClosed = strategy.closedtrades > nz(strategy.closedtrades[1], 0)
+
+
+if tradeClosed and strategy.position_size == 0
+
+    entryLevel := na
+    stopLevel := na
+    targetLevel := na
+
+
+// =====================================================================
+// PLOTS
+// =====================================================================
+
+// Only show completed Asian levels AFTER the Asian session.
+float asiaHighPlot = na
+float asiaLowPlot = na
+
+if showAsianLevels and asiaReady and not inAsia
+
+    asiaHighPlot := asiaHigh
+    asiaLowPlot := asiaLow
+
+
+plot(
+     asiaHighPlot,
+     "Asian High",
+     color = color.new(color.green, 0),
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     asiaLowPlot,
+     "Asian Low",
+     color = color.new(color.red, 0),
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+
+// Extension while waiting for retracement.
+float extensionPlot = na
+
+if setupDir != 0
+    extensionPlot := extension
+
+
+plot(
+     extensionPlot,
+     "Extension",
+     color = color.gray,
+     linewidth = 1,
+     style = plot.style_linebr
+)
+
+
+// Entry.
+float entryPlot = na
+
+if showOrders
+    if setupDir != 0 or strategy.position_size != 0
+        entryPlot := entryLevel
+
+
+plot(
+     entryPlot,
+     "Entry",
+     color = color.blue,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+
+// Stop.
+float stopPlot = na
+
+if showOrders
+    if setupDir != 0 or strategy.position_size != 0
+        stopPlot := stopLevel
+
+
+plot(
+     stopPlot,
+     "Stop Loss",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+
+// Target.
+float targetPlot = na
+
+if showOrders
+    if setupDir != 0 or strategy.position_size != 0
+        targetPlot := targetLevel
+
+
+plot(
+     targetPlot,
+     "Take Profit",
+     color = color.green,
+     linewidth = 2,
+     style = plot.style_linebr
+)
