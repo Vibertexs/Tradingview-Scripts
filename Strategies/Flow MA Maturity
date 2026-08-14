@@ -1,0 +1,193 @@
+//@version=6
+// FLOW TOUCH MATURITY STRATEGY v1
+// Role: trade the Flow MA touch rule with a maturity latch.
+//
+// The touch is the same event every time; the response is conditioned on a
+// latched maturity state, not on the touch count.
+//
+//   Entry : first pullback touch of the Flow MA while trend is up and flat.
+//   Hold  : touches are ignored while the move is immature
+//           (max extension since entry < lambda ATR).
+//   Exit  : once the move has matured -- extension >= lambda ATR and
+//           (optionally) the line's slope has decayed below a fraction of
+//           its peak -- the next touch closes the position.
+//
+// Math:
+//   Touch     T_t = 1[ low_t <= F_t + eps*ATR_t ] * 1[ close_{t-1} > F_{t-1} ]
+//   Extension X_t = max over the leg of (high_s - F_s) / ATR_s   (ratchet)
+//   Maturity  M_t latches to 1 when X_t >= lambda (AND slope decayed, if on)
+//   Buy   = T * flat * trend_up * armed
+//   Hold  = T * long * (1 - M)          -> no action
+//   Close = T * long * M
+//
+// Failure stop (optional): a fresh move that never matures and instead
+// breaks below the line by fail_mult ATR is closed -- the premise (trend
+// pullback) is dead, so waiting for a mature touch no longer applies.
+strategy("Flow Touch Maturity v1", overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     process_orders_on_close=true,
+     calc_on_every_tick=false)
+
+// ─────────────────── Inputs: Flow MA core (identical to Flow MA Core v2)
+int   length      = input.int(20, "Response length", minval=5, maxval=200,
+     group="Flow MA")
+bool  use_gate    = input.bool(true, "Range gate", group="Flow MA")
+float gate_mult   = input.float(1.5, "Range gate multiplier",
+     minval=0.5, maxval=4.0, step=0.1, group="Flow MA")
+
+// ─────────────────── Inputs: touch / maturity
+int   atr_len     = input.int(14, "ATR length", minval=5, maxval=100,
+     group="Touch & maturity")
+float touch_eps   = input.float(0.25, "Touch tolerance (ATR)",
+     minval=0.0, maxval=1.0, step=0.05, group="Touch & maturity",
+     tooltip="A touch counts when the bar low reaches the Flow MA plus this many ATRs. 0 = wick must tag the line exactly.")
+float lambda      = input.float(3.0, "Maturity extension (ATR)",
+     minval=1.0, maxval=10.0, step=0.25, group="Touch & maturity",
+     tooltip="The move is 'done' once price has stretched this many ATRs above the line at any point since entry. Ratchets; never un-matures within a leg.")
+bool  use_mom     = input.bool(true, "Require slope decay for maturity",
+     group="Touch & maturity")
+float rho         = input.float(0.35, "Slope decay fraction",
+     minval=0.1, maxval=0.9, step=0.05, group="Touch & maturity",
+     tooltip="With slope decay on, maturity also requires the Flow MA slope to fall below this fraction of its peak slope for the leg.")
+bool  use_fail    = input.bool(true, "Failure stop", group="Risk")
+float fail_mult   = input.float(1.5, "Failure stop (ATR below line)",
+     minval=0.5, maxval=4.0, step=0.25, group="Risk")
+
+// ─────────────────── Fixed low-lag core (verbatim from Flow MA Core v2)
+flow_core(float src, int len) =>
+    float power = 0.45
+    float beta  = power * (len - 1) / (power * (len - 1) + 2.0)
+    float len1  = math.max(math.log(math.sqrt(0.5 * (len - 1))) / math.log(2.0) + 2.0, 0.0)
+    float pow1  = math.max(len1 - 2.0, 0.5)
+    float alpha = math.min(math.max(math.pow(beta, 1.0 / pow1), 0.01), 0.995)
+
+    var float ma1    = na
+    var float det0   = na
+    var float det1   = na
+    var float result = na
+
+    ma1 := na(ma1) ? src : src + alpha * (ma1 - src)
+    det0 := na(det0) ? 0.0 : (src - ma1) * (1.0 - beta) + beta * det0
+
+    float ma2            = ma1 + 1.5 * det0
+    float alpha_sq       = alpha * alpha
+    float one_minus_a_sq = (1.0 - alpha) * (1.0 - alpha)
+    det1 := na(det1) ? 0.0 : (ma2 - nz(result, src)) * one_minus_a_sq + alpha_sq * det1
+    result := na(result) ? src : nz(result, src) + det1
+
+    result
+
+float flow_raw = flow_core(close, length)
+
+// ─────────────────── Range gate (verbatim from Flow MA Core v2)
+int fast_len = math.max(int(math.round(length * 0.5)), 3)
+int slow_len = length
+
+float bar_move    = math.abs(close - nz(close[1], close))
+float fast_range  = ta.ema(bar_move, fast_len)
+float fast_smooth = ta.ema(fast_range, fast_len * 2 - 1)
+float slow_range  = ta.ema(bar_move, slow_len)
+float slow_smooth = ta.ema(slow_range, slow_len * 2 - 1)
+float gate_width  = (fast_smooth + slow_smooth) * 0.5 * gate_mult
+
+var float flow_gated = na
+if na(flow_gated)
+    flow_gated := flow_raw
+else
+    float delta = flow_raw - flow_gated
+    if math.abs(delta) > gate_width
+        flow_gated := delta > 0.0 ? flow_raw - gate_width : flow_raw + gate_width
+
+float flow = use_gate ? flow_gated : flow_raw
+
+// ─────────────────── Primitives
+float atr      = ta.atr(atr_len)
+bool  warm     = bar_index > math.max(length * 3, atr_len * 2) and not na(atr) and atr > 0.0
+float slope    = flow - nz(flow[1], flow)
+bool  trend_up = close > flow and slope > 0.0
+
+// Touch: pullback from above into the line (tolerance band eps*ATR).
+bool touch = warm and low <= flow + touch_eps * atr and nz(close[1], close) > nz(flow[1], flow)
+
+// ─────────────────── State machine
+// in_long     : position state
+// x_max       : ratcheted max extension (high - flow)/ATR since entry
+// slope_peak  : ratcheted max slope/ATR since entry
+// mature      : latched maturity flag (never un-latches within a leg)
+// armed       : entry permission -- price must separate from the line in an
+//               uptrend before a touch counts as a *first* touch. Prevents
+//               instant re-entry while price is still sitting on the line
+//               right after an exit.
+var bool  in_long    = false
+var float x_max      = 0.0
+var float slope_peak = 0.0
+var bool  mature     = false
+var bool  armed      = false
+
+// Arm while flat: price cleanly above the band with the trend up.
+if warm and not in_long
+    if trend_up and close > flow + touch_eps * atr
+        armed := true
+
+// Update maturity while long.
+if in_long
+    x_max      := math.max(x_max, (high - flow) / atr)
+    slope_peak := math.max(slope_peak, slope / atr)
+    bool ext_ok = x_max >= lambda
+    bool mom_ok = not use_mom or slope / atr < rho * slope_peak
+    if ext_ok and mom_ok
+        mature := true
+
+// ─────────────────── Actions
+bool buy_sig   = warm and not in_long and armed and trend_up and touch
+bool close_sig = in_long and touch and mature
+bool fail_sig  = in_long and use_fail and close < flow - fail_mult * atr
+
+if buy_sig
+    strategy.entry("L", strategy.long, comment="first touch")
+    in_long    := true
+    armed      := false
+    x_max      := 0.0
+    slope_peak := 0.0
+    mature     := false
+else if close_sig
+    strategy.close("L", comment="mature touch")
+    in_long := false
+else if fail_sig
+    strategy.close("L", comment="failure stop")
+    in_long := false
+
+// ─────────────────── Display
+color up_color      = color.rgb(0, 255, 0)
+color down_color    = color.rgb(255, 0, 0)
+color neutral_color = color.rgb(148, 163, 184)
+
+bool  agree_up = close > flow and slope > 0.0
+bool  agree_dn = close < flow and slope < 0.0
+color line_color = agree_up ? up_color : agree_dn ? down_color : neutral_color
+
+plot(flow, "Flow MA", color=line_color, linewidth=3)
+bgcolor(in_long and mature ? color.new(#f59e0b, 88) : na,
+     title="Mature (next touch closes)")
+
+plotshape(buy_sig, "Buy touch", style=shape.triangleup,
+     location=location.belowbar, color=color.new(#22c55e, 0), size=size.small)
+plotshape(in_long[1] and touch and not mature and not close_sig, "Held touch",
+     style=shape.circle, location=location.belowbar,
+     color=color.new(#94a3b8, 30), size=size.tiny)
+plotshape(close_sig, "Mature touch exit", style=shape.xcross,
+     location=location.belowbar, color=color.new(#f59e0b, 0), size=size.small)
+plotshape(fail_sig, "Failure stop", style=shape.triangledown,
+     location=location.abovebar, color=color.new(#ef4444, 0), size=size.small)
+
+// Engine outputs for data-window inspection.
+plot(x_max,             "x_max (ATR)",   display=display.data_window)
+plot(mature ? 1.0 : 0.0, "mature",       display=display.data_window)
+plot(armed ? 1.0 : 0.0,  "armed",        display=display.data_window)
+plot(slope / atr,        "slope_atr",    display=display.data_window)
+
+alertcondition(buy_sig,   "First touch buy",   "Flow MA first touch: enter long")
+alertcondition(close_sig, "Mature touch exit", "Flow MA touched after mature move: close long")
+alertcondition(fail_sig,  "Failure stop",      "Price broke below Flow MA: close long")
