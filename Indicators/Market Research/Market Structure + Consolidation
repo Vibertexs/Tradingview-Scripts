@@ -1,0 +1,276 @@
+//@version=6
+indicator("Market Structure + Consolidation", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ==================================================
+// CONSOLIDATION MODEL - two scale-free ratios, no ATR thresholds
+//
+//   CONTAINMENT   compRatio = range(10 bars) / range(30 bars)
+//                 Low value = the recent bars sit inside the prior swing range
+//                 and are not the ones making the extremes.
+//
+//   INEFFICIENCY  effRatio = |net move| / total path travelled, over 10 bars
+//                 Low value = bars overlap and go nowhere.
+//
+// SENSITIVITY IS A HOLD CONTROL, NOT A FIND CONTROL.
+// The seed thresholds barely move with it, so the NUMBER of zones stays
+// roughly constant. What it really scales is how much room a live zone gets
+// before it counts as broken - so each zone grows longer and wider instead of
+// the chart filling up with more of them. A long-lived zone also blocks new
+// seeds, which merges what would have been several small zones into one.
+// ==================================================
+
+// --------------------------------------------------
+// INPUTS
+// --------------------------------------------------
+len        = input.int(5, "Swing Length", minval=2)
+showLabels = input.bool(true, "Show HH/HL Labels")
+showLines  = input.bool(true, "Show Structure Lines")
+showConsol = input.bool(true, "Show Consolidation Zones")
+sens       = input.int(5, "Consolidation Zone Size", minval=1, maxval=10, tooltip="Controls how big each zone gets, not how many there are. 1 = tight zones that break early. 10 = wide, long-lived zones that ride out noise. Zone count stays about the same either way.")
+showBrk    = input.bool(true, "Show Breakout Labels")
+
+// --- derived internally, nothing else to tune ---
+winN     = 10
+longN    = 30
+
+// seed thresholds: deliberately almost flat across the slider, so raising
+// sensitivity does not simply spawn more zones
+seedComp = 0.36 + sens * 0.012
+seedEff  = 0.26 + sens * 0.012
+seedBars = 3
+formLen  = winN + seedBars - 1
+
+// hold thresholds: this is where the slider actually does its work
+padPct   = 0.03 + sens * 0.030   // slack outside the box before it counts as broken
+capMult  = 1.25 + sens * 0.13    // how far the box may widen past its seed height
+maxLife  = 500
+
+// --------------------------------------------------
+// VOLATILITY CONTEXT
+// --------------------------------------------------
+atr    = ta.atr(14)
+atrAvg = ta.sma(atr, 20)
+
+momentum =
+     atr > atrAvg * 1.2 ? "Expansion" :
+     atr < atrAvg * 0.8 ? "Compression" :
+     "Normal"
+
+// --------------------------------------------------
+// PIVOT DETECTION (CONFIRMED SWINGS)
+// --------------------------------------------------
+ph = ta.pivothigh(high, len, len)
+pl = ta.pivotlow(low, len, len)
+
+var float lastHigh = na
+var float lastLow  = na
+
+var float prevPivotPrice = na
+var int   prevPivotIndex = na
+
+var string trend     = "Range"
+var string lastEvent = "None"
+
+// --------------------------------------------------
+// HIGH STRUCTURE
+// --------------------------------------------------
+if not na(ph)
+    pivotIndex = bar_index - len
+
+    if not na(lastHigh)
+        if ph > lastHigh
+            lastEvent := "HH"
+            if showLabels
+                label.new(pivotIndex, ph, "HH", style=label.style_label_down, color=color.green, textcolor=color.white)
+        else
+            lastEvent := "LH"
+            if showLabels
+                label.new(pivotIndex, ph, "LH", style=label.style_label_down, color=color.red, textcolor=color.white)
+
+    if not na(lastHigh) and ph > lastHigh
+        if trend == "Bearish"
+            trend := "Transition Up"
+        else
+            trend := "Bullish"
+
+    lastHigh := ph
+
+    if showLines and not na(prevPivotPrice)
+        line.new(prevPivotIndex, prevPivotPrice, pivotIndex, ph, width=2, color=color.gray)
+
+    prevPivotPrice := ph
+    prevPivotIndex := pivotIndex
+
+// --------------------------------------------------
+// LOW STRUCTURE
+// --------------------------------------------------
+if not na(pl)
+    pivotIndex = bar_index - len
+
+    if not na(lastLow)
+        if pl > lastLow
+            lastEvent := "HL"
+            if showLabels
+                label.new(pivotIndex, pl, "HL", style=label.style_label_up, color=color.green, textcolor=color.white)
+        else
+            lastEvent := "LL"
+            if showLabels
+                label.new(pivotIndex, pl, "LL", style=label.style_label_up, color=color.red, textcolor=color.white)
+
+    if not na(lastLow) and pl < lastLow
+        if trend == "Bullish"
+            trend := "Transition Down"
+        else
+            trend := "Bearish"
+
+    lastLow := pl
+
+    if showLines and not na(prevPivotPrice)
+        line.new(prevPivotIndex, prevPivotPrice, pivotIndex, pl, width=2, color=color.gray)
+
+    prevPivotPrice := pl
+    prevPivotIndex := pivotIndex
+
+// --------------------------------------------------
+// CONSOLIDATION DETECTION
+// --------------------------------------------------
+shortHi = ta.highest(high, winN)
+shortLo = ta.lowest(low, winN)
+longHi  = ta.highest(high, longN)
+longLo  = ta.lowest(low, longN)
+
+rangeS = shortHi - shortLo
+rangeL = longHi - longLo
+
+compRatio = rangeL > 0 ? rangeS / rangeL : 1.0
+
+netMove   = math.abs(close - close[winN])
+pathMove  = math.sum(math.abs(close - close[1]), winN)
+effRatio  = pathMove > 0 ? netMove / pathMove : 1.0
+
+formHi = ta.highest(high, formLen)
+formLo = ta.lowest(low, formLen)
+
+// a zone can only be SEEDED here; staying alive is handled below
+seed = showConsol and bar_index >= longN and compRatio <= seedComp and effRatio <= seedEff
+
+// --------------------------------------------------
+// CONSOLIDATION STATE MACHINE
+// --------------------------------------------------
+var int    runLen    = 0
+var bool   conActive = false
+var box    conBox    = na
+var float  conTop    = na
+var float  conBot    = na
+var float  conH0     = na   // seed height, the reference the growth cap works off
+var int    conLeft   = na
+var int    brkBar    = na
+var string conState  = "None"
+
+bool newCon  = false
+bool bullBrk = false
+bool bearBrk = false
+
+runLen := seed ? runLen + 1 : 0
+
+// seed a new zone
+if not conActive and runLen == seedBars
+    conActive := true
+    conLeft   := bar_index - formLen + 1
+    conTop    := formHi
+    conBot    := formLo
+    conH0     := math.max(formHi - formLo, syminfo.mintick)
+    conState  := "Active"
+    newCon    := true
+    conBox := box.new(conLeft, conTop, bar_index, conBot, border_color=color.new(color.orange, 25), border_width=1, bgcolor=color.new(color.orange, 88), text="CONSOLIDATION", text_color=color.new(color.orange, 15), text_size=size.tiny, text_halign=text.align_center, text_valign=text.align_top)
+
+// manage the live zone
+if conActive
+    pad = (conTop - conBot) * padPct
+    upB = close > conTop + pad
+    dnB = close < conBot - pad
+
+    box.set_right(conBox, bar_index)
+
+    if upB or dnB
+        conActive := false
+        runLen    := 0
+        brkBar    := bar_index
+        conState  := upB ? "Broke Up" : "Broke Down"
+        bullBrk   := upB
+        bearBrk   := dnB
+        box.set_bgcolor(conBox, color.new(upB ? color.green : color.red, 88))
+        box.set_border_color(conBox, color.new(upB ? color.green : color.red, 25))
+        if showBrk
+            label.new(bar_index, upB ? conTop : conBot, upB ? "BREAK ▲" : "BREAK ▼", style=upB ? label.style_label_up : label.style_label_down, color=upB ? color.green : color.red, textcolor=color.white, size=size.small)
+    else
+        // absorb the bar, but never let the box jump further than the pad -
+        // growth stays bounded so a drifting range still eventually breaks
+        newTop = math.max(conTop, math.min(high, conTop + pad))
+        newBot = math.min(conBot, math.max(low, conBot - pad))
+
+        if newTop - newBot > capMult * conH0 or bar_index - conLeft > maxLife
+            conActive := false
+            runLen    := 0
+            conState  := "Ended"
+        else
+            conTop := newTop
+            conBot := newBot
+            box.set_top(conBox, conTop)
+            box.set_bottom(conBox, conBot)
+
+alertcondition(newCon,  "Consolidation Detected", "Price is consolidating inside the prior swing range")
+alertcondition(bullBrk, "Range Break Up",   "Consolidation broken to the upside")
+alertcondition(bearBrk, "Range Break Down", "Consolidation broken to the downside")
+
+// --------------------------------------------------
+// TRADING BIAS ENGINE
+// --------------------------------------------------
+freshBrk = not na(brkBar) and bar_index - brkBar <= winN
+
+bias =
+     conActive ? "In Range - wait for break" :
+     freshBrk and conState == "Broke Up"   ? "Break Up - retest long" :
+     freshBrk and conState == "Broke Down" ? "Break Down - retest short" :
+     trend == "Bullish" ? "Pullbacks Long (HL)" :
+     trend == "Bearish" ? "Rallies Short (LH)" :
+     trend == "Transition Up" ? "Reversal Possible ↑" :
+     trend == "Transition Down" ? "Reversal Possible ↓" :
+     "No Edge"
+
+// --------------------------------------------------
+// TABLE PANEL
+// --------------------------------------------------
+var table panel = table.new(position.top_right, 2, 6, border_width=1)
+
+bg  = color.white
+txt = color.black
+
+if barstate.islast
+    stateTxt = conActive ? "Consolidating" : trend
+    stateCol = conActive ? color.orange :
+         trend == "Bullish" ? color.green :
+         trend == "Bearish" ? color.red : color.orange
+
+    conTxt = conActive ? "Active (" + str.tostring(bar_index - conLeft + 1) + " bars)" : conState
+    conCol = conActive ? color.orange :
+         conState == "Broke Up" ? color.green :
+         conState == "Broke Down" ? color.red : color.gray
+
+    table.cell(panel, 0, 0, "Market State", text_color=txt, bgcolor=bg)
+    table.cell(panel, 1, 0, stateTxt, text_color=color.white, bgcolor=stateCol)
+
+    table.cell(panel, 0, 1, "Last Structure", text_color=txt, bgcolor=bg)
+    table.cell(panel, 1, 1, lastEvent, text_color=txt, bgcolor=bg)
+
+    table.cell(panel, 0, 2, "Consolidation", text_color=txt, bgcolor=bg)
+    table.cell(panel, 1, 2, conTxt, text_color=color.white, bgcolor=conCol)
+
+    table.cell(panel, 0, 3, "Volatility", text_color=txt, bgcolor=bg)
+    table.cell(panel, 1, 3, momentum, text_color=txt, bgcolor=bg)
+
+    table.cell(panel, 0, 4, "Trading Bias", text_color=txt, bgcolor=bg)
+    table.cell(panel, 1, 4, bias, text_color=txt, bgcolor=bg)
+
+    table.cell(panel, 0, 5, "ATR(14)", text_color=txt, bgcolor=bg)
+    table.cell(panel, 1, 5, str.tostring(atr, format.mintick), text_color=txt, bgcolor=bg)
