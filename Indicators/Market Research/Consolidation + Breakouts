@@ -1,0 +1,585 @@
+//@version=6
+indicator(
+     "Consolidation + Breakouts",
+     overlay=true,
+     max_labels_count=500,
+     max_boxes_count=500)
+
+// ==================================================
+// INPUTS
+// ==================================================
+showConsol = input.bool(
+     true,
+     "Show Consolidation Zones")
+
+det = input.int(
+     5,
+     "Detection Sensitivity",
+     minval=1,
+     maxval=10,
+     tooltip="Controls how easily a consolidation is detected. Higher = catches looser sideways areas.")
+
+zsize = input.int(
+     4,
+     "Zone Size",
+     minval=1,
+     maxval=10,
+     tooltip="Controls how much a live consolidation box can expand before ending.")
+
+minScore = input.int(
+     0,
+     "Min Score for Breakout Signal",
+     minval=0,
+     maxval=100,
+     tooltip="Breakouts below this zone quality score will not produce a breakout signal.")
+
+showBrk = input.bool(
+     true,
+     "Show Breakout Labels")
+
+// ==================================================
+// INTERNAL SETTINGS
+// ==================================================
+winN      = 10
+longN     = 30
+seedBars  = 3
+formLen   = winN + seedBars - 1
+maxLife   = 500
+
+// Detection sensitivity
+seedComp = 0.30 + det * 0.022
+seedEff  = 0.20 + det * 0.022
+
+// Zone expansion
+padPct  = 0.02 + zsize * 0.026
+capMult = 1.15 + zsize * 0.115
+
+// ==================================================
+// QUALITY SCORE SETTINGS
+// ==================================================
+LO_DUR = 12.0
+HI_DUR = 45.0
+
+LO_HT = 1.5
+HI_HT = 5.0
+
+LO_GR = 1.0
+HI_GR = 1.6
+
+// ==================================================
+// ATR
+// ==================================================
+atr = ta.atr(14)
+
+// ==================================================
+// CONSOLIDATION MEASUREMENTS
+// ==================================================
+shortHi = ta.highest(high, winN)
+shortLo = ta.lowest(low, winN)
+
+longHi = ta.highest(high, longN)
+longLo = ta.lowest(low, longN)
+
+rangeS = shortHi - shortLo
+rangeL = longHi - longLo
+
+// --------------------------------------------------
+// CONTAINMENT
+// --------------------------------------------------
+compRatio =
+     rangeL > 0 ?
+     rangeS / rangeL :
+     1.0
+
+// --------------------------------------------------
+// MOVEMENT EFFICIENCY
+// --------------------------------------------------
+netMove =
+     math.abs(
+         close - close[winN])
+
+pathMove =
+     math.sum(
+         math.abs(close - close[1]),
+         winN)
+
+effRatio =
+     pathMove > 0 ?
+     netMove / pathMove :
+     1.0
+
+// ==================================================
+// FORMATION RANGE
+// ==================================================
+formHi =
+     ta.highest(
+         high,
+         formLen)
+
+formLo =
+     ta.lowest(
+         low,
+         formLen)
+
+// ==================================================
+// CONSOLIDATION SEED
+// ==================================================
+seed =
+     showConsol and
+     bar_index >= longN and
+     compRatio <= seedComp and
+     effRatio <= seedEff
+
+// ==================================================
+// CONSOLIDATION STATE
+// ==================================================
+var int runLen = 0
+
+var bool conActive = false
+
+var box conBox = na
+
+var float conTop   = na
+var float conBot   = na
+var float conH0    = na
+var float conScore = 0.0
+
+var int conLeft = na
+
+// Events reset every bar
+bool newCon  = false
+bool bullBrk = false
+bool bearBrk = false
+
+// ==================================================
+// SEED COUNTER
+// ==================================================
+runLen :=
+     seed ?
+     runLen + 1 :
+     0
+
+// ==================================================
+// CREATE NEW CONSOLIDATION
+// ==================================================
+if not conActive and runLen == seedBars
+
+    conActive := true
+
+    conLeft :=
+         bar_index -
+         formLen +
+         1
+
+    conTop := formHi
+    conBot := formLo
+
+    conH0 :=
+         math.max(
+             formHi - formLo,
+             syminfo.mintick)
+
+    conScore := 0.0
+
+    newCon := true
+
+    conBox :=
+         box.new(
+             conLeft,
+             conTop,
+             bar_index,
+             conBot,
+             border_color=color.new(color.orange, 25),
+             border_width=1,
+             bgcolor=color.new(color.orange, 88),
+             text="CONSOLIDATION",
+             text_color=color.new(color.orange, 15),
+             text_size=size.tiny,
+             text_halign=text.align_center,
+             text_valign=text.align_top)
+
+// ==================================================
+// MANAGE ACTIVE CONSOLIDATION
+// ==================================================
+if conActive
+
+    // ------------------------------------------------
+    // DURATION QUALITY
+    // ------------------------------------------------
+    qDur =
+         math.min(
+             math.max(
+                 (
+                     bar_index -
+                     conLeft +
+                     1 -
+                     LO_DUR
+                 ) /
+                 (
+                     HI_DUR -
+                     LO_DUR
+                 ),
+                 0),
+             1)
+
+    // ------------------------------------------------
+    // HEIGHT QUALITY
+    // ------------------------------------------------
+    qHt =
+         math.min(
+             math.max(
+                 (
+                     (
+                         conTop -
+                         conBot
+                     ) /
+                     math.max(
+                         atr,
+                         syminfo.mintick
+                     ) -
+                     LO_HT
+                 ) /
+                 (
+                     HI_HT -
+                     LO_HT
+                 ),
+                 0),
+             1)
+
+    // ------------------------------------------------
+    // GROWTH QUALITY
+    // ------------------------------------------------
+    qGr =
+         math.min(
+             math.max(
+                 (
+                     (
+                         conTop -
+                         conBot
+                     ) /
+                     conH0 -
+                     LO_GR
+                 ) /
+                 (
+                     HI_GR -
+                     LO_GR
+                 ),
+                 0),
+             1)
+
+    // ------------------------------------------------
+    // TOTAL ZONE SCORE
+    // ------------------------------------------------
+    conScore :=
+         (
+             qDur +
+             qHt +
+             qGr
+         ) /
+         3 *
+         100
+
+    // ------------------------------------------------
+    // BREAKOUT PADDING
+    // ------------------------------------------------
+    pad =
+         (
+             conTop -
+             conBot
+         ) *
+         padPct
+
+    // ------------------------------------------------
+    // BREAKOUT CONDITIONS
+    // ------------------------------------------------
+    upB =
+         close >
+         conTop +
+         pad
+
+    dnB =
+         close <
+         conBot -
+         pad
+
+    // ------------------------------------------------
+    // UPDATE BOX
+    // ------------------------------------------------
+    box.set_right(
+         conBox,
+         bar_index)
+
+    box.set_text(
+         conBox,
+         "CONSOLIDATION  " +
+         str.tostring(
+             conScore,
+             "#"))
+
+    box.set_border_color(
+         conBox,
+         conScore >= 65 ?
+         color.new(color.orange, 0) :
+
+         conScore >= 27 ?
+         color.new(color.orange, 35) :
+
+         color.new(color.gray, 45))
+
+    // =================================================
+    // BREAKOUT
+    // =================================================
+    if upB or dnB
+
+        validBreakout =
+             conScore >=
+             minScore
+
+        conActive := false
+
+        runLen := 0
+
+        bullBrk :=
+             upB and
+             validBreakout
+
+        bearBrk :=
+             dnB and
+             validBreakout
+
+        // ---------------------------------------------
+        // FINISHED BOX COLOR
+        // ---------------------------------------------
+        box.set_bgcolor(
+             conBox,
+             color.new(
+                 upB ?
+                 color.green :
+                 color.red,
+                 validBreakout ?
+                 85 :
+                 93))
+
+        box.set_border_color(
+             conBox,
+             color.new(
+                 upB ?
+                 color.green :
+                 color.red,
+                 validBreakout ?
+                 25 :
+                 60))
+
+        // ---------------------------------------------
+        // BREAKOUT LABEL
+        // ---------------------------------------------
+        if showBrk and validBreakout
+
+            label.new(
+                 bar_index,
+                 upB ?
+                 conTop :
+                 conBot,
+                 (
+                     upB ?
+                     "BREAK ▲  " :
+                     "BREAK ▼  "
+                 ) +
+                 str.tostring(
+                     conScore,
+                     "#"),
+                 style=
+                     upB ?
+                     label.style_label_up :
+                     label.style_label_down,
+                 color=
+                     upB ?
+                     color.green :
+                     color.red,
+                 textcolor=color.white,
+                 size=size.small)
+
+    // =================================================
+    // NO BREAKOUT: ALLOW BOX TO EXPAND
+    // =================================================
+    else
+
+        newTop =
+             math.max(
+                 conTop,
+                 math.min(
+                     high,
+                     conTop +
+                     pad))
+
+        newBot =
+             math.min(
+                 conBot,
+                 math.max(
+                     low,
+                     conBot -
+                     pad))
+
+        // ---------------------------------------------
+        // END ZONE IF IT GETS TOO LARGE OR TOO OLD
+        // ---------------------------------------------
+        if (
+             newTop -
+             newBot >
+             capMult *
+             conH0
+           ) or (
+             bar_index -
+             conLeft >
+             maxLife
+           )
+
+            conActive := false
+            runLen := 0
+
+        else
+
+            conTop := newTop
+            conBot := newBot
+
+            box.set_top(
+                 conBox,
+                 conTop)
+
+            box.set_bottom(
+                 conBox,
+                 conBot)
+
+// ==================================================
+// BREAKOUT IGNITION
+// ==================================================
+IGNITE_BARS = 3
+
+// Strong directional movement
+fastDrive =
+     compRatio > 0.55 and
+     effRatio > 0.45
+
+// Direction of the current net move
+//
+//  1 = bullish
+// -1 = bearish
+//  0 = neutral
+dirSign =
+     close > close[winN] ?
+     1 :
+
+     close < close[winN] ?
+     -1 :
+
+     0
+
+// ==================================================
+// IGNITION STATE
+// ==================================================
+var string impState = "None"
+
+var int impBar = na
+var int impDir = 0
+
+var float impLvl  = na
+var float impRisk = na
+var float impPeak = 0.0
+
+bool ignited = false
+
+// ==================================================
+// START WATCHING AFTER BREAKOUT
+// ==================================================
+if bullBrk or bearBrk
+
+    impState := "Watching"
+
+    impBar := bar_index
+
+    impDir :=
+         bullBrk ?
+         1 :
+         -1
+
+    impLvl :=
+         bullBrk ?
+         conTop :
+         conBot
+
+    impRisk :=
+         math.max(
+             conTop -
+             conBot,
+             syminfo.mintick)
+
+    impPeak := 0.0
+
+// ==================================================
+// BREAKOUT EXTENSION
+// ==================================================
+ext =
+     impState == "None" or
+     na(impLvl) ?
+
+     0.0 :
+
+     (
+         close -
+         impLvl
+     ) *
+     impDir /
+     impRisk
+
+// ==================================================
+// IGNITION STATE MACHINE
+// ==================================================
+if impState == "Watching"
+
+    if fastDrive and dirSign == impDir
+
+        impState := "Ignited"
+
+        ignited := true
+
+    else if (
+         bar_index -
+         impBar >
+         IGNITE_BARS
+    )
+
+        impState := "Fizzled"
+
+else if impState == "Ignited"
+
+    impPeak :=
+         math.max(
+             impPeak,
+             ext)
+
+    if compRatio < 0.45
+
+        impState := "Done"
+
+// ==================================================
+// ALERTS
+// ==================================================
+alertcondition(
+     newCon,
+     "Consolidation Detected",
+     "Price is consolidating inside the prior swing range")
+
+alertcondition(
+     bullBrk,
+     "Range Break Up",
+     "Consolidation broken to the upside")
+
+alertcondition(
+     bearBrk,
+     "Range Break Down",
+     "Consolidation broken to the downside")
+
+alertcondition(
+     ignited,
+     "Breakout Ignited",
+     "Break confirmed - it caught within 3 bars")
