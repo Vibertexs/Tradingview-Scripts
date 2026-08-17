@@ -1,5 +1,5 @@
 //@version=6
-indicator("Market Structure + Consolidation", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+indicator("Market Structure + Consolidation v2", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
 
 // ==================================================
 // CONSOLIDATION MODEL - two scale-free ratios, no ATR thresholds
@@ -11,12 +11,16 @@ indicator("Market Structure + Consolidation", overlay=true, max_lines_count=500,
 //   INEFFICIENCY  effRatio = |net move| / total path travelled, over 10 bars
 //                 Low value = bars overlap and go nowhere.
 //
-// SENSITIVITY IS A HOLD CONTROL, NOT A FIND CONTROL.
-// The seed thresholds barely move with it, so the NUMBER of zones stays
-// roughly constant. What it really scales is how much room a live zone gets
-// before it counts as broken - so each zone grows longer and wider instead of
-// the chart filling up with more of them. A long-lived zone also blocks new
-// seeds, which merges what would have been several small zones into one.
+// TWO INDEPENDENT KNOBS - one for count, one for size.
+//
+//   Detection Sensitivity  moves the SEED test  -> how many zones are found
+//   Zone Size              moves the HOLD test  -> how big each one gets
+//
+// They stay separate because a zone is seeded once and then lives on its own
+// geometry. A long-lived zone also blocks new seeds, so raising Zone Size
+// merges what would have been several small zones into one instead of
+// fragmenting the chart. If zones are running too large, drop Zone Size and
+// leave Detection alone.
 // ==================================================
 
 // --------------------------------------------------
@@ -26,24 +30,36 @@ len        = input.int(5, "Swing Length", minval=2)
 showLabels = input.bool(true, "Show HH/HL Labels")
 showLines  = input.bool(true, "Show Structure Lines")
 showConsol = input.bool(true, "Show Consolidation Zones")
-sens       = input.int(5, "Consolidation Zone Size", minval=1, maxval=10, tooltip="Controls how big each zone gets, not how many there are. 1 = tight zones that break early. 10 = wide, long-lived zones that ride out noise. Zone count stays about the same either way.")
+det        = input.int(5, "Detection Sensitivity", minval=1, maxval=10, tooltip="HOW MANY zones get found. Low = only clean, obvious coils. High = catches looser sideways patches too. Barely affects how big each zone is.")
+zsize      = input.int(4, "Zone Size", minval=1, maxval=10, tooltip="HOW BIG each zone is allowed to get. Low = tight boxes that break out early. High = wide, long-lived boxes that ride out noise. Turn this DOWN if zones are running too large.")
+minScore   = input.int(0, "Min Score for Breakout Signal", minval=0, maxval=100, tooltip="Suppresses breakout labels and alerts from low-quality zones. Zones still draw either way. 0 = signal on every break. 27 = drop the worst quarter. 44 = top half only. 65 = top quarter only.")
 showBrk    = input.bool(true, "Show Breakout Labels")
 
 // --- derived internally, nothing else to tune ---
 winN     = 10
 longN    = 30
-
-// seed thresholds: deliberately almost flat across the slider, so raising
-// sensitivity does not simply spawn more zones
-seedComp = 0.36 + sens * 0.012
-seedEff  = 0.26 + sens * 0.012
 seedBars = 3
 formLen  = winN + seedBars - 1
-
-// hold thresholds: this is where the slider actually does its work
-padPct   = 0.03 + sens * 0.030   // slack outside the box before it counts as broken
-capMult  = 1.25 + sens * 0.13    // how far the box may widen past its seed height
 maxLife  = 500
+
+// Detection moves the seed test only -> changes the COUNT of zones
+seedComp = 0.30 + det * 0.022
+seedEff  = 0.20 + det * 0.022
+
+// Zone Size moves the hold test only -> changes the EXTENT of each zone
+padPct  = 0.02 + zsize * 0.026
+capMult = 1.15 + zsize * 0.115
+
+// Quality score anchors. Each dimension ramps 0..1 between LO and HI, then the
+// three are averaged and scaled to 0-100. Anchors sit near the p10/p90 of each
+// measured distribution, so the score spreads across its full range instead of
+// bunching up. All three are causal - nothing here needs future bars.
+LO_DUR = 12.0
+HI_DUR = 45.0
+LO_HT  = 1.5
+HI_HT  = 5.0
+LO_GR  = 1.0
+HI_GR  = 1.6
 
 // --------------------------------------------------
 // VOLATILITY CONTEXT
@@ -144,9 +160,9 @@ rangeL = longHi - longLo
 
 compRatio = rangeL > 0 ? rangeS / rangeL : 1.0
 
-netMove   = math.abs(close - close[winN])
-pathMove  = math.sum(math.abs(close - close[1]), winN)
-effRatio  = pathMove > 0 ? netMove / pathMove : 1.0
+netMove  = math.abs(close - close[winN])
+pathMove = math.sum(math.abs(close - close[1]), winN)
+effRatio = pathMove > 0 ? netMove / pathMove : 1.0
 
 formHi = ta.highest(high, formLen)
 formLo = ta.lowest(low, formLen)
@@ -162,7 +178,8 @@ var bool   conActive = false
 var box    conBox    = na
 var float  conTop    = na
 var float  conBot    = na
-var float  conH0     = na   // seed height, the reference the growth cap works off
+var float  conH0     = na
+var float  conScore  = 0.0
 var int    conLeft   = na
 var int    brkBar    = na
 var string conState  = "None"
@@ -181,31 +198,88 @@ if not conActive and runLen == seedBars
     conBot    := formLo
     conH0     := math.max(formHi - formLo, syminfo.mintick)
     conState  := "Active"
+    conScore  := 0.0
     newCon    := true
-    conBox := box.new(conLeft, conTop, bar_index, conBot, border_color=color.new(color.orange, 25), border_width=1, bgcolor=color.new(color.orange, 88), text="CONSOLIDATION", text_color=color.new(color.orange, 15), text_size=size.tiny, text_halign=text.align_center, text_valign=text.align_top)
+
+    conBox := box.new(
+         conLeft,
+         conTop,
+         bar_index,
+         conBot,
+         border_color=color.new(color.orange, 25),
+         border_width=1,
+         bgcolor=color.new(color.orange, 88),
+         text="CONSOLIDATION",
+         text_color=color.new(color.orange, 15),
+         text_size=size.tiny,
+         text_halign=text.align_center,
+         text_valign=text.align_top)
 
 // manage the live zone
 if conActive
+    // --- live quality score -----------------------------------------------
+    qDur = math.min(math.max((bar_index - conLeft + 1 - LO_DUR) / (HI_DUR - LO_DUR), 0), 1)
+
+    qHt = math.min(
+         math.max(
+             ((conTop - conBot) / math.max(atr, syminfo.mintick) - LO_HT) /
+             (HI_HT - LO_HT),
+             0),
+         1)
+
+    qGr = math.min(
+         math.max(
+             ((conTop - conBot) / conH0 - LO_GR) /
+             (HI_GR - LO_GR),
+             0),
+         1)
+
+    conScore := (qDur + qHt + qGr) / 3 * 100
+
     pad = (conTop - conBot) * padPct
     upB = close > conTop + pad
     dnB = close < conBot - pad
 
     box.set_right(conBox, bar_index)
+    box.set_text(conBox, "CONSOLIDATION  " + str.tostring(conScore, "#"))
+
+    box.set_border_color(
+         conBox,
+         conScore >= 65 ? color.new(color.orange, 0) :
+         conScore >= 27 ? color.new(color.orange, 35) :
+         color.new(color.gray, 45))
 
     if upB or dnB
+        // a break from a low-scoring zone still draws, it just does not signal
+        ok = conScore >= minScore
+
         conActive := false
         runLen    := 0
         brkBar    := bar_index
         conState  := upB ? "Broke Up" : "Broke Down"
-        bullBrk   := upB
-        bearBrk   := dnB
-        box.set_bgcolor(conBox, color.new(upB ? color.green : color.red, 88))
-        box.set_border_color(conBox, color.new(upB ? color.green : color.red, 25))
-        if showBrk
-            label.new(bar_index, upB ? conTop : conBot, upB ? "BREAK ▲" : "BREAK ▼", style=upB ? label.style_label_up : label.style_label_down, color=upB ? color.green : color.red, textcolor=color.white, size=size.small)
+        bullBrk   := upB and ok
+        bearBrk   := dnB and ok
+
+        box.set_bgcolor(
+             conBox,
+             color.new(upB ? color.green : color.red, ok ? 85 : 93))
+
+        box.set_border_color(
+             conBox,
+             color.new(upB ? color.green : color.red, ok ? 25 : 60))
+
+        if showBrk and ok
+            label.new(
+                 bar_index,
+                 upB ? conTop : conBot,
+                 (upB ? "BREAK ▲  " : "BREAK ▼  ") + str.tostring(conScore, "#"),
+                 style=upB ? label.style_label_up : label.style_label_down,
+                 color=upB ? color.green : color.red,
+                 textcolor=color.white,
+                 size=size.small)
+
     else
-        // absorb the bar, but never let the box jump further than the pad -
-        // growth stays bounded so a drifting range still eventually breaks
+        // absorb the bar, but never let the box jump further than the pad
         newTop = math.max(conTop, math.min(high, conTop + pad))
         newBot = math.min(conBot, math.max(low, conBot - pad))
 
@@ -219,9 +293,76 @@ if conActive
             box.set_top(conBox, conTop)
             box.set_bottom(conBox, conBot)
 
-alertcondition(newCon,  "Consolidation Detected", "Price is consolidating inside the prior swing range")
-alertcondition(bullBrk, "Range Break Up",   "Consolidation broken to the upside")
-alertcondition(bearBrk, "Range Break Down", "Consolidation broken to the downside")
+// --------------------------------------------------
+// IGNITION - a one-shot check on the break bar
+// --------------------------------------------------
+IGNITE_BARS = 3
+
+fastDrive = compRatio > 0.55 and effRatio > 0.45
+
+// FIX:
+// Direction of the current net move over winN bars.
+//  1 = upward
+// -1 = downward
+//  0 = flat
+dirSign = close > close[winN] ? 1 : close < close[winN] ? -1 : 0
+
+var string impState = "None"
+var int    impBar   = na
+var int    impDir   = 0
+var float  impLvl   = na
+var float  impRisk  = na
+var float  impPeak  = 0.0
+
+bool ignited = false
+
+if bullBrk or bearBrk
+    impState := "Watching"
+    impBar   := bar_index
+    impDir   := bullBrk ? 1 : -1
+    impLvl   := bullBrk ? conTop : conBot
+    impRisk  := math.max(conTop - conBot, syminfo.mintick)
+    impPeak  := 0.0
+
+// extension since the break, in units of the range height
+// 1R = the consolidation box height
+ext = impState == "None" or na(impLvl) ? 0.0 : (close - impLvl) * impDir / impRisk
+
+if impState == "Watching"
+    if fastDrive and dirSign == impDir
+        impState := "Ignited"
+        ignited  := true
+    else if bar_index - impBar > IGNITE_BARS
+        impState := "Fizzled"
+
+else if impState == "Ignited"
+    impPeak := math.max(impPeak, ext)
+
+    if compRatio < 0.45
+        impState := "Done"
+
+// --------------------------------------------------
+// ALERTS
+// --------------------------------------------------
+alertcondition(
+     newCon,
+     "Consolidation Detected",
+     "Price is consolidating inside the prior swing range")
+
+alertcondition(
+     bullBrk,
+     "Range Break Up",
+     "Consolidation broken to the upside")
+
+alertcondition(
+     bearBrk,
+     "Range Break Down",
+     "Consolidation broken to the downside")
+
+alertcondition(
+     ignited,
+     "Breakout Ignited",
+     "Break confirmed - it caught within 3 bars")
 
 // --------------------------------------------------
 // TRADING BIAS ENGINE
@@ -230,8 +371,10 @@ freshBrk = not na(brkBar) and bar_index - brkBar <= winN
 
 bias =
      conActive ? "In Range - wait for break" :
-     freshBrk and conState == "Broke Up"   ? "Break Up - retest long" :
-     freshBrk and conState == "Broke Down" ? "Break Down - retest short" :
+     impState == "Watching" ? "Break unconfirmed - wait for ignition" :
+     impState == "Ignited" ? "Following - " + str.tostring(ext, "#.#") + "R extended" :
+     impState == "Done" and freshBrk ? "Leg done - trail, do not add" :
+     impState == "Fizzled" and freshBrk ? "Break failed to ignite - stand aside" :
      trend == "Bullish" ? "Pullbacks Long (HL)" :
      trend == "Bearish" ? "Rallies Short (LH)" :
      trend == "Transition Up" ? "Reversal Possible ↑" :
@@ -241,36 +384,180 @@ bias =
 // --------------------------------------------------
 // TABLE PANEL
 // --------------------------------------------------
-var table panel = table.new(position.top_right, 2, 6, border_width=1)
+var table panel = table.new(position.top_right, 2, 8, border_width=1)
 
 bg  = color.white
 txt = color.black
 
 if barstate.islast
     stateTxt = conActive ? "Consolidating" : trend
-    stateCol = conActive ? color.orange :
+
+    stateCol =
+         conActive ? color.orange :
          trend == "Bullish" ? color.green :
-         trend == "Bearish" ? color.red : color.orange
+         trend == "Bearish" ? color.red :
+         color.orange
 
-    conTxt = conActive ? "Active (" + str.tostring(bar_index - conLeft + 1) + " bars)" : conState
-    conCol = conActive ? color.orange :
+    conTxt =
+         conActive ?
+         "Active (" + str.tostring(bar_index - conLeft + 1) + " bars)" :
+         conState
+
+    conCol =
+         conActive ? color.orange :
          conState == "Broke Up" ? color.green :
-         conState == "Broke Down" ? color.red : color.gray
+         conState == "Broke Down" ? color.red :
+         color.gray
 
-    table.cell(panel, 0, 0, "Market State", text_color=txt, bgcolor=bg)
-    table.cell(panel, 1, 0, stateTxt, text_color=color.white, bgcolor=stateCol)
+    impTxt =
+         impState == "Ignited" ?
+         "Ignited  " + str.tostring(ext, "#.#") + "R" :
+         impState == "Done" ?
+         "Done  peak " + str.tostring(impPeak, "#.#") + "R" :
+         impState == "None" ?
+         "-" :
+         impState
 
-    table.cell(panel, 0, 1, "Last Structure", text_color=txt, bgcolor=bg)
-    table.cell(panel, 1, 1, lastEvent, text_color=txt, bgcolor=bg)
+    impStCol =
+         impState == "Ignited" ? color.rgb(59, 130, 246) :
+         impState == "Watching" ? color.orange :
+         color.gray
 
-    table.cell(panel, 0, 2, "Consolidation", text_color=txt, bgcolor=bg)
-    table.cell(panel, 1, 2, conTxt, text_color=color.white, bgcolor=conCol)
+    scoreTxt =
+         conState == "None" ?
+         "-" :
+         str.tostring(conScore, "#") + " / 100"
 
-    table.cell(panel, 0, 3, "Volatility", text_color=txt, bgcolor=bg)
-    table.cell(panel, 1, 3, momentum, text_color=txt, bgcolor=bg)
+    scoreCol =
+         conState == "None" ? color.gray :
+         conScore >= 65 ? color.green :
+         conScore >= 27 ? color.orange :
+         color.gray
 
-    table.cell(panel, 0, 4, "Trading Bias", text_color=txt, bgcolor=bg)
-    table.cell(panel, 1, 4, bias, text_color=txt, bgcolor=bg)
+    table.cell(
+         panel,
+         0,
+         0,
+         "Market State",
+         text_color=txt,
+         bgcolor=bg)
 
-    table.cell(panel, 0, 5, "ATR(14)", text_color=txt, bgcolor=bg)
-    table.cell(panel, 1, 5, str.tostring(atr, format.mintick), text_color=txt, bgcolor=bg)
+    table.cell(
+         panel,
+         1,
+         0,
+         stateTxt,
+         text_color=color.white,
+         bgcolor=stateCol)
+
+    table.cell(
+         panel,
+         0,
+         1,
+         "Breakout",
+         text_color=txt,
+         bgcolor=bg)
+
+    table.cell(
+         panel,
+         1,
+         1,
+         impTxt,
+         text_color=color.white,
+         bgcolor=impStCol)
+
+    table.cell(
+         panel,
+         0,
+         2,
+         "Consolidation",
+         text_color=txt,
+         bgcolor=bg)
+
+    table.cell(
+         panel,
+         1,
+         2,
+         conTxt,
+         text_color=color.white,
+         bgcolor=conCol)
+
+    table.cell(
+         panel,
+         0,
+         3,
+         "Zone Score",
+         text_color=txt,
+         bgcolor=bg)
+
+    table.cell(
+         panel,
+         1,
+         3,
+         scoreTxt,
+         text_color=color.white,
+         bgcolor=scoreCol)
+
+    table.cell(
+         panel,
+         0,
+         4,
+         "Last Structure",
+         text_color=txt,
+         bgcolor=bg)
+
+    table.cell(
+         panel,
+         1,
+         4,
+         lastEvent,
+         text_color=txt,
+         bgcolor=bg)
+
+    table.cell(
+         panel,
+         0,
+         5,
+         "Volatility",
+         text_color=txt,
+         bgcolor=bg)
+
+    table.cell(
+         panel,
+         1,
+         5,
+         momentum,
+         text_color=txt,
+         bgcolor=bg)
+
+    table.cell(
+         panel,
+         0,
+         6,
+         "Trading Bias",
+         text_color=txt,
+         bgcolor=bg)
+
+    table.cell(
+         panel,
+         1,
+         6,
+         bias,
+         text_color=txt,
+         bgcolor=bg)
+
+    table.cell(
+         panel,
+         0,
+         7,
+         "ATR(14)",
+         text_color=txt,
+         bgcolor=bg)
+
+    table.cell(
+         panel,
+         1,
+         7,
+         str.tostring(atr, format.mintick),
+         text_color=txt,
+         bgcolor=bg)
