@@ -1,0 +1,538 @@
+//@version=6
+// Swing Structure Bias [Filtered Structure v3.1 - Confirmed Reversals]
+// Derived from "Trend Angle Momentum [MarkitTick]" supplied by the user.
+// Box behavior is inspired by the user's supplied "Sessions [LuxAlgo]" script.
+// Swing filtering follows the general confirmed-pivot + alternating ZigZag approach
+// documented by TradingView, with an added ATR significance filter.
+// Market-structure state follows the Photon-style idea that HL/LH structure is
+// confirmed by a body-close BOS rather than by every small pivot fluctuation.
+//
+// Source scripts supplied by the user are CC BY-NC-SA 4.0; this derivative is
+// provided under the same license.
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+indicator("Swing Structure Bias [Filtered Structure v3.1]", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────────────────────────────────────
+var string G_SWINGS  = "Swing Detection"
+var string G_STRUCT  = "Structure"
+var string G_VISUALS = "Visuals"
+
+pivotLegs = input.int(3, "Pivot Legs (each side)", minval = 2, maxval = 20, group = G_SWINGS,
+     tooltip = "Raw pivot sensitivity. Smaller values react faster. The ZigZag/ATR filters below remove many of the extra pivots that a short setting would normally create.")
+
+atrLength = input.int(14, "ATR Length", minval = 2, group = G_SWINGS)
+minReversalAtr = input.float(0.65, "Minimum Reversal (ATR)", minval = 0.0, step = 0.05, group = G_SWINGS,
+     tooltip = "Opposite pivots must reverse by at least this many ATRs from the current swing extreme. Raise this to remove more noise; lower it to detect more swings.")
+minReversalPct = input.float(0.00, "Minimum Reversal (%)", minval = 0.0, step = 0.01, group = G_SWINGS,
+     tooltip = "Optional percentage floor. The required reversal is the larger of the ATR threshold and this percentage threshold.")
+
+useBodyBreaks = input.bool(true, "Confirm Structure With Candle Close", group = G_STRUCT,
+     tooltip = "When enabled, bullish/bearish structure changes require a candle close through the protected swing. This is less sensitive to wick sweeps.")
+confirmReversals = input.bool(true, "Require Pullback + BOS To Reverse", group = G_STRUCT,
+     tooltip = "Keeps the current swing bias after the first countertrend break. A reversal is confirmed only after a filtered pullback forms and price then breaks back in the new direction. This prevents small pullbacks from splitting a strong trend into opposite-colored boxes.")
+insideCreatesRange = input.bool(true, "LH + HL = Range", group = G_STRUCT,
+     tooltip = "When the latest filtered high is below the prior high and the latest filtered low is above the prior low, classify the phase as RANGE and hold it until its containing boundary breaks.")
+
+showSwingPoints = input.bool(true, "Show Filtered Swing Points", group = G_VISUALS)
+showSwingText = input.bool(false, "Show HH / HL / LH / LL", group = G_VISUALS)
+showStateBoxes = input.bool(true, "Show Structure Boxes", group = G_VISUALS)
+boxTransparency = input.int(88, "Box Transparency", minval = 0, maxval = 100, group = G_VISUALS)
+
+bullColor = input.color(#089981, "Bullish", group = G_VISUALS)
+bearColor = input.color(#f23645, "Bearish", group = G_VISUALS)
+rangeColor = input.color(#808080, "Range", group = G_VISUALS)
+highPointColor = input.color(#f23645, "Swing High", group = G_VISUALS)
+lowPointColor = input.color(#089981, "Swing Low", group = G_VISUALS)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+f_requiredMove(float fromPrice, float atrValue) =>
+    float atrMove = nz(atrValue) * minReversalAtr
+    float pctMove = math.abs(fromPrice) * minReversalPct / 100.0
+    math.max(atrMove, pctMove)
+
+f_stateText(int state) =>
+    state == 1 ? "BULLISH" : state == -1 ? "BEARISH" : state == 2 ? "RANGE" : ""
+
+f_stateColor(int state) =>
+    state == 1 ? bullColor : state == -1 ? bearColor : rangeColor
+
+f_highText(float price, float previousHigh) =>
+    na(previousHigh) ? "SH" : price > previousHigh ? "HH" : "LH"
+
+f_lowText(float price, float previousLow) =>
+    na(previousLow) ? "SL" : price < previousLow ? "LL" : "HL"
+
+f_makeSwingMarker(int swingType, int swingBar, float swingPrice, string swingText) =>
+    label marker = na
+    if showSwingPoints
+        color pointColor = swingType == 1 ? highPointColor : lowPointColor
+        string markerText = showSwingText ? swingText : ""
+        marker := label.new(
+             x = swingBar,
+             y = swingPrice,
+             text = markerText,
+             xloc = xloc.bar_index,
+             yloc = yloc.price,
+             style = label.style_circle,
+             color = pointColor,
+             textcolor = color.white,
+             size = showSwingText ? size.small : size.tiny)
+    marker
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1) Raw confirmed pivots
+//
+// A short pivot length gives responsive candidate points. We DO NOT use every
+// candidate. The next section converts them into an alternating swing sequence.
+// ─────────────────────────────────────────────────────────────────────────────
+float rawHigh = ta.pivothigh(high, pivotLegs, pivotLegs)
+float rawLow  = ta.pivotlow(low, pivotLegs, pivotLegs)
+int rawPivotBar = bar_index - pivotLegs
+float atrAtPivot = ta.atr(atrLength)[pivotLegs]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2) Filtered alternating swing engine
+//
+// Rules:
+// • Highs and lows must alternate.
+// • If another pivot of the SAME type appears before a valid reversal, only the
+//   more extreme one survives. This removes double/triple tops of tiny pivots.
+// • An opposite pivot is accepted only after a minimum ATR/% reversal.
+//
+// This is the key difference from v2, where independently detected highs/lows
+// were paired together and could produce inconsistent structure boxes.
+// ─────────────────────────────────────────────────────────────────────────────
+var int zzType = 0                     // 1 = latest swing high, -1 = latest swing low
+var float zzPrice = na
+var int zzBar = na
+var label zzMarker = na
+
+var float lastHigh = na
+var float prevHigh = na
+var int lastHighBar = na
+var int prevHighBar = na
+
+var float lastLow = na
+var float prevLow = na
+var int lastLowBar = na
+var int prevLowBar = na
+
+var bool highLevelBroken = false
+var bool lowLevelBroken = false
+
+bool newAlternatingSwing = false
+int newSwingType = 0
+
+// Rare outside bars can qualify as both a raw high and raw low. For a clean
+// structure map we prefer the candidate OPPOSITE the current ZigZag direction
+// and do not create two structural pivots on the same candle.
+bool candidateHigh = not na(rawHigh) and barstate.isconfirmed
+bool candidateLow  = not na(rawLow) and barstate.isconfirmed
+
+if candidateHigh and candidateLow
+    if zzType == 1
+        candidateHigh := false
+    else if zzType == -1
+        candidateLow := false
+    else
+        // No established direction yet: start with the side farther from close.
+        float highDistance = math.abs(rawHigh - close[pivotLegs])
+        float lowDistance = math.abs(close[pivotLegs] - rawLow)
+        if highDistance >= lowDistance
+            candidateLow := false
+        else
+            candidateHigh := false
+
+// ----- High candidate ---------------------------------------------------------
+if candidateHigh
+    if zzType == 0
+        zzType := 1
+        zzPrice := rawHigh
+        zzBar := rawPivotBar
+        lastHigh := rawHigh
+        lastHighBar := rawPivotBar
+        highLevelBroken := false
+        zzMarker := f_makeSwingMarker(1, zzBar, zzPrice, f_highText(zzPrice, prevHigh))
+
+    else if zzType == 1
+        // Same-side extension: keep only the more extreme high.
+        if rawHigh > zzPrice
+            zzPrice := rawHigh
+            zzBar := rawPivotBar
+            lastHigh := rawHigh
+            lastHighBar := rawPivotBar
+            highLevelBroken := false
+            if not na(zzMarker)
+                label.delete(zzMarker)
+            zzMarker := f_makeSwingMarker(1, zzBar, zzPrice, f_highText(zzPrice, prevHigh))
+
+    else
+        // Opposite pivot: require a meaningful reversal from the last low.
+        float requiredMove = f_requiredMove(zzPrice, atrAtPivot)
+        if rawHigh - zzPrice >= requiredMove
+            prevHigh := lastHigh
+            prevHighBar := lastHighBar
+            lastHigh := rawHigh
+            lastHighBar := rawPivotBar
+
+            zzType := 1
+            zzPrice := rawHigh
+            zzBar := rawPivotBar
+            highLevelBroken := false
+
+            zzMarker := f_makeSwingMarker(1, zzBar, zzPrice, f_highText(zzPrice, prevHigh))
+            newAlternatingSwing := true
+            newSwingType := 1
+
+// ----- Low candidate ----------------------------------------------------------
+if candidateLow
+    if zzType == 0
+        zzType := -1
+        zzPrice := rawLow
+        zzBar := rawPivotBar
+        lastLow := rawLow
+        lastLowBar := rawPivotBar
+        lowLevelBroken := false
+        zzMarker := f_makeSwingMarker(-1, zzBar, zzPrice, f_lowText(zzPrice, prevLow))
+
+    else if zzType == -1
+        // Same-side extension: keep only the more extreme low.
+        if rawLow < zzPrice
+            zzPrice := rawLow
+            zzBar := rawPivotBar
+            lastLow := rawLow
+            lastLowBar := rawPivotBar
+            lowLevelBroken := false
+            if not na(zzMarker)
+                label.delete(zzMarker)
+            zzMarker := f_makeSwingMarker(-1, zzBar, zzPrice, f_lowText(zzPrice, prevLow))
+
+    else
+        // Opposite pivot: require a meaningful reversal from the last high.
+        float requiredMove = f_requiredMove(zzPrice, atrAtPivot)
+        if zzPrice - rawLow >= requiredMove
+            prevLow := lastLow
+            prevLowBar := lastLowBar
+            lastLow := rawLow
+            lastLowBar := rawPivotBar
+
+            zzType := -1
+            zzPrice := rawLow
+            zzBar := rawPivotBar
+            lowLevelBroken := false
+
+            zzMarker := f_makeSwingMarker(-1, zzBar, zzPrice, f_lowText(zzPrice, prevLow))
+            newAlternatingSwing := true
+            newSwingType := -1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3) Persistent structure model
+//
+// State changes for one of four reasons:
+// A) Initial HH+HL or LH+LL structure becomes clear.
+// B) A complete inside pair (LH + HL) creates a range.
+// C) A range boundary breaks.
+// D) A directional reversal completes a TWO-STEP confirmation:
+//      1. Countertrend close through the protected swing -> potential shift only.
+//      2. A filtered pullback forms, then price breaks again in the new direction.
+//
+// The key v3.1 change is D. The first countertrend break no longer flips the
+// large swing box by itself, so a small pullback inside a strong trend remains
+// part of the existing bullish/bearish regime.
+// ─────────────────────────────────────────────────────────────────────────────
+var int structureState = 0             // 1 bull, -1 bear, 2 range, 0 warming up
+var float protectedLow = na            // low that warns bullish structure may be shifting
+var float protectedHigh = na           // high that warns bearish structure may be shifting
+var float rangeTop = na
+var float rangeBottom = na
+
+// Pending reversal state:
+//  1 = possible bearish -> bullish reversal
+// -1 = possible bullish -> bearish reversal
+// The existing swing bias remains active while a reversal is pending.
+var int pendingReversal = 0
+var int pendingStartBar = na
+var bool pendingPullbackSeen = false
+var float pendingTrigger = na
+
+bool haveTwoHighs = not na(lastHigh) and not na(prevHigh)
+bool haveTwoLows = not na(lastLow) and not na(prevLow)
+bool haveStructurePairs = haveTwoHighs and haveTwoLows
+
+bool hh = haveTwoHighs and lastHigh > prevHigh
+bool lh = haveTwoHighs and lastHigh <= prevHigh
+bool hl = haveTwoLows and lastLow >= prevLow
+bool ll = haveTwoLows and lastLow < prevLow
+
+bool bullishPattern = hh and hl
+bool bearishPattern = lh and ll
+bool insidePattern = lh and hl
+
+int proposedState = structureState
+float proposedRangeTop = rangeTop
+float proposedRangeBottom = rangeBottom
+bool stateChangeRequested = false
+
+// Break source: body close by default, wick if the user disables close confirms.
+float bullBreakSource = useBodyBreaks ? close : high
+float bearBreakSource = useBodyBreaks ? close : low
+
+// Initial classification only. After initialization we use persistence rules.
+if structureState == 0 and haveStructurePairs
+    if insideCreatesRange and insidePattern
+        proposedState := 2
+        proposedRangeTop := prevHigh
+        proposedRangeBottom := prevLow
+        stateChangeRequested := true
+    else if bullishPattern
+        proposedState := 1
+        protectedLow := lastLow
+        stateChangeRequested := true
+    else if bearishPattern
+        proposedState := -1
+        protectedHigh := lastHigh
+        stateChangeRequested := true
+
+// A complete inside pair establishes a range. Once in RANGE, later internal
+// pivots cannot chop the state into lots of smaller boxes. Only a boundary break
+// can end the range.
+if structureState != 2 and structureState != 0 and newAlternatingSwing and insideCreatesRange and insidePattern
+    proposedState := 2
+    proposedRangeTop := prevHigh
+    proposedRangeBottom := prevLow
+    stateChangeRequested := true
+
+// RANGE breakout has highest priority. The containing boundaries, not the latest
+// little internal pivot, control when the range ends.
+bool rangeBreakUp = structureState == 2 and not na(rangeTop) and bullBreakSource > rangeTop
+bool rangeBreakDown = structureState == 2 and not na(rangeBottom) and bearBreakSource < rangeBottom
+
+if rangeBreakUp and not rangeBreakDown
+    proposedState := 1
+    proposedRangeTop := na
+    proposedRangeBottom := na
+    protectedLow := lastLow
+    pendingReversal := 0
+    pendingStartBar := na
+    pendingPullbackSeen := false
+    pendingTrigger := na
+    stateChangeRequested := true
+
+if rangeBreakDown and not rangeBreakUp
+    proposedState := -1
+    proposedRangeTop := na
+    proposedRangeBottom := na
+    protectedHigh := lastHigh
+    pendingReversal := 0
+    pendingStartBar := na
+    pendingPullbackSeen := false
+    pendingTrigger := na
+    stateChangeRequested := true
+
+// Directional invalidation is now only the FIRST step of a reversal.
+// Example in a bearish trend:
+//   close > protectedHigh -> potential bullish shift, but KEEP the red box.
+// We then wait for a filtered low to form and require another bullish break.
+bool bullishInvalidation = structureState == 1 and not na(protectedLow) and bearBreakSource < protectedLow
+bool bearishInvalidation = structureState == -1 and not na(protectedHigh) and bullBreakSource > protectedHigh
+
+if confirmReversals
+    if bearishInvalidation and pendingReversal != 1
+        pendingReversal := 1
+        pendingStartBar := bar_index
+        pendingPullbackSeen := false
+        pendingTrigger := na
+
+    if bullishInvalidation and pendingReversal != -1
+        pendingReversal := -1
+        pendingStartBar := bar_index
+        pendingPullbackSeen := false
+        pendingTrigger := na
+else
+    // Optional legacy behavior: first protected-swing break flips the state.
+    if bullishInvalidation
+        proposedState := -1
+        protectedHigh := lastHigh
+        proposedRangeTop := na
+        proposedRangeBottom := na
+        stateChangeRequested := true
+
+    if bearishInvalidation
+        proposedState := 1
+        protectedLow := lastLow
+        proposedRangeTop := na
+        proposedRangeBottom := na
+        stateChangeRequested := true
+
+// Step 2a: after the first countertrend break, wait for a REAL filtered pullback.
+// For a possible bullish reversal, that means a new filtered LOW after the break.
+// The high preceding that pullback becomes the confirmation trigger.
+if confirmReversals and pendingReversal == 1 and structureState == -1
+    if newAlternatingSwing and newSwingType == -1 and not na(pendingStartBar) and lastLowBar > pendingStartBar
+        pendingPullbackSeen := true
+        pendingTrigger := lastHigh
+
+// For a possible bearish reversal, wait for a new filtered HIGH after the break.
+// The low preceding that pullback becomes the confirmation trigger.
+if confirmReversals and pendingReversal == -1 and structureState == 1
+    if newAlternatingSwing and newSwingType == 1 and not na(pendingStartBar) and lastHighBar > pendingStartBar
+        pendingPullbackSeen := true
+        pendingTrigger := lastLow
+
+// Step 2b: only the SECOND directional break changes the large swing bias.
+bool bullishReversalConfirmed = confirmReversals and structureState == -1 and pendingReversal == 1 and pendingPullbackSeen and not na(pendingTrigger) and bullBreakSource > pendingTrigger
+bool bearishReversalConfirmed = confirmReversals and structureState == 1 and pendingReversal == -1 and pendingPullbackSeen and not na(pendingTrigger) and bearBreakSource < pendingTrigger
+
+if bullishReversalConfirmed
+    proposedState := 1
+    protectedLow := lastLow
+    proposedRangeTop := na
+    proposedRangeBottom := na
+    pendingReversal := 0
+    pendingStartBar := na
+    pendingPullbackSeen := false
+    pendingTrigger := na
+    stateChangeRequested := true
+
+if bearishReversalConfirmed
+    proposedState := -1
+    protectedHigh := lastHigh
+    proposedRangeTop := na
+    proposedRangeBottom := na
+    pendingReversal := 0
+    pendingStartBar := na
+    pendingPullbackSeen := false
+    pendingTrigger := na
+    stateChangeRequested := true
+
+// Continuation BOS does NOT create a new box. It confirms the most recent
+// opposite swing as the new protected structural point. If a countertrend shift
+// was pending, a fresh continuation BOS cancels it because the original trend
+// has reasserted itself.
+bool bullishContinuationBos = structureState == 1 and not na(lastHigh) and not highLevelBroken and bar_index > lastHighBar and bullBreakSource > lastHigh
+bool bearishContinuationBos = structureState == -1 and not na(lastLow) and not lowLevelBroken and bar_index > lastLowBar and bearBreakSource < lastLow
+
+if bullishContinuationBos
+    highLevelBroken := true
+    if not na(lastLow)
+        protectedLow := lastLow
+    if pendingReversal == -1
+        pendingReversal := 0
+        pendingStartBar := na
+        pendingPullbackSeen := false
+        pendingTrigger := na
+
+if bearishContinuationBos
+    lowLevelBroken := true
+    if not na(lastHigh)
+        protectedHigh := lastHigh
+    if pendingReversal == 1
+        pendingReversal := 0
+        pendingStartBar := na
+        pendingPullbackSeen := false
+        pendingTrigger := na
+
+// Mark broken levels in non-directional states too, so one old pivot cannot fire
+// repeatedly later.
+if structureState != 1 and not na(lastHigh) and not highLevelBroken and bar_index > lastHighBar and bullBreakSource > lastHigh
+    highLevelBroken := true
+
+if structureState != -1 and not na(lastLow) and not lowLevelBroken and bar_index > lastLowBar and bearBreakSource < lastLow
+    lowLevelBroken := true
+
+// Apply range values and final state.
+bool stateChanged = stateChangeRequested and proposedState != structureState
+
+if stateChanged
+    structureState := proposedState
+    rangeTop := proposedRangeTop
+    rangeBottom := proposedRangeBottom
+
+    // Any completed regime change resets an unfinished directional reversal.
+    pendingReversal := 0
+    pendingStartBar := na
+    pendingPullbackSeen := false
+    pendingTrigger := na
+
+    // Initialize protected swing on directional entry if it was not already set.
+    if structureState == 1 and na(protectedLow)
+        protectedLow := lastLow
+    if structureState == -1 and na(protectedHigh)
+        protectedHigh := lastHigh
+
+    if structureState != 2
+        rangeTop := na
+        rangeBottom := na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4) Lux-style phase boxes
+//
+// One continuous box per structural regime. Continuation BOS does not split it.
+// RANGE boxes remain locked to their containing swing high/low.
+// ─────────────────────────────────────────────────────────────────────────────
+var box activeBox = na
+var float phaseTop = na
+var float phaseBottom = na
+
+if stateChanged
+    if showStateBoxes and not na(activeBox)
+        box.set_right(activeBox, bar_index)
+
+    if showStateBoxes
+        color phaseColor = f_stateColor(structureState)
+        float newTop = structureState == 2 and not na(rangeTop) ? rangeTop : high
+        float newBottom = structureState == 2 and not na(rangeBottom) ? rangeBottom : low
+
+        phaseTop := newTop
+        phaseBottom := newBottom
+
+        activeBox := box.new(
+             left = bar_index,
+             top = newTop,
+             right = bar_index,
+             bottom = newBottom,
+             xloc = xloc.bar_index,
+             bgcolor = color.new(phaseColor, boxTransparency),
+             border_color = phaseColor,
+             border_style = line.style_dotted,
+             border_width = 1,
+             text = f_stateText(structureState),
+             text_color = phaseColor,
+             text_size = size.tiny,
+             text_halign = text.align_left,
+             text_valign = text.align_top)
+
+if showStateBoxes and not na(activeBox)
+    box.set_right(activeBox, bar_index)
+
+    if structureState == 2 and not na(rangeTop) and not na(rangeBottom)
+        phaseTop := rangeTop
+        phaseBottom := rangeBottom
+    else
+        phaseTop := na(phaseTop) ? high : math.max(phaseTop, high)
+        phaseBottom := na(phaseBottom) ? low : math.min(phaseBottom, low)
+
+    box.set_top(activeBox, phaseTop)
+    box.set_bottom(activeBox, phaseBottom)
+
+// If boxes are disabled after one already exists, hide the active one rather
+// than continuing to update it visibly.
+if not showStateBoxes and not na(activeBox)
+    box.delete(activeBox)
+    activeBox := na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Alerts
+// ─────────────────────────────────────────────────────────────────────────────
+bool bullishStateChange = stateChanged and structureState == 1
+bool bearishStateChange = stateChanged and structureState == -1
+bool rangeStateChange = stateChanged and structureState == 2
+
+alertcondition(bullishStateChange, "Bullish Structure", "Filtered swing structure turned BULLISH")
+alertcondition(bearishStateChange, "Bearish Structure", "Filtered swing structure turned BEARISH")
+alertcondition(rangeStateChange, "Range Structure", "Filtered swing structure entered RANGE")
