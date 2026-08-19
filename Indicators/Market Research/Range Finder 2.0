@@ -1,0 +1,554 @@
+//@version=6
+// Range Finder [Episode Reconstruction v6]
+//
+// Core statistical detector:
+//   1) Variance-ratio anti-diffusion across two horizons.
+//   2) OU/AR(1)-style pullback of detrended residuals.
+//   3) Horizontal geometry and path tortuosity.
+//
+// v6 changes the RANGE EPISODE logic:
+//   - A confirmed range is backdated to the earlier "developing range" phase.
+//   - Initial box height absorbs the entire developing episode, not just the
+//     envelope on the confirmation bar.
+//   - While the regime is still range-like, new excursions are assimilated into
+//     the SAME box instead of automatically ending it.
+//   - A breakout now needs BOTH price displacement and directional/regime evidence.
+//   - One continuous range should therefore remain one continuous box.
+//
+// Source material supplied by the user is CC BY-NC-SA 4.0; this derivative is
+// provided under the same license.
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+indicator("Range Finder [Episode Reconstruction v6]", overlay = true, max_boxes_count = 300, max_lines_count = 300, max_labels_count = 100)
+
+// ============================================================================
+// Inputs
+// ============================================================================
+var string G_CORE  = "Range Detection"
+var string G_STYLE = "Style"
+
+rangeLength = input.int(30, "Range Length", minval = 15, maxval = 150, group = G_CORE,
+     tooltip = "Main statistical window. 25-40 is a good starting zone.")
+
+rangeSensitivity = input.int(7, "Range Sensitivity", minval = 1, maxval = 10, group = G_CORE,
+     tooltip = "Higher = earlier/more permissive range classification.")
+
+showRangeBoxes = input.bool(true, "Show Range Boxes", group = G_STYLE)
+
+showInvalidationLevels = input.bool(false, "Show Outer Invalidation Levels", group = G_STYLE,
+     tooltip = "Shows a wider statistical invalidation reference outside the range box.")
+
+boxTransparency = input.int(86, "Box Transparency", minval = 0, maxval = 100, group = G_STYLE)
+rangeColor = input.color(#808080, "Range Color", group = G_STYLE)
+
+// ============================================================================
+// Helpers
+// ============================================================================
+f_clamp01(float x) =>
+    math.max(0.0, math.min(1.0, x))
+
+f_smooth01(float x) =>
+    float y = f_clamp01(x)
+    y * y * (3.0 - 2.0 * y)
+
+f_lowScore(float value, float best, float worst) =>
+    na(value) ? 0.0 : worst <= best ? 0.0 : 1.0 - f_smooth01((value - best) / (worst - best))
+
+f_highScore(float value, float worst, float best) =>
+    na(value) ? 0.0 : best <= worst ? 0.0 : f_smooth01((value - worst) / (best - worst))
+
+f_var(float x, int len) =>
+    float m1 = ta.sma(x, len)
+    float m2 = ta.sma(x * x, len)
+    math.max(nz(m2 - m1 * m1), 0.0)
+
+f_cov(float x, float y, int len) =>
+    float mx = ta.sma(x, len)
+    float my = ta.sma(y, len)
+    float mxy = ta.sma(x * y, len)
+    nz(mxy - mx * my)
+
+// ============================================================================
+// Adaptive settings
+// ============================================================================
+float s = float(rangeSensitivity)
+
+int vrHorizonFast = math.max(3, int(math.round(rangeLength * 0.17)))
+int vrHorizonSlow = math.max(vrHorizonFast + 2, int(math.round(rangeLength * 0.33)))
+int boundaryLag = math.max(3, int(math.round(rangeLength * 0.25)))
+
+float vrWorst = 1.02 + s * 0.025
+float efficiencyWorst = 0.24 + s * 0.022
+float slopeWorstAtr = 0.055 + s * 0.009
+float boundaryWorstAtr = 0.14 + s * 0.024
+
+// Hard confirmation threshold.
+float entryScore = 72.0 - s * 1.60
+
+// Softer threshold used to reconstruct the beginning of a developing range.
+float seedScore = math.max(38.0, entryScore - 15.0)
+
+// Active ranges are allowed to survive below the original entry threshold.
+float holdScore = math.max(36.0, entryScore - 20.0)
+
+// A true directional breakout should usually coincide with score deterioration.
+float breakoutRegimeScore = math.max(32.0, entryScore - 24.0)
+
+int confirmBars = rangeSensitivity >= 8 ? 2 : 3
+int breakoutConfirmBars = 2
+int weakExitBars = math.max(6, int(math.round(rangeLength * 0.25)))
+
+// ============================================================================
+// Core price / volatility references
+// ============================================================================
+float atr = ta.atr(14)
+float atrSafe = math.max(atr, syminfo.mintick)
+
+float upperCluster = ta.percentile_nearest_rank(high, rangeLength, 85)
+float lowerCluster = ta.percentile_nearest_rank(low, rangeLength, 15)
+float upperTail = ta.percentile_nearest_rank(high, rangeLength, 97)
+float lowerTail = ta.percentile_nearest_rank(low, rangeLength, 3)
+float medianClose = ta.percentile_nearest_rank(close, rangeLength, 50)
+
+float robustWidth = math.max(upperCluster - lowerCluster, syminfo.mintick)
+float widthAtr = robustWidth / atrSafe
+
+// Local equilibrium and residual.
+float equilibrium = ta.linreg(close, rangeLength, 0)
+float equilibriumPrev = ta.linreg(close, rangeLength, 1)
+float equilibriumSlope = equilibrium - equilibriumPrev
+float slopeAtr = math.abs(equilibriumSlope) / atrSafe
+
+float residual = close - equilibrium
+float residualVariance = f_var(residual, rangeLength)
+float residualSigma = math.sqrt(math.max(residualVariance, 0.0))
+
+// ============================================================================
+// 1) Variance-ratio anti-diffusion
+// ============================================================================
+float safeClose = math.max(close, syminfo.mintick)
+float safeClose1 = math.max(close[1], syminfo.mintick)
+float r1 = math.log(safeClose / safeClose1)
+
+float safeCloseFast = math.max(close[vrHorizonFast], syminfo.mintick)
+float safeCloseSlow = math.max(close[vrHorizonSlow], syminfo.mintick)
+
+float rFast = math.log(safeClose / safeCloseFast)
+float rSlow = math.log(safeClose / safeCloseSlow)
+
+float var1 = f_var(r1, rangeLength)
+float varFast = f_var(rFast, rangeLength)
+float varSlow = f_var(rSlow, rangeLength)
+
+float varianceFloor = math.max(var1, 1e-12)
+
+float vrFast = varFast / (float(vrHorizonFast) * varianceFloor)
+float vrSlow = varSlow / (float(vrHorizonSlow) * varianceFloor)
+
+float vrFastScore = f_lowScore(vrFast, 0.52, vrWorst)
+float vrSlowScore = f_lowScore(vrSlow, 0.58, vrWorst + 0.08)
+float varianceRatioScore = (vrFastScore + vrSlowScore) * 0.5
+
+// ============================================================================
+// 2) OU / AR(1)-style residual pullback
+// ============================================================================
+float ouX = residual[1]
+float ouY = residual - residual[1]
+float ouVarX = f_var(ouX, rangeLength)
+
+float ouBeta = ouVarX > 1e-12 ? f_cov(ouX, ouY, rangeLength) / ouVarX : na
+float ouPull = not na(ouBeta) and ouBeta < 0.0 ? -ouBeta : 0.0
+float ouScore = f_highScore(ouPull, 0.015, 0.30)
+
+float ouPhi = not na(ouBeta) ? 1.0 + ouBeta : na
+float ouHalfLife = not na(ouPhi) and ouPhi > 0.0 and ouPhi < 1.0 ? -math.log(2.0) / math.log(ouPhi) : na
+
+float mrAverage = (varianceRatioScore + ouScore) * 0.5
+float mrAgreement = math.min(varianceRatioScore, ouScore)
+float meanReversionCore = mrAverage * 0.55 + mrAgreement * 0.45
+
+// ============================================================================
+// 3) Horizontal geometry / path behavior
+// ============================================================================
+float path = ta.sma(math.abs(close - close[1]), rangeLength) * rangeLength
+float efficiency = math.abs(close - close[rangeLength]) / math.max(path, syminfo.mintick)
+float efficiencyScore = f_lowScore(efficiency, 0.06, efficiencyWorst)
+
+float horizontalScore = f_lowScore(slopeAtr, 0.010, slopeWorstAtr)
+
+float topDriftAtr = math.abs(upperCluster - upperCluster[boundaryLag]) / atrSafe
+float bottomDriftAtr = math.abs(lowerCluster - lowerCluster[boundaryLag]) / atrSafe
+float boundaryDriftAtr = (topDriftAtr + bottomDriftAtr) * 0.5
+float boundaryScore = f_lowScore(boundaryDriftAtr, 0.025, boundaryWorstAtr)
+
+float centerCrossEvent = ta.cross(close, equilibrium) ? 1.0 : 0.0
+float centerCrosses = ta.sma(centerCrossEvent, rangeLength) * rangeLength
+float crossingScore = f_highScore(centerCrosses, 1.0, 4.0)
+
+float tortuosity = path / robustWidth
+float tortuosityScore = f_highScore(tortuosity, 1.30, 3.20)
+
+float geometryScore =
+     efficiencyScore * 0.20 +
+     horizontalScore * 0.25 +
+     boundaryScore * 0.15 +
+     crossingScore * 0.20 +
+     tortuosityScore * 0.20
+
+// ============================================================================
+// Continuous range score
+// ============================================================================
+float rangeScoreRaw = 100.0 * (meanReversionCore * 0.60 + geometryScore * 0.40)
+float rangeScore = ta.ema(rangeScoreRaw, 3)
+
+float directionStrength = 100.0 * (
+     (1.0 - horizontalScore) * 0.55 +
+     (1.0 - efficiencyScore) * 0.45)
+
+float directionSign = equilibriumSlope > 0.0 ? 1.0 : equilibriumSlope < 0.0 ? -1.0 : 0.0
+float directionScore = directionSign * directionStrength
+
+// ============================================================================
+// Candidate statistical envelope
+// ============================================================================
+float q90High = ta.percentile_nearest_rank(high, rangeLength, 90)
+float q10Low = ta.percentile_nearest_rank(low, rangeLength, 10)
+
+float sigmaHalfWidth = math.max(residualSigma * 1.65, atr * 0.85)
+float sigmaTop = medianClose + sigmaHalfWidth
+float sigmaBottom = medianClose - sigmaHalfWidth
+
+float edgePad = atr * 0.10
+float candidateTop = math.max(q90High, sigmaTop) + edgePad
+float candidateBottom = math.min(q10Low, sigmaBottom) - edgePad
+
+float candidateStopTop = math.max(upperTail + atr * 0.30, candidateTop + atr * 0.45)
+float candidateStopBottom = math.min(lowerTail - atr * 0.30, candidateBottom - atr * 0.45)
+
+// ============================================================================
+// Persistent range episode state
+// ============================================================================
+var bool inRange = false
+var bool armedForEntry = true
+
+var float rangeTop = na
+var float rangeBottom = na
+var float rangeStopTop = na
+var float rangeStopBottom = na
+
+var int rangeStartBar = na
+var int candidateStreak = 0
+var int weakStreak = 0
+var int upBreakStreak = 0
+var int downBreakStreak = 0
+
+var box activeRangeBox = na
+var line activeStopTopLine = na
+var line activeStopBottomLine = na
+
+bool scoreReady =
+     not na(rangeScore) and
+     not na(vrFast) and
+     not na(vrSlow) and
+     not na(ouBeta) and
+     candidateTop > candidateBottom
+
+// Re-arm only after the old range regime has cooled down enough.
+if not inRange and not armedForEntry and scoreReady and rangeScore < seedScore
+    armedForEntry := true
+
+bool hardRangeCandidate = scoreReady and rangeScore >= entryScore
+
+if not inRange and armedForEntry
+    candidateStreak := hardRangeCandidate ? candidateStreak + 1 : 0
+else
+    candidateStreak := 0
+
+bool rangeStarted = false
+
+// ============================================================================
+// Range confirmation + EPISODE RECONSTRUCTION
+// ============================================================================
+if not inRange and armedForEntry and candidateStreak >= confirmBars
+
+    // Scan backward from NOW through the contiguous developing-range regime.
+    //
+    // This is visual reconstruction only: the range was not knowable with full
+    // certainty on those historical bars. The real-time confirmation still occurs now.
+    int startOffset = 0
+    bool keepScanning = true
+
+    for i = 0 to rangeLength - 1
+        if keepScanning
+            bool seedLike = not na(rangeScore[i]) and rangeScore[i] >= seedScore
+            if seedLike
+                startOffset := i
+            else
+                keepScanning := false
+
+    // Reconstruct the full observed high/low span of that developing episode.
+    float episodeHigh = high
+    float episodeLow = low
+
+    for i = 0 to rangeLength - 1
+        if i <= startOffset
+            episodeHigh := math.max(episodeHigh, high[i])
+            episodeLow := math.min(episodeLow, low[i])
+
+    inRange := true
+    armedForEntry := false
+    rangeStartBar := math.max(0, bar_index - startOffset)
+
+    // The box must ENCLOSE the price that actually formed the developing range.
+    // Statistical candidate levels still matter, but observed episode extremes win.
+    rangeTop := math.max(candidateTop, episodeHigh + atr * 0.05)
+    rangeBottom := math.min(candidateBottom, episodeLow - atr * 0.05)
+
+    rangeStopTop := math.max(candidateStopTop, rangeTop + atr * 0.40)
+    rangeStopBottom := math.min(candidateStopBottom, rangeBottom - atr * 0.40)
+
+    candidateStreak := 0
+    weakStreak := 0
+    upBreakStreak := 0
+    downBreakStreak := 0
+
+    rangeStarted := true
+
+// ============================================================================
+// Range management
+// ============================================================================
+//
+// Key idea:
+//
+// Price outside the current box is NOT automatically a breakout.
+//
+// If the statistical regime still looks range-like, the excursion is treated as
+// RANGE EXPANSION and is absorbed into the same box.
+//
+// A confirmed breakout requires:
+//   1) price beyond the range, AND
+//   2) range-score deterioration, AND
+//   3) directional evidence in the breakout direction.
+//
+// This prevents a single evolving consolidation from being chopped into small boxes.
+// ============================================================================
+
+bool rangeEndedUp = false
+bool rangeEndedDown = false
+bool rangeEndedRegime = false
+
+if inRange and not rangeStarted
+
+    float breakoutBuffer = atr * 0.10
+
+    bool priceOutsideUp = close > rangeTop + breakoutBuffer
+    bool priceOutsideDown = close < rangeBottom - breakoutBuffer
+
+    bool directionalUp = directionScore >= 35.0
+    bool directionalDown = directionScore <= -35.0
+
+    bool regimeWeakForBreak = rangeScore <= breakoutRegimeScore
+
+    bool validUpBreakEvidence = priceOutsideUp and regimeWeakForBreak and directionalUp
+    bool validDownBreakEvidence = priceOutsideDown and regimeWeakForBreak and directionalDown
+
+    upBreakStreak := validUpBreakEvidence ? upBreakStreak + 1 : 0
+    downBreakStreak := validDownBreakEvidence ? downBreakStreak + 1 : 0
+
+    // ------------------------------------------------------------------------
+    // RANGE EXPANSION / ASSIMILATION
+    //
+    // If price pushes past the edge but the regime is still range-like, update
+    // the SAME box. This is the main fix for prematurely tiny ranges.
+    // ------------------------------------------------------------------------
+    bool regimeStillRangeLike = rangeScore >= holdScore
+
+    if regimeStillRangeLike and upBreakStreak == 0 and downBreakStreak == 0
+        if high > rangeTop
+            rangeTop := high + atr * 0.05
+            rangeStopTop := math.max(rangeStopTop, rangeTop + atr * 0.40)
+
+        if low < rangeBottom
+            rangeBottom := low - atr * 0.05
+            rangeStopBottom := math.min(rangeStopBottom, rangeBottom - atr * 0.40)
+
+        // Let the slower robust envelope mature too, but never shrink the range.
+        rangeTop := math.max(rangeTop, candidateTop)
+        rangeBottom := math.min(rangeBottom, candidateBottom)
+
+    // Persistent weak regime can eventually terminate a range even without a
+    // textbook box breakout.
+    weakStreak := rangeScore < holdScore ? weakStreak + 1 : 0
+
+    // Strong displacement beyond the outer invalidation reference is allowed to
+    // terminate more quickly, but still requires directional regime evidence.
+    bool hardUpBreak =
+         close > rangeStopTop and
+         directionScore >= 50.0 and
+         rangeScore < entryScore
+
+    bool hardDownBreak =
+         close < rangeStopBottom and
+         directionScore <= -50.0 and
+         rangeScore < entryScore
+
+    if hardUpBreak or upBreakStreak >= breakoutConfirmBars
+        rangeEndedUp := true
+        inRange := false
+
+    else if hardDownBreak or downBreakStreak >= breakoutConfirmBars
+        rangeEndedDown := true
+        inRange := false
+
+    else
+        bool directionalLoss =
+             weakStreak >= weakExitBars and
+             math.abs(directionScore) >= 60.0
+
+        if directionalLoss
+            rangeEndedRegime := true
+            inRange := false
+
+bool rangeEnded = rangeEndedUp or rangeEndedDown or rangeEndedRegime
+
+if rangeEnded
+    candidateStreak := 0
+    weakStreak := 0
+    upBreakStreak := 0
+    downBreakStreak := 0
+    // armedForEntry remains false until rangeScore cools below seedScore.
+
+// ============================================================================
+// Boxes
+// ============================================================================
+if rangeStarted and showRangeBoxes
+    activeRangeBox := box.new(
+         left = rangeStartBar,
+         top = rangeTop,
+         right = bar_index,
+         bottom = rangeBottom,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(rangeColor, boxTransparency),
+         border_color = rangeColor,
+         border_style = line.style_dotted,
+         border_width = 1,
+         text = "RANGE",
+         text_color = rangeColor,
+         text_size = size.tiny,
+         text_halign = text.align_left,
+         text_valign = text.align_top)
+
+// If boxes are enabled while a range is already active.
+if inRange and showRangeBoxes and na(activeRangeBox)
+    activeRangeBox := box.new(
+         left = rangeStartBar,
+         top = rangeTop,
+         right = bar_index,
+         bottom = rangeBottom,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(rangeColor, boxTransparency),
+         border_color = rangeColor,
+         border_style = line.style_dotted,
+         border_width = 1,
+         text = "RANGE",
+         text_color = rangeColor,
+         text_size = size.tiny,
+         text_halign = text.align_left,
+         text_valign = text.align_top)
+
+if inRange and showRangeBoxes and not na(activeRangeBox)
+    box.set_right(activeRangeBox, bar_index)
+    box.set_top(activeRangeBox, rangeTop)
+    box.set_bottom(activeRangeBox, rangeBottom)
+
+if rangeEnded and not na(activeRangeBox)
+    box.set_right(activeRangeBox, bar_index)
+    activeRangeBox := na
+
+if not showRangeBoxes and not na(activeRangeBox)
+    box.delete(activeRangeBox)
+    activeRangeBox := na
+
+// ============================================================================
+// Optional outer invalidation references
+// ============================================================================
+if rangeStarted and showInvalidationLevels
+    activeStopTopLine := line.new(
+         rangeStartBar, rangeStopTop, bar_index, rangeStopTop,
+         xloc = xloc.bar_index, extend = extend.none,
+         color = color.new(rangeColor, 25), style = line.style_dashed, width = 1)
+
+    activeStopBottomLine := line.new(
+         rangeStartBar, rangeStopBottom, bar_index, rangeStopBottom,
+         xloc = xloc.bar_index, extend = extend.none,
+         color = color.new(rangeColor, 25), style = line.style_dashed, width = 1)
+
+if inRange and showInvalidationLevels
+    if na(activeStopTopLine)
+        activeStopTopLine := line.new(
+             rangeStartBar, rangeStopTop, bar_index, rangeStopTop,
+             xloc = xloc.bar_index, extend = extend.none,
+             color = color.new(rangeColor, 25), style = line.style_dashed, width = 1)
+
+    if na(activeStopBottomLine)
+        activeStopBottomLine := line.new(
+             rangeStartBar, rangeStopBottom, bar_index, rangeStopBottom,
+             xloc = xloc.bar_index, extend = extend.none,
+             color = color.new(rangeColor, 25), style = line.style_dashed, width = 1)
+
+    line.set_x2(activeStopTopLine, bar_index)
+    line.set_y1(activeStopTopLine, rangeStopTop)
+    line.set_y2(activeStopTopLine, rangeStopTop)
+
+    line.set_x2(activeStopBottomLine, bar_index)
+    line.set_y1(activeStopBottomLine, rangeStopBottom)
+    line.set_y2(activeStopBottomLine, rangeStopBottom)
+
+if rangeEnded
+    if not na(activeStopTopLine)
+        line.set_x2(activeStopTopLine, bar_index)
+        activeStopTopLine := na
+
+    if not na(activeStopBottomLine)
+        line.set_x2(activeStopBottomLine, bar_index)
+        activeStopBottomLine := na
+
+if not showInvalidationLevels
+    if not na(activeStopTopLine)
+        line.delete(activeStopTopLine)
+        activeStopTopLine := na
+
+    if not na(activeStopBottomLine)
+        line.delete(activeStopBottomLine)
+        activeStopBottomLine := na
+
+// ============================================================================
+// Strategy / parameterization outputs
+// ============================================================================
+plot(rangeScore, "Range Regime Score (0-100)", display = display.data_window)
+plot(varianceRatioScore * 100.0, "Anti-Diffusion Score (0-100)", display = display.data_window)
+plot(ouScore * 100.0, "Mean-Reversion Score (0-100)", display = display.data_window)
+plot(geometryScore * 100.0, "Horizontal Geometry Score (0-100)", display = display.data_window)
+plot(directionScore, "Direction Score (-100 to 100)", display = display.data_window)
+
+plot(vrFast, "Variance Ratio Fast", display = display.data_window)
+plot(vrSlow, "Variance Ratio Slow", display = display.data_window)
+plot(ouBeta, "OU Pullback Beta", display = display.data_window)
+plot(ouHalfLife, "OU Approx Half-Life (bars)", display = display.data_window)
+plot(tortuosity, "Path Tortuosity", display = display.data_window)
+plot(widthAtr, "Robust Width (ATR)", display = display.data_window)
+
+plot(inRange ? 1.0 : 0.0, "Confirmed Range State", display = display.data_window)
+plot(inRange ? rangeTop : na, "Active Range Breakout High", display = display.data_window)
+plot(inRange ? rangeBottom : na, "Active Range Breakout Low", display = display.data_window)
+plot(inRange ? rangeStopTop : na, "Upper Invalidation Reference", display = display.data_window)
+plot(inRange ? rangeStopBottom : na, "Lower Invalidation Reference", display = display.data_window)
+
+// ============================================================================
+// Alerts
+// ============================================================================
+alertcondition(rangeStarted, "Range Started", "A reconstructed range episode was confirmed")
+alertcondition(rangeEndedUp, "Range Breakout Up", "Price and directional evidence confirmed a breakout above the range")
+alertcondition(rangeEndedDown, "Range Breakout Down", "Price and directional evidence confirmed a breakout below the range")
+alertcondition(ta.crossover(rangeScore, 65.0), "Range Score Strengthening", "Range Regime Score crossed above 65")
+alertcondition(ta.crossunder(rangeScore, 45.0), "Range Score Weakening", "Range Regime Score crossed below 45")
