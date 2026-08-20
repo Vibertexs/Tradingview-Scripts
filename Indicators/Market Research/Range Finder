@@ -1,89 +1,403 @@
 //@version=6
-// Range Finder [Range-First v1]
-// Built from the user's prior swing/range experiments.
+// Range Finder [Range-First v1 + Kalman Trend Filter]
+//
+// Keeps the original Range-First v1 range detector and box logic.
+// The Kalman filter is used ONLY to improve trend/range discrimination.
+// It does NOT set or chase the box boundaries.
+//
+// Kalman idea:
+//   - Estimate a latent price level + velocity with a 2-state constant-velocity filter.
+//   - Blend Kalman velocity with the original linear-regression slope.
+//   - Blend Kalman drift with the original close-to-close drift.
+//   - A range therefore needs to be horizontally quiet in both the raw/rolling
+//     measurements and the filtered state estimate.
+//
 // Source material supplied by the user is CC BY-NC-SA 4.0; this derivative is
 // provided under the same license.
 // https://creativecommons.org/licenses/by-nc-sa/4.0/
 
-indicator("Range Finder [Range-First v1]", overlay = true, max_boxes_count = 300, max_labels_count = 300)
+indicator(
+     "Range Finder [Range-First v1 + Kalman]",
+     overlay = true,
+     max_boxes_count = 300,
+     max_labels_count = 300)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Inputs
 // ─────────────────────────────────────────────────────────────────────────────
-var string G_CORE  = "Range Detection"
-var string G_STYLE = "Style"
+var string G_CORE   = "Range Detection"
+var string G_KALMAN = "Kalman Filter"
+var string G_STYLE  = "Style"
 
-rangeLength = input.int(30, "Range Length", minval = 10, maxval = 150, group = G_CORE,
+rangeLength = input.int(
+     30,
+     "Range Length",
+     minval = 10,
+     maxval = 150,
+     group = G_CORE,
      tooltip = "Lookback used to judge whether price is rotating inside a horizontal area. 20-40 is a good starting zone.")
 
-rangeSensitivity = input.int(7, "Range Sensitivity", minval = 1, maxval = 10, group = G_CORE,
+rangeSensitivity = input.int(
+     7,
+     "Range Sensitivity",
+     minval = 1,
+     maxval = 10,
+     group = G_CORE,
      tooltip = "Higher = detect ranges earlier/more often. Lower = only accept cleaner, tighter ranges.")
 
-showRangeBoxes = input.bool(true, "Show Range Boxes", group = G_STYLE)
-boxTransparency = input.int(86, "Box Transparency", minval = 0, maxval = 100, group = G_STYLE)
-rangeColor = input.color(#808080, "Range Color", group = G_STYLE)
+useKalman = input.bool(
+     true,
+     "Use Kalman Trend Filter",
+     group = G_KALMAN,
+     tooltip = "Blends a Kalman-estimated trend/velocity with the original slope and drift tests. The box boundaries themselves remain unchanged.")
+
+kalmanWeight = input.float(
+     0.40,
+     "Kalman Influence",
+     minval = 0.0,
+     maxval = 1.0,
+     step = 0.05,
+     group = G_KALMAN,
+     tooltip = "0 = original detector only. 1 = trend tests rely fully on the Kalman estimate. 0.30-0.50 is a good starting zone.")
+
+showKalmanLine = input.bool(
+     false,
+     "Show Kalman Center",
+     group = G_KALMAN)
+
+showRangeBoxes = input.bool(
+     true,
+     "Show Range Boxes",
+     group = G_STYLE)
+
+boxTransparency = input.int(
+     86,
+     "Box Transparency",
+     minval = 0,
+     maxval = 100,
+     group = G_STYLE)
+
+rangeColor = input.color(
+     #808080,
+     "Range Color",
+     group = G_STYLE)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Adaptive thresholds
 // ─────────────────────────────────────────────────────────────────────────────
-// One sensitivity control drives all range tests so the menu stays simple.
-// Higher sensitivity is deliberately more permissive.
-float s = rangeSensitivity
-float maxEfficiency = 0.14 + s * 0.032          // 0.17 .. 0.46
-float maxAtrRatio   = 0.70 + s * 0.035          // 0.74 .. 1.05
-float maxWidthAtr   = 3.50 + s * 0.55           // 4.05 .. 9.00 ATR
-float minOverlap    = 0.68 - s * 0.038          // 0.64 .. 0.30
-float maxSlopeAtr   = 0.018 + s * 0.011         // 0.03 .. 0.13 ATR/bar
-float maxDrift      = 0.30 + s * 0.035          // 0.34 .. 0.65 of box width
-int confirmBars     = rangeSensitivity >= 9 ? 2 : rangeSensitivity >= 6 ? 3 : rangeSensitivity >= 3 ? 4 : 5
-float breakBufferAtr = rangeSensitivity >= 9 ? 0.10 : rangeSensitivity >= 6 ? 0.15 : 0.20
-int breakConfirmBars = rangeSensitivity >= 8 ? 1 : 2
+float s = float(rangeSensitivity)
+
+float maxEfficiency = 0.14 + s * 0.032
+float maxAtrRatio   = 0.70 + s * 0.035
+float maxWidthAtr   = 3.50 + s * 0.55
+float minOverlap    = 0.68 - s * 0.038
+float maxSlopeAtr   = 0.018 + s * 0.011
+float maxDrift      = 0.30 + s * 0.035
+
+int confirmBars =
+     rangeSensitivity >= 9 ? 2 :
+     rangeSensitivity >= 6 ? 3 :
+     rangeSensitivity >= 3 ? 4 : 5
+
+float breakBufferAtr =
+     rangeSensitivity >= 9 ? 0.10 :
+     rangeSensitivity >= 6 ? 0.15 : 0.20
+
+int breakConfirmBars =
+     rangeSensitivity >= 8 ? 1 : 2
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Core range measurements
 // ─────────────────────────────────────────────────────────────────────────────
 float atr = ta.atr(14)
+float atrSafe = math.max(atr, syminfo.mintick)
+
 float atrBaseline = ta.sma(atr, 50)
-float atrRatio = atr / math.max(nz(atrBaseline, atr), syminfo.mintick)
+float atrRatio =
+     atr / math.max(
+         nz(atrBaseline, atr),
+         syminfo.mintick)
 
-float rollingTop = ta.highest(high, rangeLength)
-float rollingBottom = ta.lowest(low, rangeLength)
-float rollingWidth = math.max(rollingTop - rollingBottom, syminfo.mintick)
-float widthAtr = rollingWidth / math.max(atr, syminfo.mintick)
+float rollingTop =
+     ta.highest(
+         high,
+         rangeLength)
 
-// Kaufman-style efficiency ratio: low values mean lots of back-and-forth movement
-// relative to net displacement, which is exactly what we want for a range.
-float path = ta.sma(math.abs(close - close[1]), rangeLength) * rangeLength
-float efficiency = math.abs(close - close[rangeLength]) / math.max(path, syminfo.mintick)
+float rollingBottom =
+     ta.lowest(
+         low,
+         rangeLength)
 
-// Normalized linear-regression slope. A real range should have limited directional slope.
-float lrNow = ta.linreg(close, rangeLength, 0)
-float lrPrev = ta.linreg(close, rangeLength, 1)
-float slopeAtr = math.abs(lrNow - lrPrev) / math.max(atr, syminfo.mintick)
+float rollingWidth =
+     math.max(
+         rollingTop - rollingBottom,
+         syminfo.mintick)
 
-// Candle-to-candle overlap. Ranges usually have repeated overlap; clean trends do not.
-float overlapAmount = math.max(0.0, math.min(high, high[1]) - math.max(low, low[1]))
-float overlapBase = math.max(math.min(high - low, high[1] - low[1]), syminfo.mintick)
-float barOverlap = math.min(1.0, overlapAmount / overlapBase)
-float avgOverlap = ta.sma(barOverlap, rangeLength)
+float widthAtr =
+     rollingWidth / atrSafe
 
-// Net drift across the lookback relative to the full horizontal envelope.
-float driftRatio = math.abs(close - close[rangeLength]) / rollingWidth
+// Kaufman-style efficiency ratio.
+float path =
+     ta.sma(
+         math.abs(
+             close - close[1]),
+         rangeLength) *
+     rangeLength
 
-// Optional shape check: current price should still be materially inside the envelope,
-// not simply sitting at an extreme after a one-way move.
-float positionInRange = (close - rollingBottom) / rollingWidth
-bool notPinnedToEdge = positionInRange > 0.08 and positionInRange < 0.92
+float efficiency =
+     math.abs(
+         close - close[rangeLength]) /
+     math.max(
+         path,
+         syminfo.mintick)
+
+// Original linear-regression slope.
+float lrNow =
+     ta.linreg(
+         close,
+         rangeLength,
+         0)
+
+float lrPrev =
+     ta.linreg(
+         close,
+         rangeLength,
+         1)
+
+float lrSlopeAtr =
+     math.abs(
+         lrNow - lrPrev) /
+     atrSafe
+
+// Candle-to-candle overlap.
+float overlapAmount =
+     math.max(
+         0.0,
+         math.min(
+             high,
+             high[1]) -
+         math.max(
+             low,
+             low[1]))
+
+float overlapBase =
+     math.max(
+         math.min(
+             high - low,
+             high[1] - low[1]),
+         syminfo.mintick)
+
+float barOverlap =
+     math.min(
+         1.0,
+         overlapAmount /
+         overlapBase)
+
+float avgOverlap =
+     ta.sma(
+         barOverlap,
+         rangeLength)
+
+// Original net drift.
+float driftRatio =
+     math.abs(
+         close - close[rangeLength]) /
+     rollingWidth
+
+// Current price location inside rolling envelope.
+float positionInRange =
+     (close - rollingBottom) /
+     rollingWidth
+
+bool notPinnedToEdge =
+     positionInRange > 0.08 and
+     positionInRange < 0.92
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2-state Kalman filter: level + velocity
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// State:
+//   x0 = estimated price level
+//   x1 = estimated price velocity per bar
+//
+// Constant-velocity prediction:
+//   level(t) = level(t-1) + velocity(t-1)
+//   velocity(t) = velocity(t-1)
+//
+// Noise scales with ATR so the filter works across different price scales.
+// Higher rangeSensitivity makes the state slightly more reactive.
+// ─────────────────────────────────────────────────────────────────────────────
+
+float kalmanProcessLevelAtr =
+     0.020 + s * 0.002
+
+float kalmanProcessVelocityAtr =
+     0.004 + s * 0.0007
+
+float kalmanMeasurementAtr =
+     0.80
+
+float qLevel =
+     math.pow(
+         atrSafe *
+         kalmanProcessLevelAtr,
+         2)
+
+float qVelocity =
+     math.pow(
+         atrSafe *
+         kalmanProcessVelocityAtr,
+         2)
+
+float rMeasure =
+     math.pow(
+         atrSafe *
+         kalmanMeasurementAtr,
+         2)
+
+var float kLevel = na
+var float kVelocity = 0.0
+
+var float p00 = 1.0
+var float p01 = 0.0
+var float p10 = 0.0
+var float p11 = 1.0
+
+if na(kLevel)
+    kLevel := close
+    kVelocity := 0.0
+
+    p00 := rMeasure
+    p01 := 0.0
+    p10 := 0.0
+    p11 := rMeasure
+else
+    // Predict state.
+    float predLevel =
+         kLevel + kVelocity
+
+    float predVelocity =
+         kVelocity
+
+    // Predict covariance:
+    // P' = F P F' + Q
+    // with F = [[1,1],[0,1]]
+    float pp00 =
+         p00 + p01 + p10 + p11 + qLevel
+
+    float pp01 =
+         p01 + p11
+
+    float pp10 =
+         p10 + p11
+
+    float pp11 =
+         p11 + qVelocity
+
+    // Measurement update with H = [1,0].
+    float innovation =
+         close - predLevel
+
+    float innovationVariance =
+         math.max(
+             pp00 + rMeasure,
+             syminfo.mintick * syminfo.mintick)
+
+    float gainLevel =
+         pp00 /
+         innovationVariance
+
+    float gainVelocity =
+         pp10 /
+         innovationVariance
+
+    kLevel :=
+         predLevel +
+         gainLevel *
+         innovation
+
+    kVelocity :=
+         predVelocity +
+         gainVelocity *
+         innovation
+
+    // Joseph-form-like reduced update for H = [1,0].
+    p00 :=
+         (1.0 - gainLevel) *
+         pp00
+
+    p01 :=
+         (1.0 - gainLevel) *
+         pp01
+
+    p10 :=
+         pp10 -
+         gainVelocity *
+         pp00
+
+    p11 :=
+         pp11 -
+         gainVelocity *
+         pp01
+
+// Kalman trend measurements.
+float kalmanSlopeAtr =
+     math.abs(
+         kVelocity) /
+     atrSafe
+
+float kalmanDriftRatio =
+     not na(kLevel[rangeLength]) ?
+     math.abs(
+         kLevel - kLevel[rangeLength]) /
+     rollingWidth :
+     driftRatio
+
+// Blend original trend measurements with the Kalman state.
+// With useKalman=false this exactly reverts to the original v1 measurements.
+float slopeAtr =
+     useKalman ?
+     lrSlopeAtr *
+         (1.0 - kalmanWeight) +
+     kalmanSlopeAtr *
+         kalmanWeight :
+     lrSlopeAtr
+
+float blendedDrift =
+     useKalman ?
+     driftRatio *
+         (1.0 - kalmanWeight) +
+     kalmanDriftRatio *
+         kalmanWeight :
+     driftRatio
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Range score
 // ─────────────────────────────────────────────────────────────────────────────
-bool efficiencyPass = efficiency <= maxEfficiency
-bool compressionPass = atrRatio <= maxAtrRatio
-bool widthPass = widthAtr <= maxWidthAtr
-bool overlapPass = avgOverlap >= minOverlap
-bool slopePass = slopeAtr <= maxSlopeAtr
-bool driftPass = driftRatio <= maxDrift
+bool efficiencyPass =
+     efficiency <=
+     maxEfficiency
+
+bool compressionPass =
+     atrRatio <=
+     maxAtrRatio
+
+bool widthPass =
+     widthAtr <=
+     maxWidthAtr
+
+bool overlapPass =
+     avgOverlap >=
+     minOverlap
+
+bool slopePass =
+     slopeAtr <=
+     maxSlopeAtr
+
+bool driftPass =
+     blendedDrift <=
+     maxDrift
 
 int rangeScore =
      (efficiencyPass ? 1 : 0) +
@@ -93,64 +407,122 @@ int rangeScore =
      (slopePass ? 1 : 0) +
      (driftPass ? 1 : 0)
 
-// We require broad agreement instead of trusting a single indicator.
-// Sensitivity 8-10 can enter with 4/6; lower settings require 5/6.
-int requiredScore = rangeSensitivity >= 8 ? 4 : 5
-bool rangeCandidate = rangeScore >= requiredScore and notPinnedToEdge and not na(close[rangeLength])
+int requiredScore =
+     rangeSensitivity >= 8 ?
+     4 :
+     5
 
-// Consecutive confirmation prevents a single quiet candle from creating a box.
+bool rangeCandidate =
+     rangeScore >= requiredScore and
+     notPinnedToEdge and
+     not na(close[rangeLength])
+
+// Consecutive confirmation.
 var int candidateStreak = 0
-candidateStreak := rangeCandidate ? candidateStreak + 1 : 0
-bool confirmedRangeCandidate = candidateStreak >= confirmBars
+
+candidateStreak :=
+     rangeCandidate ?
+     candidateStreak + 1 :
+     0
+
+bool confirmedRangeCandidate =
+     candidateStreak >=
+     confirmBars
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Persistent range state
 // ─────────────────────────────────────────────────────────────────────────────
 var bool inRange = false
+
 var float rangeTop = na
 var float rangeBottom = na
+
 var int rangeStartBar = na
+
 var int upBreakStreak = 0
 var int downBreakStreak = 0
+
 var box activeRangeBox = na
 
-// Enter using the envelope that existed when the range was confirmed.
-// Back-date the visual start by the confirmation streak so the box covers the setup.
+// Enter using the original rolling envelope.
+// The Kalman filter DOES NOT define box size.
 bool rangeStarted = false
-if not inRange and confirmedRangeCandidate
+
+if not inRange and
+   confirmedRangeCandidate
+
     inRange := true
-    rangeTop := rollingTop
-    rangeBottom := rollingBottom
-    rangeStartBar := math.max(0, bar_index - confirmBars + 1)
+
+    rangeTop :=
+         rollingTop
+
+    rangeBottom :=
+         rollingBottom
+
+    rangeStartBar :=
+         math.max(
+             0,
+             bar_index -
+             confirmBars + 1)
+
     upBreakStreak := 0
     downBreakStreak := 0
+
     rangeStarted := true
 
-// While inside a range, allow small wick expansion without instantly ending the range.
-// This makes the range finder tolerant of liquidity sweeps.
+// Original small-wick expansion logic.
 if inRange
-    float softExpand = atr * 0.20
-    if high > rangeTop and high <= rangeTop + softExpand
+
+    float softExpand =
+         atr * 0.20
+
+    if high > rangeTop and
+       high <= rangeTop + softExpand
+
         rangeTop := high
-    if low < rangeBottom and low >= rangeBottom - softExpand
+
+    if low < rangeBottom and
+       low >= rangeBottom - softExpand
+
         rangeBottom := low
 
-    float breakBuffer = atr * breakBufferAtr
-    bool upBreak = close > rangeTop + breakBuffer
-    bool downBreak = close < rangeBottom - breakBuffer
+    float breakBuffer =
+         atr *
+         breakBufferAtr
 
-    upBreakStreak := upBreak ? upBreakStreak + 1 : 0
-    downBreakStreak := downBreak ? downBreakStreak + 1 : 0
+    bool upBreak =
+         close >
+         rangeTop +
+         breakBuffer
+
+    bool downBreak =
+         close <
+         rangeBottom -
+         breakBuffer
+
+    upBreakStreak :=
+         upBreak ?
+         upBreakStreak + 1 :
+         0
+
+    downBreakStreak :=
+         downBreak ?
+         downBreakStreak + 1 :
+         0
 
 bool rangeEndedUp = false
 bool rangeEndedDown = false
 
-if inRange and upBreakStreak >= breakConfirmBars
+if inRange and
+   upBreakStreak >= breakConfirmBars
+
     rangeEndedUp := true
     inRange := false
     candidateStreak := 0
 
-if inRange and downBreakStreak >= breakConfirmBars
+if inRange and
+   downBreakStreak >= breakConfirmBars
+
     rangeEndedDown := true
     inRange := false
     candidateStreak := 0
@@ -158,16 +530,23 @@ if inRange and downBreakStreak >= breakConfirmBars
 // ─────────────────────────────────────────────────────────────────────────────
 // Boxes
 // ─────────────────────────────────────────────────────────────────────────────
-if rangeStarted and showRangeBoxes
+if rangeStarted and
+   showRangeBoxes
+
     if not na(activeRangeBox)
-        box.set_right(activeRangeBox, bar_index)
+        box.set_right(
+             activeRangeBox,
+             bar_index)
+
     activeRangeBox := box.new(
          left = rangeStartBar,
          top = rangeTop,
          right = bar_index,
          bottom = rangeBottom,
          xloc = xloc.bar_index,
-         bgcolor = color.new(rangeColor, boxTransparency),
+         bgcolor = color.new(
+             rangeColor,
+             boxTransparency),
          border_color = rangeColor,
          border_style = line.style_dotted,
          border_width = 1,
@@ -177,22 +556,103 @@ if rangeStarted and showRangeBoxes
          text_halign = text.align_left,
          text_valign = text.align_top)
 
-if inRange and showRangeBoxes and not na(activeRangeBox)
-    box.set_right(activeRangeBox, bar_index)
-    box.set_top(activeRangeBox, rangeTop)
-    box.set_bottom(activeRangeBox, rangeBottom)
+if inRange and
+   showRangeBoxes and
+   not na(activeRangeBox)
 
-if (rangeEndedUp or rangeEndedDown) and not na(activeRangeBox)
-    box.set_right(activeRangeBox, bar_index)
+    box.set_right(
+         activeRangeBox,
+         bar_index)
+
+    box.set_top(
+         activeRangeBox,
+         rangeTop)
+
+    box.set_bottom(
+         activeRangeBox,
+         rangeBottom)
+
+if (rangeEndedUp or rangeEndedDown) and
+   not na(activeRangeBox)
+
+    box.set_right(
+         activeRangeBox,
+         bar_index)
+
     activeRangeBox := na
 
-if not showRangeBoxes and not na(activeRangeBox)
-    box.delete(activeRangeBox)
+if not showRangeBoxes and
+   not na(activeRangeBox)
+
+    box.delete(
+         activeRangeBox)
+
     activeRangeBox := na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Optional Kalman visual + Data Window diagnostics
+// ─────────────────────────────────────────────────────────────────────────────
+plot(
+     showKalmanLine ?
+     kLevel :
+     na,
+     "Kalman Center",
+     linewidth = 1)
+
+plot(
+     lrSlopeAtr,
+     "Original LR Slope / ATR",
+     display = display.data_window)
+
+plot(
+     kalmanSlopeAtr,
+     "Kalman Velocity / ATR",
+     display = display.data_window)
+
+plot(
+     slopeAtr,
+     "Combined Trend Slope / ATR",
+     display = display.data_window)
+
+plot(
+     driftRatio,
+     "Original Drift Ratio",
+     display = display.data_window)
+
+plot(
+     kalmanDriftRatio,
+     "Kalman Drift Ratio",
+     display = display.data_window)
+
+plot(
+     blendedDrift,
+     "Combined Drift Ratio",
+     display = display.data_window)
+
+plot(
+     float(rangeScore),
+     "Range Score (0-6)",
+     display = display.data_window)
+
+plot(
+     inRange ? 1.0 : 0.0,
+     "Confirmed Range State",
+     display = display.data_window)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Alerts
 // ─────────────────────────────────────────────────────────────────────────────
-alertcondition(rangeStarted, "Range Started", "A new price range was detected")
-alertcondition(rangeEndedUp, "Range Breakout Up", "Price closed above the active range")
-alertcondition(rangeEndedDown, "Range Breakout Down", "Price closed below the active range")
+alertcondition(
+     rangeStarted,
+     "Range Started",
+     "A new price range was detected")
+
+alertcondition(
+     rangeEndedUp,
+     "Range Breakout Up",
+     "Price closed above the active range")
+
+alertcondition(
+     rangeEndedDown,
+     "Range Breakout Down",
+     "Price closed below the active range")
