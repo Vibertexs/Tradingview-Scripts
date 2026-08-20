@@ -1,0 +1,264 @@
+//@version=6
+// Range Finder with Kalman trend filtering
+// Range boundaries lock when confirmed and remain fixed until price breaks out.
+// CC BY-NC-SA 4.0
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+indicator("Range Finder [Kalman]", overlay = true, max_boxes_count = 300, max_labels_count = 300)
+
+var string G_CORE = "Range Detection"
+var string G_KALMAN = "Kalman Filter"
+var string G_BREAKOUT = "Breakout"
+var string G_STYLE = "Style"
+
+rangeLength = input.int(30, "Range Length", minval = 10, maxval = 150, group = G_CORE)
+rangeSensitivity = input.int(7, "Range Sensitivity", minval = 1, maxval = 10, group = G_CORE,
+     tooltip = "Higher finds ranges sooner. Lower requires cleaner ranges.")
+
+useKalman = input.bool(true, "Use Kalman Filter", group = G_KALMAN)
+kalmanWeight = input.float(0.40, "Kalman Influence", minval = 0.0, maxval = 1.0, step = 0.05, group = G_KALMAN)
+showKalmanLine = input.bool(false, "Show Kalman Center", group = G_KALMAN)
+
+breakoutCooldownBars = input.int(5, "Bars Before New Range", minval = 0, maxval = 50, group = G_BREAKOUT)
+showBreakoutLabels = input.bool(true, "Show Breakout Labels", group = G_BREAKOUT)
+
+showRangeBoxes = input.bool(true, "Show Range Boxes", group = G_STYLE)
+boxTransparency = input.int(90, "Range Fill Transparency", minval = 0, maxval = 100, group = G_STYLE)
+rangeColor = input.color(#787B86, "Range", group = G_STYLE)
+bullColor = input.color(#26A69A, "Bullish Breakout", group = G_STYLE)
+bearColor = input.color(#EF5350, "Bearish Breakout", group = G_STYLE)
+
+// Detection thresholds
+float s = float(rangeSensitivity)
+float maxEfficiency = 0.14 + s * 0.032
+float maxAtrRatio = 0.70 + s * 0.035
+float maxWidthAtr = 3.50 + s * 0.55
+float minOverlap = 0.68 - s * 0.038
+float maxSlopeAtr = 0.018 + s * 0.011
+float maxDrift = 0.30 + s * 0.035
+
+int confirmBars = rangeSensitivity >= 9 ? 2 : rangeSensitivity >= 6 ? 3 : rangeSensitivity >= 3 ? 4 : 5
+float breakBufferAtr = rangeSensitivity >= 9 ? 0.10 : rangeSensitivity >= 6 ? 0.15 : 0.20
+int breakConfirmBars = rangeSensitivity >= 8 ? 1 : 2
+
+// Range measurements
+float atr = ta.atr(14)
+float atrSafe = math.max(atr, syminfo.mintick)
+float atrBaseline = ta.sma(atr, 50)
+float atrRatio = atr / math.max(nz(atrBaseline, atr), syminfo.mintick)
+
+float rollingTop = ta.highest(high, rangeLength)
+float rollingBottom = ta.lowest(low, rangeLength)
+float rollingWidth = math.max(rollingTop - rollingBottom, syminfo.mintick)
+float widthAtr = rollingWidth / atrSafe
+
+float path = ta.sma(math.abs(close - close[1]), rangeLength) * rangeLength
+float efficiency = math.abs(close - close[rangeLength]) / math.max(path, syminfo.mintick)
+
+float lrNow = ta.linreg(close, rangeLength, 0)
+float lrPrev = ta.linreg(close, rangeLength, 1)
+float lrSlopeAtr = math.abs(lrNow - lrPrev) / atrSafe
+
+float overlapAmount = math.max(0.0, math.min(high, high[1]) - math.max(low, low[1]))
+float overlapBase = math.max(math.min(high - low, high[1] - low[1]), syminfo.mintick)
+float barOverlap = math.min(1.0, overlapAmount / overlapBase)
+float avgOverlap = ta.sma(barOverlap, rangeLength)
+
+float driftRatio = math.abs(close - close[rangeLength]) / rollingWidth
+float positionInRange = (close - rollingBottom) / rollingWidth
+bool notPinnedToEdge = positionInRange > 0.08 and positionInRange < 0.92
+
+// Kalman level + velocity filter
+float kalmanProcessLevelAtr = 0.020 + s * 0.002
+float kalmanProcessVelocityAtr = 0.004 + s * 0.0007
+float kalmanMeasurementAtr = 0.80
+
+float qLevel = math.pow(atrSafe * kalmanProcessLevelAtr, 2)
+float qVelocity = math.pow(atrSafe * kalmanProcessVelocityAtr, 2)
+float rMeasure = math.pow(atrSafe * kalmanMeasurementAtr, 2)
+
+var float kLevel = na
+var float kVelocity = 0.0
+var float p00 = 1.0
+var float p01 = 0.0
+var float p10 = 0.0
+var float p11 = 1.0
+
+if na(kLevel)
+    kLevel := close
+    kVelocity := 0.0
+    p00 := rMeasure
+    p01 := 0.0
+    p10 := 0.0
+    p11 := rMeasure
+else
+    float predLevel = kLevel + kVelocity
+    float predVelocity = kVelocity
+
+    float pp00 = p00 + p01 + p10 + p11 + qLevel
+    float pp01 = p01 + p11
+    float pp10 = p10 + p11
+    float pp11 = p11 + qVelocity
+
+    float innovation = close - predLevel
+    float innovationVariance = math.max(pp00 + rMeasure, syminfo.mintick * syminfo.mintick)
+    float gainLevel = pp00 / innovationVariance
+    float gainVelocity = pp10 / innovationVariance
+
+    kLevel := predLevel + gainLevel * innovation
+    kVelocity := predVelocity + gainVelocity * innovation
+
+    p00 := (1.0 - gainLevel) * pp00
+    p01 := (1.0 - gainLevel) * pp01
+    p10 := pp10 - gainVelocity * pp00
+    p11 := pp11 - gainVelocity * pp01
+
+float kalmanSlopeAtr = math.abs(kVelocity) / atrSafe
+float kalmanDriftRatio = not na(kLevel[rangeLength]) ?
+     math.abs(kLevel - kLevel[rangeLength]) / rollingWidth : driftRatio
+
+float slopeAtr = useKalman ?
+     lrSlopeAtr * (1.0 - kalmanWeight) + kalmanSlopeAtr * kalmanWeight : lrSlopeAtr
+
+float blendedDrift = useKalman ?
+     driftRatio * (1.0 - kalmanWeight) + kalmanDriftRatio * kalmanWeight : driftRatio
+
+// Range score
+bool efficiencyPass = efficiency <= maxEfficiency
+bool compressionPass = atrRatio <= maxAtrRatio
+bool widthPass = widthAtr <= maxWidthAtr
+bool overlapPass = avgOverlap >= minOverlap
+bool slopePass = slopeAtr <= maxSlopeAtr
+bool driftPass = blendedDrift <= maxDrift
+
+int rangeScore =
+     (efficiencyPass ? 1 : 0) +
+     (compressionPass ? 1 : 0) +
+     (widthPass ? 1 : 0) +
+     (overlapPass ? 1 : 0) +
+     (slopePass ? 1 : 0) +
+     (driftPass ? 1 : 0)
+
+int requiredScore = rangeSensitivity >= 8 ? 4 : 5
+bool rangeCandidate = rangeScore >= requiredScore and notPinnedToEdge and not na(close[rangeLength])
+
+var int candidateStreak = 0
+candidateStreak := rangeCandidate ? candidateStreak + 1 : 0
+bool confirmedRangeCandidate = candidateStreak >= confirmBars
+
+// Persistent range state
+var bool inRange = false
+var float rangeTop = na
+var float rangeBottom = na
+var int rangeStartBar = na
+var int upBreakStreak = 0
+var int downBreakStreak = 0
+var int lastBreakoutBar = na
+var box activeRangeBox = na
+
+bool rangeStarted = false
+bool rangeEndedUp = false
+bool rangeEndedDown = false
+
+bool cooldownReady = na(lastBreakoutBar) or bar_index - lastBreakoutBar > breakoutCooldownBars
+
+if not inRange and confirmedRangeCandidate and cooldownReady
+    inRange := true
+    rangeTop := rollingTop
+    rangeBottom := rollingBottom
+    rangeStartBar := math.max(0, bar_index - confirmBars + 1)
+    upBreakStreak := 0
+    downBreakStreak := 0
+    rangeStarted := true
+
+// Once active, the range ends only on a confirmed close outside the locked boundary.
+if inRange
+    float breakBuffer = atr * breakBufferAtr
+    bool upBreak = close > rangeTop + breakBuffer
+    bool downBreak = close < rangeBottom - breakBuffer
+
+    upBreakStreak := upBreak ? upBreakStreak + 1 : 0
+    downBreakStreak := downBreak ? downBreakStreak + 1 : 0
+
+    if upBreakStreak >= breakConfirmBars
+        rangeEndedUp := true
+        inRange := false
+        candidateStreak := 0
+        lastBreakoutBar := bar_index
+
+    if inRange and downBreakStreak >= breakConfirmBars
+        rangeEndedDown := true
+        inRange := false
+        candidateStreak := 0
+        lastBreakoutBar := bar_index
+
+// Range boxes
+if rangeStarted and showRangeBoxes
+    if not na(activeRangeBox)
+        box.set_right(activeRangeBox, bar_index)
+
+    activeRangeBox := box.new(
+         left = rangeStartBar,
+         top = rangeTop,
+         right = bar_index,
+         bottom = rangeBottom,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(rangeColor, boxTransparency),
+         border_color = color.new(rangeColor, 15),
+         border_style = line.style_solid,
+         border_width = 1)
+
+if inRange and showRangeBoxes and not na(activeRangeBox)
+    box.set_right(activeRangeBox, bar_index)
+
+if (rangeEndedUp or rangeEndedDown) and not na(activeRangeBox)
+    box.set_right(activeRangeBox, bar_index)
+    color breakColor = rangeEndedUp ? bullColor : bearColor
+    box.set_border_color(activeRangeBox, breakColor)
+    box.set_bgcolor(activeRangeBox, color.new(breakColor, 94))
+    activeRangeBox := na
+
+if showBreakoutLabels and rangeEndedUp
+    label.new(
+         bar_index,
+         rangeTop,
+         "Bull break",
+         xloc = xloc.bar_index,
+         yloc = yloc.price,
+         style = label.style_label_up,
+         color = color.new(bullColor, 10),
+         textcolor = color.white,
+         size = size.tiny)
+
+if showBreakoutLabels and rangeEndedDown
+    label.new(
+         bar_index,
+         rangeBottom,
+         "Bear break",
+         xloc = xloc.bar_index,
+         yloc = yloc.price,
+         style = label.style_label_down,
+         color = color.new(bearColor, 10),
+         textcolor = color.white,
+         size = size.tiny)
+
+// Box visibility does not affect range detection or breakout logic.
+if not showRangeBoxes and not na(activeRangeBox)
+    box.delete(activeRangeBox)
+    activeRangeBox := na
+
+// Optional diagnostics
+plot(showKalmanLine ? kLevel : na, "Kalman Center", linewidth = 1)
+plot(lrSlopeAtr, "LR Slope / ATR", display = display.data_window)
+plot(kalmanSlopeAtr, "Kalman Velocity / ATR", display = display.data_window)
+plot(slopeAtr, "Combined Slope / ATR", display = display.data_window)
+plot(driftRatio, "Drift Ratio", display = display.data_window)
+plot(kalmanDriftRatio, "Kalman Drift Ratio", display = display.data_window)
+plot(blendedDrift, "Combined Drift Ratio", display = display.data_window)
+plot(float(rangeScore), "Range Score (0-6)", display = display.data_window)
+plot(inRange ? 1.0 : 0.0, "Range State", display = display.data_window)
+plot(rangeEndedUp ? 1.0 : rangeEndedDown ? -1.0 : 0.0, "Breakout Direction (+1/-1)", display = display.data_window)
+
+alertcondition(rangeStarted, "Range Started", "A new price range was detected")
+alertcondition(rangeEndedUp, "Bullish Range Breakout", "Price confirmed above the active range")
+alertcondition(rangeEndedDown, "Bearish Range Breakout", "Price confirmed below the active range")
