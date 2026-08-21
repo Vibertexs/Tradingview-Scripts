@@ -1,28 +1,37 @@
 //@version=6
-// Range Finder [Kalman] v4 — sized ranges + volume/TPO profile
+// Range Finder [Kalman] v5 — the entry problem
 //
-// Two orthogonal knobs, per the design rule in "Market Structure + Consolidation":
+// The confirmed break is deliberately slow: it cannot be revoked, so it has to
+// wait for evidence. Measured across four beds, that costs 1.0-2.1 ATR of give-up
+// past the boundary, growing with Range Size. Too late to enter on.
 //
-//   Range Sensitivity  -> the seed thresholds  -> HOW MANY ranges are found
-//   Range Size         -> the detection scale  -> HOW BIG each one is
+// The fix is NOT to speed up the confirmation. It is the ignition/gate split from
+// "Consolidation Breakout - Research Notes": the drawn state and the entry
+// decision want opposite things, so they get different tools.
 //
-// Range Size is a scale parameter, not a threshold. That was measured, not assumed:
-// sweeping escapeAtr, growth cap, width cap and confirmation window one at a time,
-// every one of them saturates at v3's default and does nothing above it. They can
-// only make a range SMALLER than its window allows; none of them can make it
-// bigger. The detection window is the only lever that moves size monotonically
-// (0.6x -> 3.0x window moved median range duration 36 -> 159 bars and height
-// 4.6 -> 12.7 ATR), so that is what the slider drives.
+//   1. THE LEVEL IS KNOWN IN ADVANCE. While a range is live the trigger prices are
+//      published every bar as "Break Up Level" / "Break Down Level" and drawn on
+//      the chart. Rest a stop order there and you fill AT the level with zero
+//      give-up. The delay only exists if you wait to be told.
 //
-// Breakout escape is now a FRACTION OF RANGE WIDTH, not an ATR multiple. Also
-// measured: 15% is a knee at every window scale, while a fixed 1.00 ATR escape
-// gets relatively tighter as ranges grow and starts splitting them again at 2x
-// window. Same failure mode as the flat ATR width gate.
+//   2. PROBE MARKERS fire on the first close outside — a small triangle, drawn
+//      immediately and never deleted. On the test beds a probe goes on to confirm
+//      about half the time (52%), so this is a trigger, not a verdict. Both events
+//      stay on the chart: probe first, confirmation later or not at all.
 //
-// Breakout signals are terminal (from v3). A close outside opens a probe; the
-// range stays live and the box stops extending until the probe resolves. Failed
-// probe -> boundary widens, nothing emitted. Break -> label, alert, range over.
-// A label is never moved or deleted; box GEOMETRY still adjusts backwards.
+//   3. AN ESCAPE CAP in ATR, so confirmation cannot wait forever on a wide range.
+//      1.50 is free (identical box counts at every size); tighter buys speed and
+//      costs box integrity, priced in the input tooltip.
+//
+// NOT shipped: an ignition filter on the probe bar. Volatility expansion,
+// efficiency, bar range and close-position were all tested as predictors of
+// whether a probe confirms. Every one had zero or negative lift; the two that
+// scored well had n=3. These synthetic beds cannot separate real breaks from
+// false ones on the break bar, so no filter was justified. On real data this is
+// the first thing to re-test.
+//
+// Everything else is v4: two orthogonal knobs (Sensitivity = how many, Range Size
+// = how big), scale-free escape, terminal signals, per-range POC/value area.
 //
 // Closed-bar honest: alerts want "Once Per Bar Close", strategies want
 // calc_on_every_tick = false. Nothing is revoked once a bar has closed.
@@ -30,7 +39,7 @@
 // CC BY-NC-SA 4.0
 // https://creativecommons.org/licenses/by-nc-sa/4.0/
 
-indicator("Range Finder [Kalman] v4", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 750)
+indicator("Range Finder [Kalman] v5", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 750)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Inputs
@@ -49,6 +58,13 @@ absorbProbes = input.bool(true, "Absorb Rejected Probes", group = G_BRK,
      tooltip = "A wick or close that pushes past the boundary and comes back moves the boundary to where price was rejected. Off, ranges break far more often (trend and random-walk beds: 3 boxes -> 5).")
 escapePct    = input.float(15.0, "Breakout Escape (% of range)", minval = 2.0, maxval = 60.0, step = 1.0, group = G_BRK,
      tooltip = "How far past the boundary a close must travel to confirm a break, as a share of range height. 15% is the measured knee and holds at every range size. Below it, false signals; above it, only delay.")
+
+escapeCapAtr = input.float(1.50, "Breakout Escape Cap (ATR)", minval = 0.0, maxval = 5.0, step = 0.25, group = G_BRK,
+     tooltip = "Confirms a break once price is this far past the boundary even if the % test is not met. 0 disables. Measured trade at Range Size 10: cap off = 2.06 ATR give-up, 6 boxes | 1.50 = 1.77 ATR, 6 boxes (free) | 1.25 = 1.49 ATR, 7 boxes | 1.00 = 1.10 ATR, 8 boxes | 0.75 = 1.04 ATR, 9 boxes. Below 1.50 a long shelf starts splitting.")
+showTriggers = input.bool(true, "Show Trigger Levels", group = G_BRK,
+     tooltip = "Draws the exact prices a break confirms at, on every bar the range is live. Rest a stop order at these to enter with no delay.")
+showProbes   = input.bool(true, "Show Probe Markers", group = G_BRK,
+     tooltip = "Triangle on the first close outside the range. Fast but only ~52% of probes go on to confirm.")
 
 profileBasis   = input.string("Time (TPO)", "Profile Basis", options = ["Off", "Time (TPO)", "Volume"], group = G_PROF,
      tooltip = "Time counts bars per price level and works everywhere. Volume is only meaningful where volume is real — on FX it is a broker tick count, so Time is the default.")
@@ -316,6 +332,8 @@ f_profile(backFrom, backTo, topP, botP, rows, vaFrac, useVol, doIt) =>
 bool rangeStarted = false
 bool brokeUp      = false
 bool brokeDown    = false
+bool probeOpened  = false
+int  probeOpenDir = 0
 
 float buf = atr * breakBufferAtr
 
@@ -341,13 +359,18 @@ if inRange
             probeDir  := d
             probeBars := 1
             probeExt  := d == 1 ? high : low
+            // fast trigger — fires the moment price first closes outside
+            probeOpened  := true
+            probeOpenDir := d
 
-        // escape measured against the range's own height, not ATR — a fixed ATR
-        // multiple is relatively tighter on a big range and splits it
-        float span    = math.max(rTop - rBot, syminfo.mintick)
-        float escaped = (d == 1 ? close - rTop : rBot - close) / span
+        // Escape measured against the range's own height, not ATR — a fixed ATR
+        // multiple is relatively tighter on a big range and splits it. The ATR cap
+        // is a ceiling on top of that so a wide range cannot wait forever.
+        float span        = math.max(rTop - rBot, syminfo.mintick)
+        float dist        = d == 1 ? close - rTop : rBot - close
+        bool  escapeHit   = dist / span >= escapeFrac or (escapeCapAtr > 0 and dist / atrSafe >= escapeCapAtr)
 
-        if (probeBars >= MIN_PROBE_BARS and escaped >= escapeFrac) or probeBars >= confirmWindow
+        if (probeBars >= MIN_PROBE_BARS and escapeHit) or probeBars >= confirmWindow
             brokeUp      := d == 1
             brokeDown    := d == -1
             breakLevel   := d == 1 ? rTop : rBot
@@ -468,9 +491,30 @@ if not showBoxes and not na(rBox)
     rBox := na
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Entry aids — the level is known before the break, the probe fires on the bar
+// ─────────────────────────────────────────────────────────────────────────────
+float breakUpLevel   = inRange ? rTop + buf : na
+float breakDownLevel = inRange ? rBot - buf : na
+
+plot(showTriggers ? breakUpLevel : na,   "Break Up Level",
+     color = color.new(bullColor, 25), style = plot.style_linebr, linewidth = 1)
+plot(showTriggers ? breakDownLevel : na, "Break Down Level",
+     color = color.new(bearColor, 25), style = plot.style_linebr, linewidth = 1)
+
+plotshape(showProbes and probeOpened and probeOpenDir ==  1, "Probe Up",
+     style = shape.triangleup,   location = location.abovebar,
+     color = color.new(bullColor, 30), size = size.tiny)
+plotshape(showProbes and probeOpened and probeOpenDir == -1, "Probe Down",
+     style = shape.triangledown, location = location.belowbar,
+     color = color.new(bearColor, 30), size = size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Strategy outputs and diagnostics
 // ─────────────────────────────────────────────────────────────────────────────
 plot(brokeUp ? 1.0 : brokeDown ? -1.0 : 0.0, "Breakout Signal (+1/-1)", display = display.data_window)
+plot(probeOpened ? float(probeOpenDir) : 0.0, "Probe Signal (+1/-1)", display = display.data_window)
+plot(breakUpLevel,   "Break Up Level (value)",   display = display.data_window)
+plot(breakDownLevel, "Break Down Level (value)", display = display.data_window)
 plot(breakLevel,          "Last Break Level", display = display.data_window)
 plot(inRange ? rTop : na, "Range Top",        display = display.data_window)
 plot(inRange ? rBot : na, "Range Bottom",     display = display.data_window)
@@ -486,5 +530,7 @@ plot(inRange ? float(bar_index - rLeft + 1) : 0.0, "Range Age (bars)",  display 
 plot(inRange ? (rTop - rBot) / atrSafe : 0.0,      "Range Width (ATR)", display = display.data_window)
 
 alertcondition(rangeStarted, "Range Started", "A new price range was detected")
+alertcondition(probeOpened and probeOpenDir ==  1, "Probe Up (fast)",   "Price closed above the range - fast trigger, not yet confirmed")
+alertcondition(probeOpened and probeOpenDir == -1, "Probe Down (fast)", "Price closed below the range - fast trigger, not yet confirmed")
 alertcondition(brokeUp,      "Bullish Range Breakout", "Price confirmed above the range")
 alertcondition(brokeDown,    "Bearish Range Breakout", "Price confirmed below the range")
