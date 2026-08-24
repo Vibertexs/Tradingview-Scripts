@@ -1,5 +1,5 @@
 //@version=6
-// Range Finder [Kalman] v5.1 — Small Range Tune
+// Range Finder [Kalman] v5.3 — Adaptive Single Range
 //
 // This is a targeted sensitivity tune of the original v5, not a redesign.
 //
@@ -17,11 +17,15 @@
 //
 //   4. Break-to-new-range cooldown is reduced from 5 bars to 3.
 //
-//   5. Optional "Refocus On Tighter Shelf" lets a live broad range hand off to
-//      a newly-confirmed smaller consolidation inside it. This is the key change
-//      for finding small ranges that used to be hidden inside one long-lived box.
-//      It does NOT add a second detector or a second structure scale: there is
-//      still only one live range.
+//   5. The single live range automatically RESIZES to the latest confirmed
+//      nested shelf. No second overlapping box is created. The existing box moves
+//      forward to the newest boundaries.
+//
+//   6. Optional adaptation marks are drawn ONLY when a resize actually occurs.
+//      Each mark is a short old-boundary -> new-boundary connector on that bar;
+//      nothing is carried forward into later bars or later ranges.
+//
+//      There is still only one detector and one live range.
 //
 // Everything else — Kalman filter, range score, probe/confirmation split,
 // wick absorption, escape logic, profile, outputs, and drawing style — stays
@@ -30,7 +34,7 @@
 // CC BY-NC-SA 4.0
 // https://creativecommons.org/licenses/by-nc-sa/4.0/
 
-indicator("Range Finder [Kalman] v5.1 - Small Range Tune", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 750)
+indicator("Range Finder [Kalman] v5.3 - Adaptive Range", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 750)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Inputs
@@ -45,10 +49,8 @@ rangeSize        = input.int(5, "Range Size", minval = 1, maxval = 10, group = G
 rangeSensitivity = input.int(7, "Range Sensitivity", minval = 1, maxval = 10, group = G_CORE,
      tooltip = "How readily a range is accepted at that scale. Higher finds more ranges, lower requires cleaner ones. Independent of Range Size.")
 
-refocusTighter = input.bool(true, "Refocus On Tighter Shelf", group = G_CORE,
-     tooltip = "While a range is live, allow a newly confirmed smaller consolidation inside it to become the active range instead of waiting for the broad range to break. This is what lets the detector pick up smaller ranges nested inside long shelves.")
-refocusPct = input.float(80.0, "Tighter Shelf Max Width (%)", minval = 40.0, maxval = 95.0, step = 5.0, group = G_CORE,
-     tooltip = "A nested shelf must be no wider than this percentage of the current live range before it can take over. 80% means the new shelf must be at least 20% tighter. This is a handoff rule, not a zone-quality score.")
+adaptiveResize = input.bool(true, "Auto Resize To Latest Shelf", group = G_CORE,
+     tooltip = "While a range is live, automatically move that SAME range box to the latest confirmed nested shelf. No overlapping replacement box is created. The range can tighten and shift inward as newer consolidation structure becomes available.")
 
 absorbProbes = input.bool(true, "Absorb Rejected Probes", group = G_BRK,
      tooltip = "A wick or close that pushes past the boundary and comes back moves the boundary to where price was rejected. Off, ranges break far more often.")
@@ -67,8 +69,10 @@ profileBasis   = input.string("Time (TPO)", "Profile Basis", options = ["Off", "
 profileRows    = input.int(24, "Profile Rows", minval = 6, maxval = 100, group = G_PROF)
 valueAreaPct   = input.float(70.0, "Value Area %", minval = 30.0, maxval = 95.0, step = 5.0, group = G_PROF)
 
-showBoxes       = input.bool(true, "Show Range Boxes", group = G_STY)
-showBreakLabels = input.bool(true, "Show Breakout Labels", group = G_STY)
+showBoxes           = input.bool(true, "Show Range Boxes", group = G_STY)
+showAdaptationTrace = input.bool(true, "Show Adaptation Moves", group = G_STY,
+     tooltip = "Draws a short connector only when the live box actually resizes: old top -> new top and old bottom -> new bottom. Nothing extends between ranges.")
+showBreakLabels     = input.bool(true, "Show Breakout Labels", group = G_STY)
 boxTransp       = input.int(90, "Range Fill Transparency", minval = 0, maxval = 100, group = G_STY)
 rangeColor      = input.color(#787B86, "Range", group = G_STY)
 profileColor    = input.color(#F2B705, "POC / Value Area", group = G_STY)
@@ -379,37 +383,53 @@ if inRange
         rRight := bar_index
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Small-range handoff
+// Adaptive resize to the latest shelf
 //
-// The original could not detect a smaller shelf while a broad range was live
-// because wantSeed explicitly required "not inRange". We keep one live range,
-// but allow a confirmed nested window to take over if it is materially tighter.
+// The old version froze the broad box and created a second smaller box. That made
+// the chart show overlapping ranges. This version keeps ONE live range only.
+//
+// Once the same detector confirms a newer rolling shelf fully inside the current
+// range, the CURRENT box is resized to that latest shelf. Because rTop/rBot are
+// normal series values, the optional step-line traces below preserve the old
+// boundaries historically even though the box itself moves.
 // ─────────────────────────────────────────────────────────────────────────────
 float liveWidth = inRange ? math.max(rTop - rBot, syminfo.mintick) : na
-bool nestedInside = inRange and rollingTop <= rTop and rollingBottom >= rBot and
+
+bool latestShelfInside = inRange and
+     rollingTop <= rTop and rollingBottom >= rBot and
      (rollingTop < rTop or rollingBottom > rBot)
 
-bool canRefocus = refocusTighter and inRange and probeDir == 0 and
-     confirmedRangeCandidate and nestedInside and
-     rollingWidth <= liveWidth * (refocusPct / 100.0) and
+bool canRefocus = adaptiveResize and inRange and probeDir == 0 and
+     confirmedRangeCandidate and latestShelfInside and
      (bar_index - rLeft + 1) >= winLen
 
 if canRefocus
-    // Freeze the old live box where it ended. No breakout label is emitted because
-    // this is a range handoff, not a directional break.
-    if not na(rBox)
-        box.set_right(rBox, math.max(rLeft, bar_index - 1))
-        rBox := na
+    // Capture the old boundaries before moving the SAME live box.
+    float oldTop = rTop
+    float oldBot = rBot
 
-    // Existing profile lines remain on the old range; release their handles.
-    pocLine := na
-    vahLine := na
-    valLine := na
+    // Remove the CURRENT profile drawings before resizing. They belonged to the
+    // previous dimensions of this same live range and would otherwise visually
+    // overlap the freshly-sized profile.
+    if not na(pocLine)
+        line.delete(pocLine)
+        pocLine := na
+    if not na(vahLine)
+        line.delete(vahLine)
+        vahLine := na
+    if not na(valLine)
+        line.delete(valLine)
+        valLine := na
+
     pocValue := na
     vahValue := na
     valValue := na
 
     int floorBar = math.max(0, nz(lastBreakBar, -1) + 1)
+
+    // Resize the SAME live range to the latest confirmed rolling shelf.
+    // rBox is deliberately NOT deleted or replaced here. The normal drawing
+    // update below moves its left/top/bottom/right coordinates in-place.
     rLeft   := math.max(floorBar, bar_index - winLen + 1)
     rTop    := rollingTop
     rBot    := rollingBottom
@@ -417,12 +437,30 @@ if canRefocus
     rSeedW  := rollingWidth
     rejects := 0
 
+    // Event-only adaptation marks. These exist ONLY on the resize bar and show
+    // how each boundary moved. They do not extend through the life of the range
+    // and cannot bridge into the next range.
+    if showAdaptationTrace
+        if rTop != oldTop
+            line.new(bar_index - 1, oldTop, bar_index, rTop,
+                 xloc = xloc.bar_index,
+                 extend = extend.none,
+                 color = color.new(rangeColor, 0),
+                 width = 2)
+        if rBot != oldBot
+            line.new(bar_index - 1, oldBot, bar_index, rBot,
+                 xloc = xloc.bar_index,
+                 extend = extend.none,
+                 color = color.new(rangeColor, 0),
+                 width = 2)
+
     probeDir  := 0
     probeBars := 0
     probeExt  := na
 
+    // Require a fresh confirmation streak before another resize. This prevents
+    // the box from jittering inward on every single bar.
     candidateStreak := 0
-    rangeStarted   := true
     rangeRefocused := true
 
 bool cooldownReady = na(lastBreakBar) or bar_index - lastBreakBar > COOLDOWN_BARS
@@ -562,10 +600,10 @@ plot(float(rejects),      "Rejected Probes",  display = display.data_window)
 plot(float(rangeScore),   "Range Score (0-6)", display = display.data_window)
 plot(inRange ? float(bar_index - rLeft + 1) : 0.0, "Range Age (bars)",  display = display.data_window)
 plot(inRange ? (rTop - rBot) / atrSafe : 0.0,      "Range Width (ATR)", display = display.data_window)
-plot(rangeRefocused ? 1.0 : 0.0, "Range Refocused", display = display.data_window)
+plot(rangeRefocused ? 1.0 : 0.0, "Range Auto-Resized", display = display.data_window)
 
 alertcondition(rangeStarted, "Range Started", "A new price range was detected")
-alertcondition(rangeRefocused, "Range Refocused", "The active range handed off to a smaller nested shelf")
+alertcondition(rangeRefocused, "Range Auto-Resized", "The active range resized to the latest confirmed nested shelf")
 alertcondition(probeOpened and probeOpenDir ==  1, "Probe Up (fast)",   "Price closed above the range - fast trigger, not yet confirmed")
 alertcondition(probeOpened and probeOpenDir == -1, "Probe Down (fast)", "Price closed below the range - fast trigger, not yet confirmed")
 alertcondition(brokeUp,      "Bullish Range Breakout", "Price confirmed above the range")
