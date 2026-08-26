@@ -1,825 +1,496 @@
 //@version=6
-
-// Swing Structure Bias [v10 - Adaptive Sensitivity]
-
-// Derived from "Trend Angle Momentum [MarkitTick]" supplied by the user.
-
-// Box behavior is inspired by the user's supplied "Sessions [LuxAlgo]" script.
-
-// Swing filtering follows the general confirmed-pivot + alternating ZigZag approach
-
-// documented by TradingView, with an added ATR significance filter.
-
-// Fast swing dots use the filtered ZigZag engine, while box direction uses an
-
-// adaptive structure engine that becomes progressively faster as sensitivity rises.
-
+// Asian Session Bias [Daily Swing Filter] v1
 //
-
-// Source scripts supplied by the user are CC BY-NC-SA 4.0; this derivative is
-
-// provided under the same license.
-
+// Replaces "Swing Structure Bias [v10]". That script could not do this job, and
+// no amount of tuning would have fixed it - the problem was structural:
+//
+//   • It had NO concept of a session or a trading day. It was a free-running
+//     pivot engine on 3-bar pivots. On any intraday chart that flips state
+//     dozens of times per day, which is exactly the "random bullish/bearish/range
+//     boxes" you were seeing. Those boxes were not noise on top of a good signal;
+//     the box WAS the signal, and it had no anchor.
+//   • RANGE could trigger any time two filtered swings happened to nest, at any
+//     hour, independent of anything. It fired constantly and meant nothing.
+//   • Nothing separated "when the bias is decided" from "when the bias applies",
+//     so there was no daily bias to filter on.
+//
+// This version is built the way you described the job:
+//
+//   1. The Asian session is the DECISION window. A four-factor score is computed
+//      live, bar by bar, as Asia forms - not from yesterday's data.
+//   2. At the Asian close the score LOCKS. That is the day's bias. It does not
+//      change again for the rest of the day.
+//   3. London is the EXPRESSION window. The locked bias is carried forward and
+//      drawn across it, with the Asian high/low projected as the levels London
+//      has to resolve.
+//
+// Result: exactly ONE bias per day, bullish or bearish. Never a stream of boxes.
+//
+// The consolidation feature you liked is kept, but re-pointed at something real:
+// the Asian range measured against its own rolling average. A compressed Asia is
+// a genuine setup condition. A nested pivot pair at 3am was not.
+//
+// Requires an intraday chart. 5m-1h is the useful range; 15m is a good default.
+//
+// CC BY-NC-SA 4.0
 // https://creativecommons.org/licenses/by-nc-sa/4.0/
 
-indicator("Swing Structure Bias [v10 - Adaptive Sensitivity]", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+indicator("Asian Session Bias [Daily Swing Filter]", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
 
 // ─────────────────────────────────────────────────────────────────────────────
-
 // Inputs
+// ─────────────────────────────────────────────────────────────────────────────
+var string G_SESS = "Sessions"
+var string G_BIAS = "Bias"
+var string G_STY  = "Style"
+
+sessionTz = input.string("GMT+0", "Session Timezone", group = G_SESS,
+     options = ["GMT+0", "GMT+1", "GMT+2", "GMT+3", "GMT+8", "GMT+9", "GMT+10",
+                "GMT-4", "GMT-5", "GMT-6", "GMT-7", "GMT-8",
+                "Europe/London", "America/New_York", "Asia/Tokyo", "Asia/Shanghai", "Australia/Sydney"],
+     tooltip = "The timezone the session strings below are written in. Set this FIRST - everything else depends on it. GMT+0 with the default sessions is the standard FX convention.")
+
+asiaSession   = input.session("0000-0800", "Asian Session (decision window)", group = G_SESS,
+     tooltip = "The bias is computed live inside this window and locked when it closes.")
+londonSession = input.session("0800-1600", "London Session (expression window)", group = G_SESS,
+     tooltip = "The locked bias is carried across this window and tested against the Asian high/low.")
+
+neutralBand = input.float(0.00, "Neutral Band", minval = 0.00, maxval = 0.50, step = 0.05, group = G_BIAS,
+     tooltip = "0.00 means the day is ALWAYS bullish or bearish - the default, and what you asked for. Raise it to introduce a third NEUTRAL classification on genuinely balanced Asian sessions. 0.15 flags roughly the most balanced sessions as neutral.")
+
+minAsiaBars = input.int(4, "Minimum Asian Bars", minval = 2, maxval = 50, group = G_BIAS,
+     tooltip = "The live bias stays undecided until the Asian session has this many bars. Stops the first one or two candles from dictating the day. On a 15m chart, 4 is one hour of Asia.")
+
+compressPct = input.float(75.0, "Compression Threshold (% of average)", minval = 30.0, maxval = 100.0, step = 5.0, group = G_BIAS,
+     tooltip = "An Asian range smaller than this share of its 20-day average is flagged COMPRESSED. This is the consolidation signal - a coiled Asia that London tends to expand out of.")
+
+showAsiaBox  = input.bool(true,  "Show Asian Range Box",    group = G_STY)
+showBiasBox  = input.bool(true,  "Show Bias Box",           group = G_STY)
+showLevels   = input.bool(true,  "Project Asian High/Low",  group = G_STY)
+showTable    = input.bool(true,  "Show Bias Panel",         group = G_STY)
+historyDays  = input.int(20, "Days To Keep On Chart", minval = 1, maxval = 60, group = G_STY)
+
+boxTransp    = input.int(90, "Box Transparency", minval = 0, maxval = 100, group = G_STY)
+bullColor    = input.color(#089981, "Bullish",  group = G_STY)
+bearColor    = input.color(#f23645, "Bearish",  group = G_STY)
+neutralColor = input.color(#808080, "Neutral",  group = G_STY)
+asiaColor    = input.color(#787b86, "Asian Session", group = G_STY)
 
 // ─────────────────────────────────────────────────────────────────────────────
-
-var string G_CORE   = "Core"
-var string G_STYLE  = "Style"
-
-// Keep the user-facing menu small. The stable/default values below are
-// intentionally fixed so the indicator stays easy to tune.
-int pivotLegs = 3
-int atrLength = 14
-int atrFloorLength = 50
-float atrFloorMult = 0.80
-float minReversalPct = 0.00
-bool useBodyBreaks = true
-float structureBreakAtr = 0.00
-bool showSwingText = false
-bool showStructuralSwingPoints = false
-color rangeColor = #808080
-
-minReversalAtr = input.float(0.80, "Swing Filter (ATR)", minval = 0.0, step = 0.05, group = G_CORE,
-     tooltip = "Controls how large a reversal must be before a fast swing dot is accepted. Higher = fewer swing dots.")
-
-structureSensitivity = input.int(5, "Structure Sensitivity", minval = 1, maxval = 10, group = G_CORE,
-     tooltip = "1 = very stable/slow, 5 = balanced, 10 = very tight/fast. At high settings the boxes use fast filtered or raw pivots directly instead of waiting for the slow two-stage structure engine.")
-
-// Sensitivity changes the actual regime engine, not just the swing dots.
-// 1-4  = slow structural swings + two-stage CHoCH/BOS confirmation
-// 5-7  = shorter structural swings + direct opposite break
-// 8-9  = filtered fast swings + direct opposite break
-// 10   = raw confirmed pivots + direct opposite break
-int structureSwingLength = structureSensitivity == 1 ? 80 : structureSensitivity == 2 ? 65 : structureSensitivity == 3 ? 50 : structureSensitivity == 4 ? 40 : structureSensitivity == 5 ? 30 : structureSensitivity == 6 ? 22 : structureSensitivity == 7 ? 14 : structureSensitivity == 8 ? 12 : structureSensitivity == 9 ? 10 : 8
-bool useTwoStageStructure = structureSensitivity <= 4
-bool useSlowDirectStructure = structureSensitivity >= 5 and structureSensitivity <= 7
-bool useFilteredFastStructure = structureSensitivity >= 8 and structureSensitivity <= 9
-bool useRawFastStructure = structureSensitivity == 10
-float adaptiveBreakBufferAtr = structureSensitivity == 5 ? 0.20 : structureSensitivity == 6 ? 0.10 : structureSensitivity == 8 ? 0.15 : 0.00
-
-showSwingPoints = input.bool(true, "Show Swing Points", group = G_CORE)
-showStateBoxes = input.bool(true, "Show Structure Boxes", group = G_CORE)
-
-boxTransparency = input.int(88, "Box Transparency", minval = 0, maxval = 100, group = G_STYLE)
-bullColor = input.color(#089981, "Bullish", group = G_STYLE)
-bearColor = input.color(#f23645, "Bearish", group = G_STYLE)
-
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Helpers
-
-// ─────────────────────────────────────────────────────────────────────────────
-
-f_requiredMove(float fromPrice, float atrValue) =>
-
-    float atrMove = nz(atrValue) * minReversalAtr
-
-    float pctMove = math.abs(fromPrice) * minReversalPct / 100.0
-
-    math.max(atrMove, pctMove)
-
-f_stateText(int state) =>
-
-    state == 1 ? "BULLISH" : state == -1 ? "BEARISH" : state == 2 ? "RANGE" : ""
-
-f_stateColor(int state) =>
-
-    state == 1 ? bullColor : state == -1 ? bearColor : rangeColor
-
-f_highText(float price, float previousHigh) =>
-
-    na(previousHigh) ? "SH" : price > previousHigh ? "HH" : "LH"
-
-f_lowText(float price, float previousLow) =>
-
-    na(previousLow) ? "SL" : price < previousLow ? "LL" : "HL"
-
-f_makeSwingMarker(int swingType, int swingBar, float swingPrice, string swingText) =>
-
-    label marker = na
-
-    if showSwingPoints
-
-        color pointColor = swingType == 1 ? bearColor : bullColor
-
-        string markerText = showSwingText ? swingText : ""
-
-        marker := label.new(
-
-             x = swingBar,
-
-             y = swingPrice,
-
-             text = markerText,
-
-             xloc = xloc.bar_index,
-
-             yloc = yloc.price,
-
-             style = label.style_circle,
-
-             color = pointColor,
-
-             textcolor = color.white,
-
-             size = showSwingText ? size.small : size.tiny)
-
-    marker
-
-// ─────────────────────────────────────────────────────────────────────────────
-
-// 1) Raw confirmed pivots
-
+// Factor weights
 //
+// Fixed rather than exposed, to keep the menu small. Every factor is published
+// individually in the Data Window and the panel, so you can always see which one
+// drove the day's decision without needing a knob for it.
+// ─────────────────────────────────────────────────────────────────────────────
+float W_LOCATION = 1.00   // where Asia is closing inside its own range
+float W_DRIVE    = 0.80   // net open-to-close displacement
+float W_VWAP     = 0.70   // acceptance above or below session VWAP
+float W_SEQUENCE = 0.50   // whether the session built up or built down
+float W_TOTAL    = W_LOCATION + W_DRIVE + W_VWAP + W_SEQUENCE
 
-// A short pivot length gives responsive candidate points. We DO NOT use every
-
-// candidate. The next section converts them into an alternating swing sequence.
+int RANGE_MEMORY = 20     // Asian sessions kept for the compression average
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Session detection
+// ─────────────────────────────────────────────────────────────────────────────
+bool inAsia   = not na(time(timeframe.period, asiaSession,   sessionTz))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTz))
 
-float rawHigh = ta.pivothigh(high, pivotLegs, pivotLegs)
+bool asiaOpened   = inAsia and not inAsia[1]
+bool asiaClosed   = not inAsia and inAsia[1]
+bool londonClosed = not inLondon and inLondon[1]
 
-float rawLow  = ta.pivotlow(low, pivotLegs, pivotLegs)
-
-int rawPivotBar = bar_index - pivotLegs
-
-// ATR regime filter: use normal ATR when volatility expands, but keep a slow
-// baseline floor so the required swing move does not collapse in quiet chop.
-float atrNow = ta.atr(atrLength)
-float atrBaseline = ta.sma(atrNow, atrFloorLength)
-float filteredAtr = math.max(atrNow, nz(atrBaseline, atrNow) * atrFloorMult)
-float atrAtPivot = filteredAtr[pivotLegs]
+bool tfOk = timeframe.isintraday and timeframe.in_seconds() <= 3600
 
 // ─────────────────────────────────────────────────────────────────────────────
-
-// 2) Filtered alternating swing engine
-
+// Live Asian session accumulation
 //
+// Everything here is built forward from the session open. Nothing reaches back
+// into the previous day.
+// ─────────────────────────────────────────────────────────────────────────────
+var float asiaHigh    = na
+var float asiaLow     = na
+var float asiaOpenPx  = na
+var int   asiaHighBar = na
+var int   asiaLowBar  = na
+var int   asiaStartBar = na
+var int   asiaBarCount = 0
+var int   asiaBarsAbove = 0
+var float vwapNumer   = 0.0
+var float vwapDenom   = 0.0
+var float asiaVwap    = na
 
-// Rules:
+if asiaOpened
+    asiaHigh     := high
+    asiaLow      := low
+    asiaOpenPx   := open
+    asiaHighBar  := bar_index
+    asiaLowBar   := bar_index
+    asiaStartBar := bar_index
+    asiaBarCount := 0
+    asiaBarsAbove := 0
+    vwapNumer    := 0.0
+    vwapDenom    := 0.0
+    asiaVwap     := na
 
-// • Highs and lows must alternate.
+if inAsia
+    if high > asiaHigh
+        asiaHigh    := high
+        asiaHighBar := bar_index
+    if low < asiaLow
+        asiaLow    := low
+        asiaLowBar := bar_index
 
-// • If another pivot of the SAME type appears before a valid reversal, only the
+    // Weight by volume where volume is real, by bar count where it is not.
+    // This makes the VWAP factor work on FX and on futures without a setting.
+    float w = nz(volume, 0.0) > 0.0 ? volume : 1.0
+    vwapNumer := vwapNumer + hlc3 * w
+    vwapDenom := vwapDenom + w
+    asiaVwap  := vwapNumer / math.max(vwapDenom, 1e-10)
 
-//   more extreme one survives. This removes double/triple tops of tiny pivots.
-
-// • An opposite pivot is accepted only after a minimum ATR/% reversal.
-
-//
-
-// This is the key difference from v2, where independently detected highs/lows
-
-// were paired together and could produce inconsistent structure boxes.
+    asiaBarCount := asiaBarCount + 1
+    if close > asiaVwap
+        asiaBarsAbove := asiaBarsAbove + 1
 
 // ─────────────────────────────────────────────────────────────────────────────
-
-var int zzType = 0                     // 1 = latest swing high, -1 = latest swing low
-
-var float zzPrice = na
-
-var int zzBar = na
-
-var label zzMarker = na
-
-var float lastHigh = na
-
-var float prevHigh = na
-
-var int lastHighBar = na
-
-var int prevHighBar = na
-
-var float lastLow = na
-
-var float prevLow = na
-
-var int lastLowBar = na
-
-var int prevLowBar = na
-
-var bool highLevelBroken = false
-
-var bool lowLevelBroken = false
-
-bool newAlternatingSwing = false
-
-int newSwingType = 0
-
-// Rare outside bars can qualify as both a raw high and raw low. For a clean
-
-// structure map we prefer the candidate OPPOSITE the current ZigZag direction
-
-// and do not create two structural pivots on the same candle.
-
-bool candidateHigh = not na(rawHigh) and barstate.isconfirmed
-
-bool candidateLow  = not na(rawLow) and barstate.isconfirmed
-
-if candidateHigh and candidateLow
-
-    if zzType == 1
-
-        candidateHigh := false
-
-    else if zzType == -1
-
-        candidateLow := false
-
-    else
-
-        // No established direction yet: start with the side farther from close.
-
-        float highDistance = math.abs(rawHigh - close[pivotLegs])
-
-        float lowDistance = math.abs(close[pivotLegs] - rawLow)
-
-        if highDistance >= lowDistance
-
-            candidateLow := false
-
-        else
-
-            candidateHigh := false
-
-// ----- High candidate ---------------------------------------------------------
-
-if candidateHigh
-
-    if zzType == 0
-
-        zzType := 1
-
-        zzPrice := rawHigh
-
-        zzBar := rawPivotBar
-
-        lastHigh := rawHigh
-
-        lastHighBar := rawPivotBar
-
-        highLevelBroken := false
-
-        zzMarker := f_makeSwingMarker(1, zzBar, zzPrice, f_highText(zzPrice, prevHigh))
-
-    else if zzType == 1
-
-        // Same-side extension: keep only the more extreme high.
-
-        if rawHigh > zzPrice
-
-            zzPrice := rawHigh
-
-            zzBar := rawPivotBar
-
-            lastHigh := rawHigh
-
-            lastHighBar := rawPivotBar
-
-            highLevelBroken := false
-
-            if not na(zzMarker)
-
-                label.delete(zzMarker)
-
-            zzMarker := f_makeSwingMarker(1, zzBar, zzPrice, f_highText(zzPrice, prevHigh))
-
-    else
-
-        // Opposite pivot: require a meaningful reversal from the last low.
-
-        float requiredMove = f_requiredMove(zzPrice, atrAtPivot)
-
-        if rawHigh - zzPrice >= requiredMove
-
-            prevHigh := lastHigh
-
-            prevHighBar := lastHighBar
-
-            lastHigh := rawHigh
-
-            lastHighBar := rawPivotBar
-
-            zzType := 1
-
-            zzPrice := rawHigh
-
-            zzBar := rawPivotBar
-
-            highLevelBroken := false
-
-            zzMarker := f_makeSwingMarker(1, zzBar, zzPrice, f_highText(zzPrice, prevHigh))
-
-            newAlternatingSwing := true
-
-            newSwingType := 1
-
-// ----- Low candidate ----------------------------------------------------------
-
-if candidateLow
-
-    if zzType == 0
-
-        zzType := -1
-
-        zzPrice := rawLow
-
-        zzBar := rawPivotBar
-
-        lastLow := rawLow
-
-        lastLowBar := rawPivotBar
-
-        lowLevelBroken := false
-
-        zzMarker := f_makeSwingMarker(-1, zzBar, zzPrice, f_lowText(zzPrice, prevLow))
-
-    else if zzType == -1
-
-        // Same-side extension: keep only the more extreme low.
-
-        if rawLow < zzPrice
-
-            zzPrice := rawLow
-
-            zzBar := rawPivotBar
-
-            lastLow := rawLow
-
-            lastLowBar := rawPivotBar
-
-            lowLevelBroken := false
-
-            if not na(zzMarker)
-
-                label.delete(zzMarker)
-
-            zzMarker := f_makeSwingMarker(-1, zzBar, zzPrice, f_lowText(zzPrice, prevLow))
-
-    else
-
-        // Opposite pivot: require a meaningful reversal from the last high.
-
-        float requiredMove = f_requiredMove(zzPrice, atrAtPivot)
-
-        if zzPrice - rawLow >= requiredMove
-
-            prevLow := lastLow
-
-            prevLowBar := lastLowBar
-
-            lastLow := rawLow
-
-            lastLowBar := rawPivotBar
-
-            zzType := -1
-
-            zzPrice := rawLow
-
-            zzBar := rawPivotBar
-
-            lowLevelBroken := false
-
-            zzMarker := f_makeSwingMarker(-1, zzBar, zzPrice, f_lowText(zzPrice, prevLow))
-
-            newAlternatingSwing := true
-
-            newSwingType := -1
+// The four factors
+//
+// Each is normalised to [-1, +1] and each measures something the others do not.
+// The old script effectively had one factor - "did a pivot get broken" - which is
+// why it had no way to express conviction and no way to stay still.
+// ─────────────────────────────────────────────────────────────────────────────
+float asiaRange = math.max(nz(asiaHigh - asiaLow, 0.0), syminfo.mintick)
+
+// 1. LOCATION - where price sits in the session range right now.
+//    Closing on the highs of Asia is the single most direct statement of intent.
+float fLocation = 2.0 * (close - asiaLow) / asiaRange - 1.0
+
+// 2. DRIVE - net displacement from the session open, scaled by half the range.
+//    Separates "closed high after grinding up" from "closed high after a V".
+float fDrive = math.max(-1.0, math.min(1.0, (close - asiaOpenPx) / (asiaRange * 0.5)))
+
+// 3. VWAP ACCEPTANCE - share of session bars that closed above session VWAP.
+//    A time-based measure, so a single spike cannot dominate it.
+float fVwap = asiaBarCount > 0 ? 2.0 * (float(asiaBarsAbove) / float(asiaBarCount)) - 1.0 : 0.0
+
+// 4. SEQUENCE - was the session low set before the high, or after?
+//    Low first then high = the session built upward. This is the only factor that
+//    looks at ORDER rather than level, which is why it earns its place.
+float fSequence = na(asiaHighBar) or na(asiaLowBar) ? 0.0 : asiaHighBar > asiaLowBar ? 1.0 : asiaHighBar < asiaLowBar ? -1.0 : 0.0
+
+float biasScore = (fLocation * W_LOCATION + fDrive * W_DRIVE + fVwap * W_VWAP + fSequence * W_SEQUENCE) / W_TOTAL
+
+bool asiaMature = asiaBarCount >= minAsiaBars
+int  liveBias = not inAsia or not asiaMature or na(biasScore) ? 0 :
+     neutralBand > 0.0 and math.abs(biasScore) <= neutralBand ? 2 :
+     biasScore >= 0.0 ? 1 : -1
+
+// The last value seen INSIDE the session. asiaClosed fires on the first bar after
+// Asia, when close/hlc3 already belong to the next session - so the final reading
+// has to be captured while still inside.
+var float asiaFinalScore = na
+var int   asiaFinalBias  = 0
+
+// Cleared at every Asian open so a short or broken session can never lock
+// yesterday's reading as if it were today's.
+if asiaOpened
+    asiaFinalScore := na
+    asiaFinalBias  := 0
+
+if inAsia and asiaMature
+    asiaFinalScore := biasScore
+    asiaFinalBias  := liveBias
 
 // ─────────────────────────────────────────────────────────────────────────────
-
-// 3) Adaptive structural regime engine + true range detection
-//
-// Structure Sensitivity now changes the actual box engine:
-//
-//   1-4  Stable: slow structural legs + two-stage CHoCH -> new pivot -> BOS.
-//   5-7  Balanced: shorter structural legs and an opposite close flips directly.
-//   8-9  Fast: filtered ZigZag swings become the protected structure directly.
-//   10   Tightest: raw confirmed pivots become the protected structure directly.
-//
-// RANGE stays separate from CHoCH. It is still created only by a contained
-// filtered LH + HL pair, and its boundaries stay locked until a body-close exits.
+// Lock the day's bias at the Asian close
 // ─────────────────────────────────────────────────────────────────────────────
+var int   dayBias       = 0
+var float dayScore      = na
+var float dayHigh       = na
+var float dayLow        = na
+var float dayMid        = na
+var bool  dayCompressed = false
+var float dayRangePct   = na
+var int   dayLockBar    = na
+var int   londonState   = 0     // +1 confirmed with bias, -1 invalidated against it
+var bool  biasResolved  = false
+var bool  dayDone       = false
 
-var int structureLeg = 0              // -1 = bearish leg from structural high, 1 = bullish leg from structural low
-var float structuralHigh = na
-var int structuralHighBar = na
-var bool structuralHighCrossed = false
+var array<float> asiaRangeMemory = array.new_float()
 
-var float structuralLow = na
-var int structuralLowBar = na
-var bool structuralLowCrossed = false
+bool biasLocked = false
 
-var label structuralHighMarker = na
-var label structuralLowMarker = na
+if asiaClosed and asiaFinalBias != 0
+    dayBias    := asiaFinalBias
+    dayScore   := asiaFinalScore
+    dayHigh    := asiaHigh
+    dayLow     := asiaLow
+    dayMid     := (asiaHigh + asiaLow) / 2.0
+    dayLockBar := bar_index
+    londonState  := 0
+    biasResolved := false
+    dayDone      := false
+    biasLocked   := true
 
-// Raw-pivot structure used only at sensitivity 10.
-var float rawStructureHigh = na
-var int rawStructureHighBar = na
-var bool rawStructureHighCrossed = false
-var float rawStructureLow = na
-var int rawStructureLowBar = na
-var bool rawStructureLowCrossed = false
+    // Compression is judged against this instrument's OWN recent Asian ranges,
+    // so it needs no ATR setting and travels between symbols unchanged.
+    float thisRange = asiaHigh - asiaLow
+    float avgRange  = array.size(asiaRangeMemory) >= 5 ? array.avg(asiaRangeMemory) : na
+    dayRangePct   := na(avgRange) or avgRange <= 0 ? na : thisRange / avgRange * 100.0
+    dayCompressed := not na(dayRangePct) and dayRangePct <= compressPct
 
-if not na(rawHigh) and barstate.isconfirmed
-    rawStructureHigh := rawHigh
-    rawStructureHighBar := rawPivotBar
-    rawStructureHighCrossed := false
-
-if not na(rawLow) and barstate.isconfirmed
-    rawStructureLow := rawLow
-    rawStructureLowBar := rawPivotBar
-    rawStructureLowCrossed := false
-
-// Confirmed regime and low-sensitivity two-stage reversal state.
-var int structureState = 0            // 1 bull, -1 bear, 2 range, 0 warming up
-var int pendingReversal = 0           // 1 = bullish CHoCH pending, -1 = bearish CHoCH pending
-var int pendingReversalBar = na
-var bool bullishConfirmationArmed = false
-var bool bearishConfirmationArmed = false
-
-// True range boundaries come from a contained pair of filtered fast swings.
-var float rangeTop = na
-var float rangeBottom = na
-
-// Slow structural legs. These remain available for sensitivities 1-7.
-bool newLegHigh = not na(high[structureSwingLength]) and high[structureSwingLength] > ta.highest(high, structureSwingLength)
-bool newLegLow = not na(low[structureSwingLength]) and low[structureSwingLength] < ta.lowest(low, structureSwingLength)
-
-int previousStructureLeg = structureLeg
-
-if newLegHigh
-    structureLeg := -1
-else if newLegLow
-    structureLeg := 1
-
-bool newStructuralHigh = structureLeg == -1 and previousStructureLeg != -1
-bool newStructuralLow = structureLeg == 1 and previousStructureLeg != 1
-
-if newStructuralHigh
-    structuralHigh := high[structureSwingLength]
-    structuralHighBar := bar_index - structureSwingLength
-    structuralHighCrossed := false
-
-    // Only stable mode uses the second BOS confirmation.
-    if useTwoStageStructure and pendingReversal == 1 and not na(pendingReversalBar) and structuralHighBar > pendingReversalBar
-        bullishConfirmationArmed := true
-
-    if showStructuralSwingPoints
-        if not na(structuralHighMarker)
-            label.delete(structuralHighMarker)
-        structuralHighMarker := label.new(
-             x = structuralHighBar,
-             y = structuralHigh,
-             text = useTwoStageStructure and pendingReversal == 1 and bullishConfirmationArmed ? "BOS H" : "SH",
-             xloc = xloc.bar_index,
-             yloc = yloc.price,
-             style = label.style_circle,
-             color = bearColor,
-             textcolor = color.white,
-             size = size.small)
-
-if newStructuralLow
-    structuralLow := low[structureSwingLength]
-    structuralLowBar := bar_index - structureSwingLength
-    structuralLowCrossed := false
-
-    if useTwoStageStructure and pendingReversal == -1 and not na(pendingReversalBar) and structuralLowBar > pendingReversalBar
-        bearishConfirmationArmed := true
-
-    if showStructuralSwingPoints
-        if not na(structuralLowMarker)
-            label.delete(structuralLowMarker)
-        structuralLowMarker := label.new(
-             x = structuralLowBar,
-             y = structuralLow,
-             text = useTwoStageStructure and pendingReversal == -1 and bearishConfirmationArmed ? "BOS L" : "SL",
-             xloc = xloc.bar_index,
-             yloc = yloc.price,
-             style = label.style_circle,
-             color = bullColor,
-             textcolor = color.white,
-             size = size.small)
-
-float bullBreakSource = useBodyBreaks ? close : high
-float bearBreakSource = useBodyBreaks ? close : low
-
-// Each sensitivity band gets its own protected levels.
-float slowBuffer = filteredAtr * adaptiveBreakBufferAtr
-bool slowBreakUp = not na(structuralHigh) and not structuralHighCrossed and bar_index > structuralHighBar and bullBreakSource > structuralHigh + slowBuffer
-bool slowBreakDown = not na(structuralLow) and not structuralLowCrossed and bar_index > structuralLowBar and bearBreakSource < structuralLow - slowBuffer
-
-float fastBuffer = filteredAtr * adaptiveBreakBufferAtr
-bool filteredFastBreakUp = not na(lastHigh) and not highLevelBroken and bar_index > lastHighBar and bullBreakSource > lastHigh + fastBuffer
-bool filteredFastBreakDown = not na(lastLow) and not lowLevelBroken and bar_index > lastLowBar and bearBreakSource < lastLow - fastBuffer
-
-bool rawFastBreakUp = not na(rawStructureHigh) and not rawStructureHighCrossed and bar_index > rawStructureHighBar and bullBreakSource > rawStructureHigh
-bool rawFastBreakDown = not na(rawStructureLow) and not rawStructureLowCrossed and bar_index > rawStructureLowBar and bearBreakSource < rawStructureLow
-
-bool activeBreakUp = (useTwoStageStructure or useSlowDirectStructure) ? slowBreakUp : useFilteredFastStructure ? filteredFastBreakUp : rawFastBreakUp
-bool activeBreakDown = (useTwoStageStructure or useSlowDirectStructure) ? slowBreakDown : useFilteredFastStructure ? filteredFastBreakDown : rawFastBreakDown
-
-// Actual sideways/contained structure still comes from the filtered swings.
-bool haveTwoFastHighs = not na(lastHigh) and not na(prevHigh)
-bool haveTwoFastLows = not na(lastLow) and not na(prevLow)
-bool fastHigherHigh = haveTwoFastHighs and lastHigh > prevHigh
-bool fastLowerHigh = haveTwoFastHighs and lastHigh <= prevHigh
-bool fastHigherLow = haveTwoFastLows and lastLow >= prevLow
-bool fastLowerLow = haveTwoFastLows and lastLow < prevLow
-bool fastInsidePattern = fastLowerHigh and fastHigherLow
-bool actualRangeCandidate = structureState != 0 and structureState != 2 and newAlternatingSwing and fastInsidePattern and prevHigh > prevLow
-
-bool rangeBreakUp = structureState == 2 and not na(rangeTop) and bullBreakSource > rangeTop
-bool rangeBreakDown = structureState == 2 and not na(rangeBottom) and bearBreakSource < rangeBottom
-
-int proposedState = structureState
-float proposedRangeTop = rangeTop
-float proposedRangeBottom = rangeBottom
-bool stateChangeRequested = false
-bool bullishChochCandidate = false
-bool bearishChochCandidate = false
-bool bullishBosConfirmed = false
-bool bearishBosConfirmed = false
-
-// RANGE always has first priority once active.
-if structureState == 2
-    if rangeBreakUp and not rangeBreakDown
-        proposedState := 1
-        proposedRangeTop := na
-        proposedRangeBottom := na
-        stateChangeRequested := true
-        bullishBosConfirmed := true
-        pendingReversal := 0
-        pendingReversalBar := na
-        bullishConfirmationArmed := false
-        bearishConfirmationArmed := false
-
-    else if rangeBreakDown and not rangeBreakUp
-        proposedState := -1
-        proposedRangeTop := na
-        proposedRangeBottom := na
-        stateChangeRequested := true
-        bearishBosConfirmed := true
-        pendingReversal := 0
-        pendingReversalBar := na
-        bullishConfirmationArmed := false
-        bearishConfirmationArmed := false
-
-else
-    // Mark whichever protected level fired so the same level cannot trigger again.
-    if activeBreakUp and not activeBreakDown
-        if useTwoStageStructure or useSlowDirectStructure
-            structuralHighCrossed := true
-        else if useFilteredFastStructure
-            highLevelBroken := true
-        else
-            rawStructureHighCrossed := true
-
-    if activeBreakDown and not activeBreakUp
-        if useTwoStageStructure or useSlowDirectStructure
-            structuralLowCrossed := true
-        else if useFilteredFastStructure
-            lowLevelBroken := true
-        else
-            rawStructureLowCrossed := true
-
-    // First directional classification.
-    if structureState == 0
-        if activeBreakUp and not activeBreakDown
-            proposedState := 1
-            stateChangeRequested := true
-        else if activeBreakDown and not activeBreakUp
-            proposedState := -1
-            stateChangeRequested := true
-
-        if stateChangeRequested
-            pendingReversal := 0
-            pendingReversalBar := na
-            bullishConfirmationArmed := false
-            bearishConfirmationArmed := false
-
-    // Stable sensitivities 1-4 retain the deliberately slow two-stage reversal.
-    else if useTwoStageStructure
-        if activeBreakUp and not activeBreakDown
-            if structureState == 1
-                // Bullish continuation cancels an unfinished bearish reversal.
-                if pendingReversal == -1
-                    pendingReversal := 0
-                    pendingReversalBar := na
-                    bearishConfirmationArmed := false
-            else
-                // Current regime is bearish.
-                if pendingReversal != 1
-                    pendingReversal := 1
-                    pendingReversalBar := bar_index
-                    bullishConfirmationArmed := false
-                    bearishConfirmationArmed := false
-                    bullishChochCandidate := true
-                else if bullishConfirmationArmed
-                    proposedState := 1
-                    proposedRangeTop := na
-                    proposedRangeBottom := na
-                    stateChangeRequested := true
-                    bullishBosConfirmed := true
-                    pendingReversal := 0
-                    pendingReversalBar := na
-                    bullishConfirmationArmed := false
-                    bearishConfirmationArmed := false
-
-        if activeBreakDown and not activeBreakUp
-            if structureState == -1
-                // Bearish continuation cancels an unfinished bullish reversal.
-                if pendingReversal == 1
-                    pendingReversal := 0
-                    pendingReversalBar := na
-                    bullishConfirmationArmed := false
-            else
-                // Current regime is bullish.
-                if pendingReversal != -1
-                    pendingReversal := -1
-                    pendingReversalBar := bar_index
-                    bearishConfirmationArmed := false
-                    bullishConfirmationArmed := false
-                    bearishChochCandidate := true
-                else if bearishConfirmationArmed
-                    proposedState := -1
-                    proposedRangeTop := na
-                    proposedRangeBottom := na
-                    stateChangeRequested := true
-                    bearishBosConfirmed := true
-                    pendingReversal := 0
-                    pendingReversalBar := na
-                    bullishConfirmationArmed := false
-                    bearishConfirmationArmed := false
-
-    // Sensitivities 5-10 are genuinely reactive: one opposite protected-level
-    // close is enough to reverse the box. What counts as the protected level gets
-    // progressively faster as sensitivity rises.
-    else
-        if activeBreakUp and not activeBreakDown
-            if structureState != 1
-                proposedState := 1
-                proposedRangeTop := na
-                proposedRangeBottom := na
-                stateChangeRequested := true
-                bullishBosConfirmed := true
-            pendingReversal := 0
-            pendingReversalBar := na
-            bullishConfirmationArmed := false
-            bearishConfirmationArmed := false
-
-        else if activeBreakDown and not activeBreakUp
-            if structureState != -1
-                proposedState := -1
-                proposedRangeTop := na
-                proposedRangeBottom := na
-                stateChangeRequested := true
-                bearishBosConfirmed := true
-            pendingReversal := 0
-            pendingReversalBar := na
-            bullishConfirmationArmed := false
-            bearishConfirmationArmed := false
-
-    // True RANGE is independent of CHoCH. It only starts when no directional
-    // break happened and the filtered structure forms a contained LH + HL pair.
-    if not stateChangeRequested and not activeBreakUp and not activeBreakDown and actualRangeCandidate
-        proposedState := 2
-        proposedRangeTop := prevHigh
-        proposedRangeBottom := prevLow
-        stateChangeRequested := true
-        pendingReversal := 0
-        pendingReversalBar := na
-        bullishConfirmationArmed := false
-        bearishConfirmationArmed := false
-
-bool stateChanged = stateChangeRequested and proposedState != structureState
-
-if stateChanged
-    structureState := proposedState
-    rangeTop := proposedRangeTop
-    rangeBottom := proposedRangeBottom
-
-    if structureState != 2
-        rangeTop := na
-        rangeBottom := na
+    array.push(asiaRangeMemory, thisRange)
+    if array.size(asiaRangeMemory) > RANGE_MEMORY
+        array.shift(asiaRangeMemory)
 
 // ─────────────────────────────────────────────────────────────────────────────
-
-// 4) Persistent phase boxes
-
+// London confirmation / invalidation
 //
+// The bias itself never changes once locked - that is the whole point of a daily
+// filter. What CAN change is whether London agreed with it. Both outcomes are
+// published so you can trade the agreement or fade the failure.
+// ─────────────────────────────────────────────────────────────────────────────
+bool biasActive = dayBias != 0 and not inAsia and not na(dayLockBar) and bar_index >= dayLockBar
 
-// One continuous box per structural regime. Continuation BOS does not split it.
+bool londonConfirmed   = false
+bool londonInvalidated = false
 
-// RANGE is reserved for an actual contained LH + HL structure.
-
-// CHoCH alone never creates a gray box, and fast internal swings never split directional boxes.
+if biasActive and inLondon and not biasResolved
+    if dayBias == 1
+        if close > dayHigh
+            londonState  := 1
+            biasResolved := true
+            londonConfirmed := true
+        else if close < dayLow
+            londonState  := -1
+            biasResolved := true
+            londonInvalidated := true
+    else if dayBias == -1
+        if close < dayLow
+            londonState  := 1
+            biasResolved := true
+            londonConfirmed := true
+        else if close > dayHigh
+            londonState  := -1
+            biasResolved := true
+            londonInvalidated := true
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Drawing helpers
+// ─────────────────────────────────────────────────────────────────────────────
+f_biasColor(int b) =>
+    b == 1 ? bullColor : b == -1 ? bearColor : neutralColor
 
-var box activeBox = na
+f_biasText(int b) =>
+    b == 1 ? "BULLISH" : b == -1 ? "BEARISH" : b == 2 ? "NEUTRAL" : ""
 
-var float phaseTop = na
+f_trimBoxes(array<box> a, int keep) =>
+    while array.size(a) > keep
+        box.delete(array.shift(a))
 
-var float phaseBottom = na
+f_trimLines(array<line> a, int keep) =>
+    while array.size(a) > keep
+        line.delete(array.shift(a))
 
-if stateChanged
+f_trimLabels(array<label> a, int keep) =>
+    while array.size(a) > keep
+        label.delete(array.shift(a))
 
-    if showStateBoxes and not na(activeBox)
+var array<box>   asiaBoxes  = array.new<box>()
+var array<box>   biasBoxes  = array.new<box>()
+var array<line>  highLines  = array.new<line>()
+var array<line>  lowLines   = array.new<line>()
+var array<label> biasLabels = array.new<label>()
 
-        box.set_right(activeBox, bar_index)
+var box   curAsiaBox = na
+var box   curBiasBox = na
+var line  curHighLine = na
+var line  curLowLine  = na
+var float biasBoxTop  = na
+var float biasBoxBot  = na
 
-    if showStateBoxes
-
-        color phaseColor = f_stateColor(structureState)
-
-        float newTop = structureState == 2 and not na(rangeTop) ? rangeTop : high
-
-        float newBottom = structureState == 2 and not na(rangeBottom) ? rangeBottom : low
-
-        phaseTop := newTop
-
-        phaseBottom := newBottom
-
-        activeBox := box.new(
-
-             left = bar_index,
-
-             top = newTop,
-
-             right = bar_index,
-
-             bottom = newBottom,
-
-             xloc = xloc.bar_index,
-
-             bgcolor = color.new(phaseColor, boxTransparency),
-
-             border_color = phaseColor,
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Asian range box - drawn live as the session forms
+// ─────────────────────────────────────────────────────────────────────────────
+if showAsiaBox and tfOk
+    if asiaOpened
+        curAsiaBox := box.new(bar_index, high, bar_index, low,
+             xloc         = xloc.bar_index,
+             bgcolor      = color.new(asiaColor, math.min(99, boxTransp + 4)),
+             border_color = color.new(asiaColor, 40),
              border_style = line.style_dotted,
-
              border_width = 1,
+             text         = "ASIA",
+             text_color   = color.new(asiaColor, 25),
+             text_size    = size.tiny,
+             text_halign  = text.align_left,
+             text_valign  = text.align_top)
+        array.push(asiaBoxes, curAsiaBox)
+        f_trimBoxes(asiaBoxes, historyDays)
 
-             text = f_stateText(structureState),
+    if inAsia and not na(curAsiaBox)
+        box.set_right(curAsiaBox, bar_index)
+        box.set_top(curAsiaBox, asiaHigh)
+        box.set_bottom(curAsiaBox, asiaLow)
 
-             text_color = phaseColor,
+// ─────────────────────────────────────────────────────────────────────────────
+// Bias box - one per day, from the Asian close to the London close
+// ─────────────────────────────────────────────────────────────────────────────
+if biasLocked and tfOk
+    color bc = f_biasColor(dayBias)
 
-             text_size = size.tiny,
+    if showBiasBox
+        biasBoxTop := high
+        biasBoxBot := low
+        curBiasBox := box.new(bar_index, high, bar_index, low,
+             xloc         = xloc.bar_index,
+             bgcolor      = color.new(bc, boxTransp),
+             border_color = color.new(bc, 30),
+             border_style = line.style_solid,
+             border_width = 1,
+             text         = f_biasText(dayBias) + (dayCompressed ? "  ·  COMPRESSED" : ""),
+             text_color   = bc,
+             text_size    = size.small,
+             text_halign  = text.align_left,
+             text_valign  = dayBias == 1 ? text.align_top : text.align_bottom)
+        array.push(biasBoxes, curBiasBox)
+        f_trimBoxes(biasBoxes, historyDays)
 
-             text_halign = text.align_left,
+        label lb = label.new(bar_index, dayBias == 1 ? low : high,
+             text      = (dayBias == 1 ? "▲ " : "▼ ") + str.tostring(math.round(math.abs(dayScore) * 100)) + "%",
+             xloc      = xloc.bar_index,
+             yloc      = yloc.price,
+             style     = dayBias == 1 ? label.style_label_up : label.style_label_down,
+             color     = color.new(bc, 15),
+             textcolor = color.white,
+             size      = size.tiny)
+        array.push(biasLabels, lb)
+        f_trimLabels(biasLabels, historyDays)
 
-             text_valign = text.align_top)
+    if showLevels
+        curHighLine := line.new(asiaStartBar, dayHigh, bar_index, dayHigh,
+             xloc = xloc.bar_index, color = color.new(bc, 35), width = 1, style = line.style_solid)
+        curLowLine := line.new(asiaStartBar, dayLow, bar_index, dayLow,
+             xloc = xloc.bar_index, color = color.new(bc, 35), width = 1, style = line.style_solid)
+        array.push(highLines, curHighLine)
+        array.push(lowLines,  curLowLine)
+        f_trimLines(highLines, historyDays)
+        f_trimLines(lowLines,  historyDays)
 
-if showStateBoxes and not na(activeBox)
+// Extend the live day's drawings until London closes, then freeze them. Without
+// this the box would keep growing through the New York session and into the next
+// Asian open, which is what made the old boxes look like they never ended.
+if londonClosed
+    dayDone := true
 
-    box.set_right(activeBox, bar_index)
+bool extendDay = biasActive and not dayDone and tfOk
 
-    if structureState == 2 and not na(rangeTop) and not na(rangeBottom)
-        phaseTop := rangeTop
-        phaseBottom := rangeBottom
+if extendDay
+    if showBiasBox and not na(curBiasBox)
+        biasBoxTop := na(biasBoxTop) ? high : math.max(biasBoxTop, high)
+        biasBoxBot := na(biasBoxBot) ? low  : math.min(biasBoxBot, low)
+        box.set_right(curBiasBox, bar_index)
+        box.set_top(curBiasBox, biasBoxTop)
+        box.set_bottom(curBiasBox, biasBoxBot)
+    if showLevels and not na(curHighLine)
+        line.set_x2(curHighLine, bar_index)
+        line.set_x2(curLowLine,  bar_index)
+
+// Toggling a drawing off should remove what is already on the chart, not leave
+// orphans behind.
+if not showAsiaBox and array.size(asiaBoxes) > 0
+    f_trimBoxes(asiaBoxes, 0)
+    curAsiaBox := na
+if not showBiasBox and array.size(biasBoxes) > 0
+    f_trimBoxes(biasBoxes, 0)
+    f_trimLabels(biasLabels, 0)
+    curBiasBox := na
+if not showLevels and array.size(highLines) > 0
+    f_trimLines(highLines, 0)
+    f_trimLines(lowLines, 0)
+    curHighLine := na
+    curLowLine  := na
+
+// Mark the bar where London resolved the bias.
+plotshape(londonConfirmed and dayBias == 1,  "London Confirms Bull", shape.triangleup,
+     location.belowbar, color.new(bullColor, 0), size = size.tiny)
+plotshape(londonConfirmed and dayBias == -1, "London Confirms Bear", shape.triangledown,
+     location.abovebar, color.new(bearColor, 0), size = size.tiny)
+plotshape(londonInvalidated, "London Invalidates Bias", shape.xcross,
+     location.abovebar, color.new(neutralColor, 0), size = size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bias panel
+// ─────────────────────────────────────────────────────────────────────────────
+var table panel = table.new(position.top_right, 2, 7,
+     border_width = 1, border_color = color.new(color.gray, 60), frame_width = 1, frame_color = color.new(color.gray, 60))
+
+f_panelRow(int r, string k, string v, color c) =>
+    table.cell(panel, 0, r, k, text_size = size.tiny, text_color = color.new(color.gray, 20), text_halign = text.align_left, bgcolor = color.new(color.black, 85))
+    table.cell(panel, 1, r, v, text_size = size.tiny, text_color = c, text_halign = text.align_right, bgcolor = color.new(color.black, 85))
+
+if showTable and barstate.islast
+    if not tfOk
+        table.cell(panel, 0, 0, "Use an intraday chart (5m-1h)", text_size = size.small, text_color = bearColor, bgcolor = color.new(color.black, 80))
     else
-        phaseTop := na(phaseTop) ? high : math.max(phaseTop, high)
-        phaseBottom := na(phaseBottom) ? low : math.min(phaseBottom, low)
+        int   shownBias  = inAsia ? liveBias : dayBias
+        float shownScore = inAsia ? biasScore : dayScore
+        color shownColor = f_biasColor(shownBias)
 
-    box.set_top(activeBox, phaseTop)
-
-    box.set_bottom(activeBox, phaseBottom)
-
-// If boxes are disabled after one already exists, hide the active one rather
-
-// than continuing to update it visibly.
-
-if not showStateBoxes and not na(activeBox)
-
-    box.delete(activeBox)
-
-    activeBox := na
+        f_panelRow(0, inAsia ? "ASIA — LIVE" : "TODAY — LOCKED",
+             shownBias == 0 ? "forming…" : f_biasText(shownBias), shownColor)
+        f_panelRow(1, "Conviction",
+             na(shownScore) ? "—" : str.tostring(math.round(math.abs(shownScore) * 100)) + "%", shownColor)
+        f_panelRow(2, "Location",
+             na(fLocation) ? "—" : str.tostring(fLocation, "#.00"), nz(fLocation) >= 0 ? bullColor : bearColor)
+        f_panelRow(3, "Drive",
+             na(fDrive) ? "—" : str.tostring(fDrive, "#.00"), nz(fDrive) >= 0 ? bullColor : bearColor)
+        f_panelRow(4, "VWAP acceptance",
+             na(fVwap) ? "—" : str.tostring(fVwap, "#.00"), nz(fVwap) >= 0 ? bullColor : bearColor)
+        f_panelRow(5, "Sequence",
+             fSequence > 0 ? "low → high" : fSequence < 0 ? "high → low" : "—",
+             fSequence >= 0 ? bullColor : bearColor)
+        f_panelRow(6, "Asia range",
+             na(dayRangePct) ? "—" : str.tostring(math.round(dayRangePct)) + "% of avg" + (dayCompressed ? "  ⚑" : ""),
+             dayCompressed ? #f2b705 : color.new(color.gray, 20))
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Filter outputs
+//
+// "Daily Bias" is the one to feed into a strategy or reference with
+// request.security. It is 0 until the Asian close and then holds +1 or -1 for the
+// remainder of the day - a genuine daily filter, not a per-bar opinion.
+// ─────────────────────────────────────────────────────────────────────────────
+float biasOut     = biasActive and dayBias == 1 ? 1.0 : biasActive and dayBias == -1 ? -1.0 : 0.0
+float liveBiasOut = inAsia and liveBias == 1 ? 1.0 : inAsia and liveBias == -1 ? -1.0 : 0.0
 
+plot(biasOut,                           "Daily Bias (+1/-1)",            display = display.data_window)
+plot(liveBiasOut,                       "Live Asia Bias (+1/-1)",        display = display.data_window)
+plot(na(dayScore) ? 0.0 : math.abs(dayScore), "Bias Conviction (0-1)",   display = display.data_window)
+plot(biasScore,                         "Bias Score (-1..+1)",           display = display.data_window)
+plot(float(londonState),                "London State (+1 conf/-1 inv)", display = display.data_window)
+plot(dayCompressed ? 1.0 : 0.0,         "Asia Compressed (0/1)",         display = display.data_window)
+plot(dayRangePct,                       "Asia Range (% of avg)",         display = display.data_window)
+
+plot(fLocation, "Factor: Location", display = display.data_window)
+plot(fDrive,    "Factor: Drive",    display = display.data_window)
+plot(fVwap,     "Factor: VWAP",     display = display.data_window)
+plot(fSequence, "Factor: Sequence", display = display.data_window)
+
+plot(biasActive ? dayHigh : na, "Asia High", display = display.data_window)
+plot(biasActive ? dayLow  : na, "Asia Low",  display = display.data_window)
+plot(biasActive ? dayMid  : na, "Asia Mid",  display = display.data_window)
+plot(asiaVwap,                  "Asia VWAP", display = display.data_window)
+
+plot(inAsia   ? 1.0 : 0.0, "In Asia",   display = display.data_window)
+plot(inLondon ? 1.0 : 0.0, "In London", display = display.data_window)
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Alerts
-
 // ─────────────────────────────────────────────────────────────────────────────
-
-bool bullishStateChange = stateChanged and structureState == 1
-
-bool bearishStateChange = stateChanged and structureState == -1
-bool rangeStateChange = stateChanged and structureState == 2
-
-alertcondition(bullishChochCandidate, "Bullish CHoCH Candidate", "Bullish CHoCH candidate formed; waiting for confirmation BOS")
-alertcondition(bearishChochCandidate, "Bearish CHoCH Candidate", "Bearish CHoCH candidate formed; waiting for confirmation BOS")
-alertcondition(bullishBosConfirmed, "Bullish Direction Confirmed", "Bullish direction confirmed by the active structure engine")
-alertcondition(bearishBosConfirmed, "Bearish Direction Confirmed", "Bearish direction confirmed by the active structure engine")
-alertcondition(bullishStateChange, "Bullish Structure", "Filtered swing structure turned BULLISH")
-alertcondition(bearishStateChange, "Bearish Structure", "Filtered swing structure turned BEARISH")
-alertcondition(rangeStateChange, "Range Structure", "Filtered swing structure entered a contained RANGE")
-
+alertcondition(biasLocked and dayBias ==  1, "Daily Bias Bullish", "Asian session closed BULLISH - bias locked for the day")
+alertcondition(biasLocked and dayBias == -1, "Daily Bias Bearish", "Asian session closed BEARISH - bias locked for the day")
+alertcondition(biasLocked and dayCompressed, "Asia Compressed",    "Asian range closed compressed versus its 20-day average")
+alertcondition(londonConfirmed,              "London Confirms",    "London broke the Asian range in the direction of the locked bias")
+alertcondition(londonInvalidated,            "London Invalidates", "London broke the Asian range against the locked bias")
