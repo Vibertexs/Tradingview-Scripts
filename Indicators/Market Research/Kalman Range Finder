@@ -1,510 +1,1067 @@
 //@version=6
-// Range Finder [Kalman] v6 — Horizontal-Gated Single Range
+// Range Finder [Kalman] v5.6 — Selectable HTF Structure + Chart-TF Reaction
 //
-// v6 is a logic redesign of the detection layer, not a threshold tweak.
+// v5.6 changes the MTF architecture:
+//   • Structure Timeframe is now an explicit input (e.g. 60 = 1H).
+//   • You can keep the TradingView chart on 1m/3m/5m/etc.
+//   • Range detection, breakout confirmation, profile, pullback candidate ranking,
+//     and adaptive candidate history are calculated from CONFIRMED structure-TF bars.
+//   • The chart timeframe is used only to judge the live retest/rejection/acceptance.
+//   • HTF data uses the non-repainting request.security(..., expression[1],
+//     lookahead = barmerge.lookahead_on) pattern.
+//   • A wick through the hard invalidation is allowed. A CLOSED chart-TF candle
+//     through the hard invalidation kills the entry setup.
 //
-// THREE PROBLEMS v5.3 HAD
-//
-// 1. New ranges were built out of the old range.
-//    rollingTop/rollingBottom are ta.highest/ta.lowest over winLen bars. After a
-//    break, that window still straddled the old range AND the impulse leg for
-//    winLen bars. The 3-bar cooldown expired long before the window was clean, so
-//    the "new" range inherited the old boundaries and the breakout candle's spike,
-//    and then immediately broke again. That is the doubled bear break in shot 1.
-//
-// 2. Horizontality was optional.
-//    The old score was 6 fungible votes needing 4. A structure could FAIL slope,
-//    FAIL drift and FAIL efficiency, pass width + overlap + atr ratio, and still be
-//    accepted. So raising Sensitivity did not find more horizontal ranges — it
-//    found more diagonal ones. That is every false box in shot 2.
-//
-// 3. Nothing tested shelf SHAPE.
-//    Every measurement was an aggregate over the whole window. A rising staircase
-//    leg and a true shelf can have identical width, overlap and ATR ratio. What
-//    separates them is WHERE price spent its time, and no test looked at that.
-//
-// WHAT v6 DOES
-//
-//   A. CLEAN WINDOW. A new range cannot be seeded until the entire detection
-//      window sits after the last break. Cooldown is now winLen bars, not 3.
-//      Candidate evaluation itself is suppressed while the window is dirty, so a
-//      contaminated bar cannot even build confirmation streak.
-//
-//   B. TWO-TIER ACCEPTANCE. Criteria are split by what they mean:
-//        MANDATORY (all four must pass — these define "horizontal"):
-//          slope, net drift, split-half overlap, two-sided occupancy
-//        VOTES (N of four — these describe "clean/quiet"):
-//          efficiency, ATR ratio, width, bar-to-bar overlap
-//      Sensitivity widens the mandatory thresholds and lowers the vote count.
-//      It can never let a structure skip a mandatory gate. Up = more horizontal
-//      ranges, not more sloped ones.
-//
-//   C. SHELF GEOMETRY. Two new tests do the actual discrimination:
-//        Split-Half Overlap — the older half and recent half of the window must
-//        occupy the SAME price band. A staircase leg fails hard; a shelf scores
-//        0.8-1.0.
-//        Two-Sided Occupancy — price must visit BOTH the top edge and the bottom
-//        edge in BOTH halves of the window. A leg touches one edge early and the
-//        other edge late and fails. A shelf fills all four quadrants.
-//
-//   D. FEWER SETTINGS. Absorb Rejected Probes, Breakout Escape Cap and Show
-//      Adaptation Moves are gone — folded into constants at their good values.
-//      Range Detection is two knobs plus the resize toggle, and the two knobs are
-//      now orthogonal: Size sets the time scale, Sensitivity sets the tolerance.
-//
-// Kalman filter, probe/confirmation split, wick absorption, escape logic,
-// profile, outputs and drawing style are unchanged from v5.3.
+// Research-informed pullback candidates remain:
+//   1. broken range edge / SR flip
+//   2. nearest Forex round number
+//   3. prior value-area edge
+//   4. prior range POC
 //
 // CC BY-NC-SA 4.0
 // https://creativecommons.org/licenses/by-nc-sa/4.0/
-
-indicator("Range Finder [Kalman] v6 - Horizontal Range", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 750)
+indicator("Range Finder [Kalman] v5.6 - Selectable HTF Structure", overlay = true,
+     max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 750)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Inputs
 // ─────────────────────────────────────────────────────────────────────────────
+var string G_MTF  = "Multi-Timeframe"
 var string G_CORE = "Range Detection"
 var string G_BRK  = "Breakout"
 var string G_PROF = "Value Area Profile"
+var string G_PB   = "Pullback Zone (SD / SR)"
+var string G_ENT  = "Chart-TF Entry / Reaction"
 var string G_STY  = "Style"
 
-rangeSize        = input.int(5, "Range Size", minval = 1, maxval = 10, group = G_CORE,
-     tooltip = "TIME SCALE ONLY. How many bars of structure must qualify. 1 is ~6 bars, 5 is ~20, 10 is ~93. This knob does not affect how strict detection is - larger windows are naturally harder to keep horizontal, which is the correct behaviour.")
-rangeSensitivity = input.int(7, "Range Sensitivity", minval = 1, maxval = 10, group = G_CORE,
-     tooltip = "TOLERANCE ONLY. How much slope, drift and shape distortion a horizontal range may carry. Raising this loosens the horizontality thresholds - it never lets a sloped structure skip them. Raise it if true shelves are being missed; lower it if boxes appear on trending legs.")
+structureTf = input.timeframe("60", "Structure Timeframe", group = G_MTF,
+     tooltip = "The timeframe that creates ranges, breakouts and SD/SR pullback zones. Example: choose 60 for 1H while viewing a 5m chart. Structure data uses confirmed candles only.")
+showTfBadge = input.bool(true, "Show MTF Status Badge", group = G_MTF)
 
-adaptiveResize = input.bool(true, "Auto Resize To Latest Shelf", group = G_CORE,
-     tooltip = "While a range is live, move that SAME box to the latest confirmed nested shelf. The shelf must be at least 15% tighter than the current range and must pass the full horizontality gate, so the box no longer creeps inward on trending structure.")
+rangeSize = input.int(5, "Range Size", minval = 1, maxval = 10, group = G_CORE,
+     tooltip = "1≈6 structure bars, 5≈20, 10≈93. The unit is the selected Structure Timeframe, not the chart timeframe.")
+rangeSensitivity = input.int(7, "Range Sensitivity", minval = 1, maxval = 10, group = G_CORE)
+adaptiveResize = input.bool(true, "Auto Resize To Latest Shelf", group = G_CORE)
 
-escapePct    = input.float(15.0, "Breakout Escape (% of range)", minval = 2.0, maxval = 60.0, step = 1.0, group = G_BRK,
-     tooltip = "How far past the boundary a close must travel to confirm a break, as a share of range height.")
-showTriggers = input.bool(true, "Show Trigger Levels", group = G_BRK,
-     tooltip = "Draws the exact prices a break confirms at, on every bar the range is live.")
-showProbes   = input.bool(true, "Show Probe Markers", group = G_BRK,
-     tooltip = "Triangle on the first close outside the range. Fast trigger, not a confirmed verdict.")
+absorbProbes = input.bool(true, "Absorb Rejected Probes", group = G_BRK)
+escapePct = input.float(15.0, "Breakout Escape (% of range)", minval = 2.0, maxval = 60.0, step = 1.0, group = G_BRK)
+escapeCapAtr = input.float(1.50, "Breakout Escape Cap (HTF ATR)", minval = 0.0, maxval = 5.0, step = 0.25, group = G_BRK)
+showTriggers = input.bool(true, "Show HTF Trigger Levels", group = G_BRK)
+showProbes = input.bool(true, "Show Confirmed HTF Probe Markers", group = G_BRK)
 
-profileBasis   = input.string("Time (TPO)", "Profile Basis", options = ["Off", "Time (TPO)", "Volume"], group = G_PROF,
-     tooltip = "Time counts bars per price level and works everywhere. Volume is only meaningful where volume is real.")
-profileRows    = input.int(24, "Profile Rows", minval = 6, maxval = 100, group = G_PROF)
-valueAreaPct   = input.float(70.0, "Value Area %", minval = 30.0, maxval = 95.0, step = 5.0, group = G_PROF)
+profileBasis = input.string("Time (TPO)", "Profile Basis", options = ["Off", "Time (TPO)", "Volume"], group = G_PROF,
+     tooltip = "Profile is built from confirmed Structure-Timeframe bars. TPO remains the safer default for spot FX.")
+profileRows = input.int(24, "Profile Rows", minval = 6, maxval = 100, group = G_PROF)
+valueAreaPct = input.float(70.0, "Value Area %", minval = 30.0, maxval = 95.0, step = 5.0, group = G_PROF)
 
-showBoxes       = input.bool(true, "Show Range Boxes", group = G_STY)
-showBreakLabels = input.bool(true, "Show Breakout Labels", group = G_STY)
-boxTransp       = input.int(90, "Range Fill Transparency", minval = 0, maxval = 100, group = G_STY)
-rangeColor      = input.color(#787B86, "Range", group = G_STY)
-profileColor    = input.color(#F2B705, "POC / Value Area", group = G_STY)
-bullColor       = input.color(#26A69A, "Bullish Breakout", group = G_STY)
-bearColor       = input.color(#EF5350, "Bearish Breakout", group = G_STY)
+showPullbackZone = input.bool(true, "Show Most-Likely Pullback Zone", group = G_PB)
+pullbackHorizon = input.int(40, "Evaluation Horizon (HTF bars)", minval = 5, maxval = 300, group = G_PB)
+pullbackZoneAtr = input.float(0.18, "Base Zone Half-Width (HTF ATR)", minval = 0.05, maxval = 1.00, step = 0.01, group = G_PB)
+pullbackZoneRangePct = input.float(3.0, "Minimum Half-Width (% of range)", minval = 0.0, maxval = 20.0, step = 0.5, group = G_PB)
+pullbackMaxHalfAtr = input.float(0.45, "Maximum Base Half-Width (HTF ATR)", minval = 0.10, maxval = 2.00, step = 0.05, group = G_PB)
+pullbackReactionAtr = input.float(0.75, "Historical Success Reaction (HTF ATR)", minval = 0.10, maxval = 3.00, step = 0.05, group = G_PB)
+pullbackInvalidAtr = input.float(0.25, "Hard Invalidation Beyond Zone (HTF ATR)", minval = 0.0, maxval = 2.00, step = 0.05, group = G_PB)
+pullbackHistoryWeight = input.float(55.0, "Completed-History Weight (%)", minval = 0.0, maxval = 100.0, step = 5.0, group = G_PB,
+     tooltip = "Adaptive history is evaluated on the selected Structure Timeframe so the ranked HTF zone stays consistent when you switch between lower chart timeframes.")
+pullbackMinSamples = input.int(8, "Samples For Full History Weight", minval = 2, maxval = 100, group = G_PB)
+useForexRoundNumbers = input.bool(true, "Use 00 / 50-Pip Confluence", group = G_PB)
+roundNumberPips = input.int(50, "Round-Number Interval (pips)", minval = 5, maxval = 500, step = 5, group = G_PB)
+mergePullbackConfluence = input.bool(false, "Merge Nearby Confluence", group = G_PB)
+keepHistoricalPullbackZones = input.bool(true, "Keep Completed Pullback Zones", group = G_PB)
+showPullbackLabels = input.bool(true, "Show Pullback Labels", group = G_PB)
+
+useChartReaction = input.bool(true, "Use Chart Timeframe For Entry Confirmation", group = G_ENT,
+     tooltip = "ON = the timeframe currently open in TradingView judges the HTF zone. Example: Structure TF=1H and chart=5m means 1H creates the zone and closed 5m candles judge the retest.")
+reclaimMode = input.string("Midpoint", "Required Reclaim", options = ["Midpoint", "Outer Edge", "Off"], group = G_ENT)
+entryReactionAtr = input.float(0.25, "Entry Displacement (Chart-TF ATR)", minval = 0.05, maxval = 2.00, step = 0.05, group = G_ENT)
+requireMicroBreak = input.bool(true, "Require Micro Structure Break", group = G_ENT)
+microLookback = input.int(3, "Micro Structure Lookback (chart bars)", minval = 1, maxval = 10, group = G_ENT)
+acceptanceDepthPct = input.float(65.0, "Acceptance Depth (% through zone)", minval = 25.0, maxval = 100.0, step = 5.0, group = G_ENT)
+acceptanceCloses = input.int(2, "Closes For Acceptance Warning", minval = 1, maxval = 5, group = G_ENT)
+maxReactionBars = input.int(6, "Max Chart Bars To Confirm", minval = 1, maxval = 30, group = G_ENT)
+minReactionScore = input.float(60.0, "Minimum Reaction Score", minval = 0.0, maxval = 100.0, step = 5.0, group = G_ENT)
+showHardInvalidation = input.bool(true, "Show Hard Invalidation Line", group = G_ENT)
+
+showBoxes = input.bool(true, "Show HTF Range Boxes", group = G_STY)
+showAdaptationTrace = input.bool(true, "Show HTF Adaptation Moves", group = G_STY)
+showBreakLabels = input.bool(true, "Show HTF Breakout Labels", group = G_STY)
+boxTransp = input.int(90, "Range Fill Transparency", minval = 0, maxval = 100, group = G_STY)
+rangeColor = input.color(#787B86, "Range", group = G_STY)
+profileColor = input.color(#F2B705, "POC / Value Area", group = G_STY)
+bullColor = input.color(#26A69A, "Bullish", group = G_STY)
+bearColor = input.color(#EF5350, "Bearish", group = G_STY)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constants  (former inputs folded in at their good values)
+// Constants / scale
 // ─────────────────────────────────────────────────────────────────────────────
-float MAX_GROWTH       = 2.00
-float WICK_ABSORB_ATR  = 1.00
+float MAX_GROWTH = 2.00
+float WICK_ABSORB_ATR = 1.00
 float BACKFILL_TOL_ATR = 0.25
-int   MIN_PROBE_BARS   = 2
-float KALMAN_WEIGHT    = 0.40
-int   PROFILE_MAX_BARS = 500
-float ESCAPE_CAP_ATR   = 1.50   // was an input; off-default was never useful
-bool  ABSORB_PROBES    = true   // was an input; off made ranges break constantly
-float EDGE_ZONE_FRAC   = 0.22   // top/bottom band width for occupancy counting
-float SHELF_TIGHTEN    = 0.85   // a resize target must be this much tighter
+int MIN_PROBE_BARS = 2
+int COOLDOWN_BARS = 3
+float KALMAN_WEIGHT = 0.40
+int PROFILE_MAX_BARS = 500
+int PULLBACK_MAX_EVENTS = 100
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Scale — Range Size maps to window length only.
-//   1=6, 2=8, 3=11, 4=15, 5=20, 6=28, 7=37, 8=51, 9=69, 10=93
-// ─────────────────────────────────────────────────────────────────────────────
-float z        = float(rangeSize)
+float z = float(rangeSize)
 float scalePos = (z - 1.0) / 9.0
-int   winLen   = int(math.round(6.0 * math.pow(93.0 / 6.0, scalePos)))
-int   halfLen  = winLen >= 4 ? winLen / 2 : 2
-
-int   anchorLookback = math.min(500, winLen * 8)
-int   confirmWindow  = math.max(6, int(math.round(winLen * 0.33)))
-float escapeFrac     = escapePct / 100.0
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tolerances — Range Sensitivity only.
-//
-// Split by role. The mandatory group defines horizontality and is never skipped.
-// The vote group describes consolidation quality and is partially skippable.
-// ─────────────────────────────────────────────────────────────────────────────
+int winLen = int(math.round(6.0 * math.pow(93.0 / 6.0, scalePos)))
+int anchorLookback = math.min(500, winLen * 8)
+int confirmWindow = math.max(6, int(math.round(winLen * 0.33)))
+float escapeFrac = escapePct / 100.0
 float s = float(rangeSensitivity)
-
-// mandatory horizontality tolerances
-float maxSlopeAtr     = 0.012 + s * 0.0075   //  1: 0.020   7: 0.065   10: 0.087
-float maxDrift        = 0.200 + s * 0.0280   //  1: 0.228   7: 0.396   10: 0.480
-float minHalfOverlap  = 0.800 - s * 0.0320   //  1: 0.768   7: 0.576   10: 0.480
-int   quadrantsNeeded = rangeSensitivity >= 9 ? 3 : 4
-
-// vote tolerances
-float maxEfficiency = 0.12 + s * 0.030
-float maxAtrRatio   = 0.80 + s * 0.050
-float minOverlap    = 0.70 - s * 0.036
-float widthK        = 1.375
-int   votesNeeded   = rangeSensitivity >= 8 ? 2 : rangeSensitivity >= 5 ? 3 : 4
-
-int   confirmBars    = rangeSensitivity >= 9 ? 2 : rangeSensitivity >= 6 ? 3 : rangeSensitivity >= 3 ? 4 : 5
+float maxEfficiency = 0.14 + s * 0.032
+float maxAtrRatio = 0.80 + s * 0.050
+float minOverlap = 0.68 - s * 0.038
+float maxSlopeAtr = 0.018 + s * 0.011
+float maxDrift = 0.30 + s * 0.035
+float widthK = 1.375
+int confirmBars = rangeSensitivity >= 9 ? 2 : rangeSensitivity >= 6 ? 3 : rangeSensitivity >= 3 ? 4 : 5
 float breakBufferAtr = rangeSensitivity >= 9 ? 0.10 : rangeSensitivity >= 6 ? 0.15 : 0.20
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Measurements
+// Timeframe validation + confirmed structure feed
 // ─────────────────────────────────────────────────────────────────────────────
-float atr         = ta.atr(14)
-float atrSafe     = math.max(atr, syminfo.mintick)
-float atrBaseline = ta.sma(atr, 50)
-float atrRatio    = atr / math.max(nz(atrBaseline, atr), syminfo.mintick)
+float chartTfSeconds = timeframe.in_seconds(timeframe.period)
+float structureTfSeconds = timeframe.in_seconds(structureTf)
+bool structureTfValid = not na(chartTfSeconds) and not na(structureTfSeconds) and structureTfSeconds >= chartTfSeconds
+if not structureTfValid
+    runtime.error("Structure Timeframe must be equal to or higher than the TradingView chart timeframe.")
 
-float rollingTop    = ta.highest(high, winLen)
-float rollingBottom = ta.lowest(low, winLen)
-float rollingWidth  = math.max(rollingTop - rollingBottom, syminfo.mintick)
-float widthAtr      = rollingWidth / atrSafe
+// Canonical non-repainting HTF request: use the PREVIOUS confirmed structure bar
+// and lookahead_on. Values update once at the start of each new structure period.
+[sReqO, sReqH, sReqL, sReqC, sReqV, sReqTime, sReqCloseTime] = request.security(
+     syminfo.tickerid, structureTf,
+     [open[1], high[1], low[1], close[1], volume[1], time[1], time_close[1]],
+     lookahead = barmerge.lookahead_on)
 
-float path       = ta.sma(math.abs(close - close[1]), winLen) * winLen
-float efficiency = math.abs(close - close[winLen]) / math.max(path, syminfo.mintick)
-
-float lrNow      = ta.linreg(close, winLen, 0)
-float lrPrev     = ta.linreg(close, winLen, 1)
-float lrSlopeAtr = math.abs(lrNow - lrPrev) / atrSafe
-
-float overlapAmount = math.max(0.0, math.min(high, high[1]) - math.max(low, low[1]))
-float overlapBase   = math.max(math.min(high - low, high[1] - low[1]), syminfo.mintick)
-float barOverlap    = math.min(1.0, overlapAmount / overlapBase)
-float avgOverlap    = ta.sma(barOverlap, winLen)
-
-float driftRatio      = math.abs(close - close[winLen]) / rollingWidth
-float positionInRange = (close - rollingBottom) / rollingWidth
-bool  notPinnedToEdge = positionInRange > 0.05 and positionInRange < 0.95
+var int lastProcessedStructTime = na
+bool newStructData = not na(sReqTime) and (na(lastProcessedStructTime) or sReqTime != lastProcessedStructTime)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SHELF GEOMETRY  (new in v6)
-//
-// Test 1 — Split-Half Overlap.
-// Take the older half and the recent half of the window as two independent
-// price bands. A true shelf revisits the same band in both halves, so the bands
-// nearly coincide. A staircase leg moves its band upward, so the intersection
-// shrinks while the union grows. This is the single cleanest separator between
-// the false boxes and the real one in the second screenshot.
+// Confirmed structure-bar storage. This virtual HTF stream lets the original
+// range/profile/test logic operate independently of the lower chart timeframe.
 // ─────────────────────────────────────────────────────────────────────────────
-float topRecent = ta.highest(high, halfLen)
-float botRecent = ta.lowest(low,  halfLen)
-float topOlder  = ta.highest(high[halfLen], halfLen)
-float botOlder  = ta.lowest(low[halfLen],   halfLen)
+var array<float> sOpenA = array.new_float()
+var array<float> sHighA = array.new_float()
+var array<float> sLowA = array.new_float()
+var array<float> sCloseA = array.new_float()
+var array<float> sVolA = array.new_float()
+var array<int> sTimeA = array.new_int()
+var array<int> sCloseTimeA = array.new_int()
+var array<float> sTrA = array.new_float()
+var array<float> sAtrA = array.new_float()
+var array<float> sKalmanA = array.new_float()
 
-float unionTop = math.max(topRecent, topOlder)
-float unionBot = math.min(botRecent, botOlder)
-float interTop = math.min(topRecent, topOlder)
-float interBot = math.max(botRecent, botOlder)
-float halfOverlap = math.max(0.0, interTop - interBot) / math.max(unionTop - unionBot, syminfo.mintick)
+// Completed pullback outcome statistics, indexed:
+// bull 0..3 Edge/Round/Value/POC, bear 4..7.
+var array<float> pbHistEvents = array.new_float(8, 0.0)
+var array<float> pbHistReached = array.new_float(8, 0.0)
+var array<float> pbHistReacted = array.new_float(8, 0.0)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Test 2 — Two-Sided Occupancy.
-// Divide the window into four quadrants: {top edge, bottom edge} x {older half,
-// recent half}. A range rotates between its boundaries and fills all four. A
-// trending leg fills only the diagonal pair - bottom-older and top-recent for an
-// uptrend - which is exactly the signature of the false boxes.
-// ─────────────────────────────────────────────────────────────────────────────
-float edgeZone = rollingWidth * EDGE_ZONE_FRAC
-
-int qTopRecent = 0
-int qTopOlder  = 0
-int qBotRecent = 0
-int qBotOlder  = 0
-
-if bar_index > winLen
-    for i = 0 to winLen - 1
-        bool isRecent = i < halfLen
-        if high[i] >= rollingTop - edgeZone
-            if isRecent
-                qTopRecent := qTopRecent + 1
-            else
-                qTopOlder := qTopOlder + 1
-        if low[i] <= rollingBottom + edgeZone
-            if isRecent
-                qBotRecent := qBotRecent + 1
-            else
-                qBotOlder := qBotOlder + 1
-
-int quadrantsFilled =
-     (qTopRecent > 0 ? 1 : 0) + (qTopOlder > 0 ? 1 : 0) +
-     (qBotRecent > 0 ? 1 : 0) + (qBotOlder > 0 ? 1 : 0)
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Kalman level + velocity filter
-// ─────────────────────────────────────────────────────────────────────────────
-float qLevel    = math.pow(atrSafe * (0.020 + s * 0.002), 2)
-float qVelocity = math.pow(atrSafe * (0.004 + s * 0.0007), 2)
-float rMeasure  = math.pow(atrSafe * 0.80, 2)
-
-var float kLevel    = na
-var float kVelocity = 0.0
-var float p00 = 1.0
-var float p01 = 0.0
-var float p10 = 0.0
-var float p11 = 1.0
-
-if na(kLevel)
-    kLevel    := close
-    kVelocity := 0.0
-    p00 := rMeasure
-    p01 := 0.0
-    p10 := 0.0
-    p11 := rMeasure
-else
-    float predLevel    = kLevel + kVelocity
-    float predVelocity = kVelocity
-
-    float pp00 = p00 + p01 + p10 + p11 + qLevel
-    float pp01 = p01 + p11
-    float pp10 = p10 + p11
-    float pp11 = p11 + qVelocity
-
-    float innovation         = close - predLevel
-    float innovationVariance = math.max(pp00 + rMeasure, syminfo.mintick * syminfo.mintick)
-    float gainLevel          = pp00 / innovationVariance
-    float gainVelocity       = pp10 / innovationVariance
-
-    kLevel    := predLevel + gainLevel * innovation
-    kVelocity := predVelocity + gainVelocity * innovation
-
-    p00 := (1.0 - gainLevel) * pp00
-    p01 := (1.0 - gainLevel) * pp01
-    p10 := pp10 - gainVelocity * pp00
-    p11 := pp11 - gainVelocity * pp01
-
-float kalmanSlopeAtr   = math.abs(kVelocity) / atrSafe
-float kalmanDriftRatio = not na(kLevel[winLen]) ? math.abs(kLevel - kLevel[winLen]) / rollingWidth : driftRatio
-
-float slopeAtr     = lrSlopeAtr * (1.0 - KALMAN_WEIGHT) + kalmanSlopeAtr * KALMAN_WEIGHT
-float blendedDrift = driftRatio * (1.0 - KALMAN_WEIGHT) + kalmanDriftRatio * KALMAN_WEIGHT
-
-// ─────────────────────────────────────────────────────────────────────────────
-// State  (declared before acceptance so the clean-window rule can see it)
-// ─────────────────────────────────────────────────────────────────────────────
-var bool  inRange = false
-var float rTop    = na
-var float rBot    = na
-var float rSeedW  = na
-var int   rLeft   = na
-var int   rRight  = na
-var int   rejects = 0
-var box   rBox    = na
-
-var int   probeDir  = 0
-var int   probeBars = 0
-var float probeExt  = na
-
-var int   lastBreakBar  = na
-var int   lastResizeBar = na
-var float breakLevel    = na
-
-var line  pocLine  = na
-var line  vahLine  = na
-var line  valLine  = na
-var float pocValue = na
-var float vahValue = na
-var float valValue = na
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CLEAN WINDOW  (new in v6)
-//
-// Every detection measurement above is an aggregate over the last winLen bars.
-// While any of those bars predate the last break, the measurements describe the
-// OLD range plus the impulse that killed it. v5.3 waited 3 bars, which is not
-// enough for any Range Size, and then read that contaminated window as if it
-// were new structure - producing a box built from the old boundaries and the
-// breakout spike, which broke again immediately.
-//
-// The window must now be entirely post-break before a candidate can even be
-// evaluated. Suppressing evaluation (rather than just seeding) also stops the
-// confirmation streak from being banked on dirty bars.
-// ─────────────────────────────────────────────────────────────────────────────
-int  barsSinceBreak = na(lastBreakBar) ? 1000000 : bar_index - lastBreakBar
-bool cleanWindow    = barsSinceBreak >= winLen
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Acceptance — mandatory gates, then quality votes
-// ─────────────────────────────────────────────────────────────────────────────
-bool gateSlope     = slopeAtr     <= maxSlopeAtr
-bool gateDrift     = blendedDrift <= maxDrift
-bool gateShape     = halfOverlap  >= minHalfOverlap
-bool gateOccupancy = quadrantsFilled >= quadrantsNeeded
-
-bool horizontalOk = gateSlope and gateDrift and gateShape and gateOccupancy
-
-int qualityVotes =
-     (efficiency <= maxEfficiency              ? 1 : 0) +
-     (atrRatio   <= maxAtrRatio                ? 1 : 0) +
-     (widthAtr   <= widthK * math.sqrt(winLen) ? 1 : 0) +
-     (avgOverlap >= minOverlap                 ? 1 : 0)
-
-bool rangeCandidate = horizontalOk and qualityVotes >= votesNeeded and
-     notPinnedToEdge and cleanWindow and not na(close[winLen])
-
-var int candidateStreak = 0
-candidateStreak := rangeCandidate ? candidateStreak + 1 : 0
-bool confirmedRangeCandidate = candidateStreak >= confirmBars
+// Unresolved HTF candidate evaluations.
+var array<int> pbEvDir = array.new_int()
+var array<int> pbEvStart = array.new_int()
+var array<int> pbEvExpiry = array.new_int()
+var array<float> pbEvAtr = array.new_float()
+var array<float> pbEvTop0 = array.new_float()
+var array<float> pbEvBot0 = array.new_float()
+var array<float> pbEvTop1 = array.new_float()
+var array<float> pbEvBot1 = array.new_float()
+var array<float> pbEvTop2 = array.new_float()
+var array<float> pbEvBot2 = array.new_float()
+var array<float> pbEvTop3 = array.new_float()
+var array<float> pbEvBot3 = array.new_float()
+var array<bool> pbEvEntered0 = array.new_bool()
+var array<bool> pbEvEntered1 = array.new_bool()
+var array<bool> pbEvEntered2 = array.new_bool()
+var array<bool> pbEvEntered3 = array.new_bool()
+var array<bool> pbEvDone0 = array.new_bool()
+var array<bool> pbEvDone1 = array.new_bool()
+var array<bool> pbEvDone2 = array.new_bool()
+var array<bool> pbEvDone3 = array.new_bool()
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-f_widthCap(nBars) =>
-    widthK * math.sqrt(math.max(nBars, winLen)) * atrSafe
+f_clamp01(x) =>
+    math.max(0.0, math.min(1.0, x))
 
-f_fits(hiEdge, loEdge, nBars, seedW) =>
+f_pipSize() =>
+    float p = syminfo.mintick
+    if syminfo.type == "forex"
+        p := syminfo.mintick < 0.001 ? 0.0001 : syminfo.mintick < 0.1 ? 0.01 : syminfo.mintick
+    p
+
+f_avg_last(array<float> a, int count) =>
+    int n = array.size(a)
+    float sum = 0.0
+    int used = 0
+    if n > 0 and count > 0
+        int start = math.max(0, n - count)
+        for i = start to n - 1
+            float v = array.get(a, i)
+            if not na(v)
+                sum += v
+                used += 1
+    used > 0 ? sum / float(used) : na
+
+f_fits_ctx(float hiEdge, float loEdge, int nBars, float seedW, float atrSafe0) =>
     float w = hiEdge - loEdge
-    w > 0 and w <= f_widthCap(nBars) and (na(seedW) or w <= seedW * MAX_GROWTH)
+    float cap = widthK * math.sqrt(math.max(nBars, winLen)) * atrSafe0
+    w > 0 and w <= cap and (na(seedW) or w <= seedW * MAX_GROWTH)
 
-f_backfill(top0, bot0, doIt) =>
-    int   startBar = bar_index
-    float top = top0
-    float bot = bot0
-    float tol = atrSafe * BACKFILL_TOL_ATR
-    if doIt
-        bool stop = false
-        for i = 1 to anchorLookback
-            if not stop and i <= bar_index
-                if math.abs(close[i] - close[i + winLen]) > (top0 - bot0) * maxDrift
-                    stop := true
-                else if close[i] <= top0 + tol and close[i] >= bot0 - tol
-                    startBar := bar_index - i
-                    top := math.max(top, math.min(high[i], top0 + atrSafe))
-                    bot := math.min(bot, math.max(low[i],  bot0 - atrSafe))
-                else
-                    stop := true
-    // hard floor: a range may never reach back across the last break
-    int   floorBar  = math.max(0, nz(lastBreakBar, -1) + 1)
-    int   windowBar = math.max(0, bar_index - winLen + 1)
-    startBar := math.max(math.min(startBar, windowBar), floorBar)
-    int   bars   = bar_index - startBar + 1
-    float noSeed = na
-    if not f_fits(top, bot, bars, noSeed)
-        top      := top0
-        bot      := bot0
-        startBar := math.max(floorBar, windowBar)
-    [startBar, top, bot]
-
-f_profile(backFrom, backTo, topP, botP, rows, vaFrac, useVol, doIt) =>
+f_profile_arr(int leftIdx, int rightIdx, float topP, float botP, bool useVol) =>
     float pocP = na
     float vahP = na
     float valP = na
-    float h    = (topP - botP) / rows
-    int   hi   = math.min(backTo, PROFILE_MAX_BARS)
-    if doIt and h > 0 and hi >= backFrom and backFrom >= 0
-        array<float> w = array.new_float(rows, 0.0)
-        for k = backFrom to hi
-            float bh = math.min(high[k], topP)
-            float bl = math.max(low[k],  botP)
+    float h = (topP - botP) / float(profileRows)
+    int totalBars = rightIdx - leftIdx + 1
+    int startIdx = math.max(leftIdx, rightIdx - PROFILE_MAX_BARS + 1)
+    if h > 0 and totalBars > 0 and rightIdx >= startIdx and startIdx >= 0
+        array<float> w = array.new_float(profileRows, 0.0)
+        for k = startIdx to rightIdx
+            float bh = math.min(array.get(sHighA, k), topP)
+            float bl = math.max(array.get(sLowA, k), botP)
             if bh >= bl
-                int i0 = math.max(0, math.min(rows - 1, int((bl - botP) / h)))
-                int i1 = math.max(0, math.min(rows - 1, int((bh - botP) / h)))
-                float unit = (useVol ? nz(volume[k], 0.0) : 1.0) / float(i1 - i0 + 1)
+                int i0 = math.max(0, math.min(profileRows - 1, int((bl - botP) / h)))
+                int i1 = math.max(0, math.min(profileRows - 1, int((bh - botP) / h)))
+                float rawUnit = useVol ? nz(array.get(sVolA, k), 0.0) : 1.0
+                float unit = rawUnit / float(i1 - i0 + 1)
                 for r = i0 to i1
                     array.set(w, r, array.get(w, r) + unit)
         float total = array.sum(w)
         if total > 0
-            int   poc    = array.indexof(w, array.max(w))
-            int   up     = poc
-            int   dn     = poc
-            float acc    = array.get(w, poc)
-            float target = total * vaFrac
-            while acc < target and (up < rows - 1 or dn > 0)
-                float a = up < rows - 1 ? array.get(w, up + 1) : -1.0
-                float b = dn > 0        ? array.get(w, dn - 1) : -1.0
+            int poc = array.indexof(w, array.max(w))
+            int up = poc
+            int dn = poc
+            float acc = array.get(w, poc)
+            float target = total * valueAreaPct / 100.0
+            while acc < target and (up < profileRows - 1 or dn > 0)
+                float a = up < profileRows - 1 ? array.get(w, up + 1) : -1.0
+                float b = dn > 0 ? array.get(w, dn - 1) : -1.0
                 if a >= b
-                    up  += 1
+                    up += 1
                     acc += a
                 else
-                    dn  -= 1
+                    dn -= 1
                     acc += b
-            pocP := botP + (poc + 0.5) * h
-            vahP := botP + (up + 1) * h
-            valP := botP + dn * h
+            pocP := botP + (float(poc) + 0.5) * h
+            vahP := botP + float(up + 1) * h
+            valP := botP + float(dn) * h
     [pocP, vahP, valP]
 
+f_levelTests_arr(float level, int leftIdx, int rightIdx, float tol, int dir, int kind, int currentIdx) =>
+    int tests = 0
+    int lastAgo = 1000000
+    bool touching = false
+    int startIdx = math.max(leftIdx, rightIdx - PROFILE_MAX_BARS + 1)
+    if not na(level) and rightIdx >= startIdx and startIdx >= 0
+        for k = startIdx to rightIdx
+            float hk = array.get(sHighA, k)
+            float lk = array.get(sLowA, k)
+            float ck = array.get(sCloseA, k)
+            bool overlap = lk <= level + tol and hk >= level - tol
+            bool edgeRoleReject = dir == 1 ? ck <= level : ck >= level
+            bool futureRoleReject = dir == 1 ? ck >= level : ck <= level
+            bool tested = overlap and (kind == 0 ? edgeRoleReject : futureRoleReject)
+            if tested and not touching
+                tests += 1
+                lastAgo := currentIdx - k
+            touching := tested
+    [tests, lastAgo]
+
+f_histEstimate(int idx) =>
+    float n = array.get(pbHistEvents, idx)
+    float reached = array.get(pbHistReached, idx)
+    float reacted = array.get(pbHistReacted, idx)
+    float pSuccess = (reacted + 1.0) / (n + 2.0)
+    float pReach = (reached + 1.0) / (n + 2.0)
+    float pReactionGivenReach = (reacted + 1.0) / (reached + 2.0)
+    [pSuccess, pReach, pReactionGivenReach, n]
+
+f_candidateScore_arr(int kind, bool valid, float level, float edgeLevel, float roundLevel, float vaLevel,
+     float pocLevel0, float halfW, int dir, int leftIdx, int rightIdx, int currentIdx,
+     float breakoutQuality, float currentClose, float atrSafe0) =>
+    float score = -1.0
+    int tests = 0
+    int lastAgo = 1000000
+    int confluenceCount = 0
+    if valid
+        [tests0, lastAgo0] = f_levelTests_arr(level, leftIdx, rightIdx, halfW, dir, kind, currentIdx)
+        tests := tests0
+        lastAgo := lastAgo0
+        float touchStrength = math.min(float(tests), 4.0) / 4.0
+        float recency = lastAgo < 1000000 ? math.exp(-float(lastAgo) / math.max(float(winLen), 1.0)) : 0.0
+        float distanceAtr = math.abs(currentClose - level) / atrSafe0
+        float horizonScale = math.max(0.75, math.sqrt(float(pullbackHorizon)) / 3.0)
+        float reachability = math.exp(-distanceAtr / horizonScale)
+        float mergeDist = halfW * 1.50
+        confluenceCount += not na(edgeLevel) and kind != 0 and math.abs(level - edgeLevel) <= mergeDist ? 1 : 0
+        confluenceCount += not na(roundLevel) and kind != 1 and math.abs(level - roundLevel) <= mergeDist ? 1 : 0
+        confluenceCount += not na(vaLevel) and kind != 2 and math.abs(level - vaLevel) <= mergeDist ? 1 : 0
+        confluenceCount += not na(pocLevel0) and kind != 3 and math.abs(level - pocLevel0) <= mergeDist ? 1 : 0
+        float confluence = math.min(float(confluenceCount), 2.0) / 2.0
+        bool roundNear = false
+        if useForexRoundNumbers and syminfo.type == "forex" and not na(roundLevel)
+            float pip = f_pipSize()
+            roundNear := math.abs(level - roundLevel) <= math.max(halfW, pip * 5.0)
+        float base = kind == 0 ? 0.56 : kind == 1 ? 0.50 : kind == 2 ? 0.47 : 0.42
+        float qualityTilt = kind == 0 ? 0.08 * breakoutQuality : kind == 1 ? 0.04 : kind == 2 ? 0.05 * (1.0 - breakoutQuality) : 0.08 * (1.0 - breakoutQuality)
+        score := base + 0.08 * touchStrength + 0.06 * recency + 0.06 * (roundNear ? 1.0 : 0.0) +
+             0.06 * confluence + 0.10 * (reachability - 0.50) + qualityTilt
+        score := math.max(0.05, math.min(0.95, score))
+    [score, tests]
+
+f_blendScore(float structureScore, int histIdx) =>
+    [histSuccess, histReach, histHold, histN] = f_histEstimate(histIdx)
+    float sampleRamp = math.min(1.0, histN / math.max(float(pullbackMinSamples), 1.0))
+    float histWeight = pullbackHistoryWeight / 100.0 * sampleRamp
+    float blended = structureScore < 0 ? -1.0 : structureScore * (1.0 - histWeight) + histSuccess * histWeight
+    [blended, histSuccess, histReach, histHold, histN]
+
+f_candidateName(int kind) =>
+    kind == 0 ? "Broken edge / SR flip" : kind == 1 ? "Forex round number" : kind == 2 ? "Value-area edge" : "Range POC"
+
+f_pullbackText(int dir, string candidateName, string confluence, float zBot, float zTop, float rank,
+     float observedRate, float observedReach, float observedHold, float observedN, string status) =>
+    bool historyReady = observedN >= pullbackMinSamples
+    string observedText = "History: learning (n=" + str.tostring(int(observedN)) + ")"
+    if historyReady
+        observedText := "HTF history: success " + str.tostring(observedRate * 100.0, "#.0") +
+             "% | reach " + str.tostring(observedReach * 100.0, "#.0") +
+             "% | reaction/reach " + str.tostring(observedHold * 100.0, "#.0") +
+             "% (n=" + str.tostring(int(observedN)) + ")"
+    (dir == 1 ? "Demand / Support pullback" : "Supply / Resistance pullback") +
+         "\nHTF: " + structureTf + " | " + candidateName + confluence +
+         "\nZone: " + str.tostring(zBot, format.mintick) + " - " + str.tostring(zTop, format.mintick) +
+         "\nRelative rank: " + str.tostring(rank * 100.0, "#.0") + "/100" +
+         "\n" + observedText + "\nStatus: " + status
+
+f_entryText(float invalidLevel, string status, float score, bool reclaim, bool displacement,
+     bool microBreak, int weakCloses, float microLevel) =>
+    string scoreText = na(score) ? "n/a" : str.tostring(score, "#.0") + "/100"
+    "\nChart " + timeframe.period + " Entry: " + status +
+         "\nReaction score: " + scoreText +
+         " | reclaim " + (reclaim ? "Y" : "N") +
+         " | displacement " + (displacement ? "Y" : "N") +
+         " | micro break " + (microBreak ? "Y" : "N") +
+         "\nWeak closes: " + str.tostring(weakCloses) +
+         (na(microLevel) ? "" : " | micro: " + str.tostring(microLevel, format.mintick)) +
+         "\nHard invalidation: " + str.tostring(invalidLevel, format.mintick)
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Lifecycle
+// Structure state
 // ─────────────────────────────────────────────────────────────────────────────
-bool rangeStarted   = false
+var bool sInRange = false
+var float sTop = na
+var float sBot = na
+var float sSeedW = na
+var int sLeftIdx = na
+var int sRightIdx = na
+var int sRejects = 0
+var int sProbeDir = 0
+var int sProbeBars = 0
+var float sProbeExt = na
+var int sLastBreakIdx = na
+var float sBreakLevel = na
+var int sCandidateStreak = 0
+
+// Kalman state is advanced ONLY when a new confirmed structure bar arrives.
+var float sKLevel = na
+var float sKVelocity = 0.0
+var float sP00 = 1.0
+var float sP01 = 0.0
+var float sP10 = 0.0
+var float sP11 = 1.0
+
+// Latest structure measurements / events.
+var float sAtrSafe = na
+var float sRollingTop = na
+var float sRollingBot = na
+var int sRangeScore = 0
+var bool sRangeCandidateConfirmed = false
+var float sPocValue = na
+var float sVahValue = na
+var float sValValue = na
+var float sBreakUpLevel = na
+var float sBreakDownLevel = na
+
+bool rangeStarted = false
 bool rangeRefocused = false
-bool brokeUp        = false
-bool brokeDown      = false
-bool probeOpened    = false
-int  probeOpenDir   = 0
+bool brokeUp = false
+bool brokeDown = false
+bool probeOpened = false
+int probeOpenDir = 0
+int structureEventTime = na
+int structureEventCloseTime = na
 
-float buf = atr * breakBufferAtr
+// Drawing objects for the current HTF range/profile.
+var box rBox = na
+var line pocLine = na
+var line vahLine = na
+var line valLine = na
 
-if inRange
-    int  rBars  = bar_index - rLeft + 1
-    bool cAbove = close > rTop + buf
-    bool cBelow = close < rBot - buf
+// ─────────────────────────────────────────────────────────────────────────────
+// Latest displayed pullback zone + chart-timeframe reaction state
+// ─────────────────────────────────────────────────────────────────────────────
+var box pbBox = na
+var label pbLabel = na
+var line pbInvalidLine = na
+var bool pbActive = false
+var int pbDir = 0
+var int pbCreatedStructIdx = na
+var int pbExpiryStructIdx = na
+var int pbCreatedTime = na
+var int pbExpiryTime = na
+var int pbEndTime = na
+var int pbTouchBar = na
+var float pbTop = na
+var float pbBot = na
+var float pbMid = na
+var float pbAtrAtBreak = na
+var float pbRank = na
+var float pbObservedRate = na
+var float pbObservedReach = na
+var float pbObservedHold = na
+var float pbObservedN = 0.0
+var string pbCandidateName = ""
+var string pbConfluence = ""
+var string pbStatus = "None"
+var bool pbTouched = false
+var float pbInvalidLevel = na
 
-    if ABSORB_PROBES and close < rTop and high > rTop and high - rTop <= atrSafe * WICK_ABSORB_ATR and f_fits(high, rBot, rBars, rSeedW)
-        rTop := high
-    if ABSORB_PROBES and close > rBot and low < rBot and rBot - low <= atrSafe * WICK_ABSORB_ATR and f_fits(rTop, low, rBars, rSeedW)
-        rBot := low
+var bool pbEntryTouched = false
+var bool pbEntryConfirmed = false
+var bool pbEntryDead = false
+var bool pbAcceptance = false
+var bool pbReclaim = false
+var bool pbDisplacement = false
+var bool pbMicroBreak = false
+var int pbChartTouchBar = na
+var int pbChartBarsAfterTouch = 0
+var int pbWeakCloses = 0
+var float pbEntryExtreme = na
+var float pbMicroLevel = na
+var float pbReactionScore = na
+var string pbEntryStatus = "Off"
+var array<float> pbPreHighs = array.new_float()
+var array<float> pbPreLows = array.new_float()
 
-    if cAbove or cBelow
-        int d = cAbove ? 1 : -1
-        if probeDir == d
-            probeBars += 1
-            probeExt  := d == 1 ? math.max(probeExt, high) : math.min(probeExt, low)
+bool pullbackZoneStarted = false
+bool pullbackZoneTouched = false
+bool pullbackZoneReacted = false
+bool pullbackZoneFailed = false
+bool pullbackZoneExpired = false
+bool chartEntryConfirmedNow = false
+bool chartAcceptanceWarningNow = false
+bool chartEntryInvalidNow = false
+bool chartEntryTimedOutNow = false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Process exactly one NEW CONFIRMED Structure-Timeframe candle.
+// ─────────────────────────────────────────────────────────────────────────────
+if newStructData
+    lastProcessedStructTime := sReqTime
+    array.push(sOpenA, sReqO)
+    array.push(sHighA, sReqH)
+    array.push(sLowA, sReqL)
+    array.push(sCloseA, sReqC)
+    array.push(sVolA, nz(sReqV, 0.0))
+    array.push(sTimeA, sReqTime)
+    array.push(sCloseTimeA, sReqCloseTime)
+    int si = array.size(sCloseA) - 1
+    structureEventTime := sReqTime
+    structureEventCloseTime := sReqCloseTime
+
+    float o0 = sReqO
+    float h0 = sReqH
+    float l0 = sReqL
+    float c0 = sReqC
+    float prevC = si > 0 ? array.get(sCloseA, si - 1) : c0
+    float tr0 = math.max(h0 - l0, math.max(math.abs(h0 - prevC), math.abs(l0 - prevC)))
+    array.push(sTrA, tr0)
+
+    float atr0 = na
+    if array.size(sTrA) >= 14
+        float prevAtr = array.size(sAtrA) > 0 ? array.get(sAtrA, array.size(sAtrA) - 1) : na
+        if na(prevAtr)
+            atr0 := f_avg_last(sTrA, 14)
         else
-            probeDir  := d
-            probeBars := 1
-            probeExt  := d == 1 ? high : low
-            probeOpened  := true
-            probeOpenDir := d
+            atr0 := (prevAtr * 13.0 + tr0) / 14.0
+    array.push(sAtrA, atr0)
+    float atrSafe0 = math.max(nz(atr0, math.max(h0 - l0, syminfo.mintick)), syminfo.mintick)
+    sAtrSafe := atrSafe0
+    float atrBaseline0 = f_avg_last(sAtrA, 50)
+    float atrRatio0 = atrSafe0 / math.max(nz(atrBaseline0, atrSafe0), syminfo.mintick)
 
-        float span      = math.max(rTop - rBot, syminfo.mintick)
-        float dist      = d == 1 ? close - rTop : rBot - close
-        bool  escapeHit = dist / span >= escapeFrac or dist / atrSafe >= ESCAPE_CAP_ATR
+    // Rolling structure measurements from the virtual confirmed-HTF stream.
+    int rollStart = math.max(0, si - winLen + 1)
+    float rollingTop0 = -1e20
+    float rollingBot0 = 1e20
+    for k = rollStart to si
+        rollingTop0 := math.max(rollingTop0, array.get(sHighA, k))
+        rollingBot0 := math.min(rollingBot0, array.get(sLowA, k))
+    float rollingWidth0 = math.max(rollingTop0 - rollingBot0, syminfo.mintick)
+    sRollingTop := rollingTop0
+    sRollingBot := rollingBot0
+    float widthAtr0 = rollingWidth0 / atrSafe0
 
-        if (probeBars >= MIN_PROBE_BARS and escapeHit) or probeBars >= confirmWindow
-            brokeUp      := d == 1
-            brokeDown    := d == -1
-            breakLevel   := d == 1 ? rTop : rBot
-            inRange      := false
-            lastBreakBar := bar_index
-            candidateStreak := 0
-            probeDir  := 0
-            probeBars := 0
-            probeExt  := na
+    bool enoughHistory = si >= winLen
+    float path0 = 0.0
+    float avgOverlap0 = 0.0
+    float oldClose = enoughHistory ? array.get(sCloseA, si - winLen) : c0
+    if enoughHistory
+        float overlapSum = 0.0
+        for k = si - winLen + 1 to si
+            float ck = array.get(sCloseA, k)
+            float cPrev = array.get(sCloseA, k - 1)
+            path0 += math.abs(ck - cPrev)
+            float hk = array.get(sHighA, k)
+            float lk = array.get(sLowA, k)
+            float hp = array.get(sHighA, k - 1)
+            float lp = array.get(sLowA, k - 1)
+            float overlapAmount = math.max(0.0, math.min(hk, hp) - math.max(lk, lp))
+            float overlapBase = math.max(math.min(hk - lk, hp - lp), syminfo.mintick)
+            overlapSum += math.min(1.0, overlapAmount / overlapBase)
+        avgOverlap0 := overlapSum / float(winLen)
+    float efficiency0 = enoughHistory ? math.abs(c0 - oldClose) / math.max(path0, syminfo.mintick) : 1.0
+
+    // OLS slope over the latest winLen confirmed structure closes.
+    float lrSlope0 = 0.0
+    if si >= winLen - 1
+        float n = float(winLen)
+        float sumX = n * (n - 1.0) * 0.5
+        float sumXX = (n - 1.0) * n * (2.0 * n - 1.0) / 6.0
+        float sumY = 0.0
+        float sumXY = 0.0
+        for j = 0 to winLen - 1
+            float y = array.get(sCloseA, si - winLen + 1 + j)
+            sumY += y
+            sumXY += float(j) * y
+        float denom = n * sumXX - sumX * sumX
+        lrSlope0 := denom != 0 ? (n * sumXY - sumX * sumY) / denom : 0.0
+    float lrSlopeAtr0 = math.abs(lrSlope0) / atrSafe0
+    float driftRatio0 = enoughHistory ? math.abs(c0 - oldClose) / rollingWidth0 : 1.0
+    float position0 = (c0 - rollingBot0) / rollingWidth0
+    bool notPinned0 = position0 > 0.01 and position0 < 0.99
+
+    // Kalman level + velocity on the confirmed HTF stream.
+    float qLevel0 = math.pow(atrSafe0 * (0.020 + s * 0.002), 2)
+    float qVelocity0 = math.pow(atrSafe0 * (0.004 + s * 0.0007), 2)
+    float rMeasure0 = math.pow(atrSafe0 * 0.80, 2)
+    if na(sKLevel)
+        sKLevel := c0
+        sKVelocity := 0.0
+        sP00 := rMeasure0
+        sP01 := 0.0
+        sP10 := 0.0
+        sP11 := rMeasure0
     else
-        if probeDir != 0
-            rejects += 1
-            if ABSORB_PROBES and probeDir == 1 and f_fits(math.max(rTop, probeExt), rBot, rBars, rSeedW)
-                rTop := math.max(rTop, probeExt)
-            if ABSORB_PROBES and probeDir == -1 and f_fits(rTop, math.min(rBot, probeExt), rBars, rSeedW)
-                rBot := math.min(rBot, probeExt)
-            probeDir  := 0
-            probeBars := 0
-            probeExt  := na
-        rRight := bar_index
+        float predLevel = sKLevel + sKVelocity
+        float predVelocity = sKVelocity
+        float pp00 = sP00 + sP01 + sP10 + sP11 + qLevel0
+        float pp01 = sP01 + sP11
+        float pp10 = sP10 + sP11
+        float pp11 = sP11 + qVelocity0
+        float innovation = c0 - predLevel
+        float innovationVariance = math.max(pp00 + rMeasure0, syminfo.mintick * syminfo.mintick)
+        float gainLevel = pp00 / innovationVariance
+        float gainVelocity = pp10 / innovationVariance
+        sKLevel := predLevel + gainLevel * innovation
+        sKVelocity := predVelocity + gainVelocity * innovation
+        sP00 := (1.0 - gainLevel) * pp00
+        sP01 := (1.0 - gainLevel) * pp01
+        sP10 := pp10 - gainVelocity * pp00
+        sP11 := pp11 - gainVelocity * pp01
+    array.push(sKalmanA, sKLevel)
+    float kalmanSlopeAtr0 = math.abs(sKVelocity) / atrSafe0
+    float oldKalman = array.size(sKalmanA) > winLen ? array.get(sKalmanA, array.size(sKalmanA) - 1 - winLen) : na
+    float kalmanDrift0 = not na(oldKalman) ? math.abs(sKLevel - oldKalman) / rollingWidth0 : driftRatio0
+    float slopeAtr0 = lrSlopeAtr0 * (1.0 - KALMAN_WEIGHT) + kalmanSlopeAtr0 * KALMAN_WEIGHT
+    float blendedDrift0 = driftRatio0 * (1.0 - KALMAN_WEIGHT) + kalmanDrift0 * KALMAN_WEIGHT
+
+    int rangeScore0 =
+         (efficiency0 <= maxEfficiency ? 1 : 0) +
+         (atrRatio0 <= maxAtrRatio ? 1 : 0) +
+         (widthAtr0 <= widthK * math.sqrt(float(winLen)) ? 1 : 0) +
+         (avgOverlap0 >= minOverlap ? 1 : 0) +
+         (slopeAtr0 <= maxSlopeAtr ? 1 : 0) +
+         (blendedDrift0 <= maxDrift ? 1 : 0)
+    sRangeScore := rangeScore0
+    int requiredScore = rangeSensitivity >= 7 ? 4 : 5
+    bool rangeCandidate0 = enoughHistory and rangeScore0 >= requiredScore and notPinned0
+    sCandidateStreak := rangeCandidate0 ? sCandidateStreak + 1 : 0
+    bool confirmedCandidate0 = sCandidateStreak >= confirmBars
+    sRangeCandidateConfirmed := confirmedCandidate0
+
+    // Update unresolved historical pullback candidates from this confirmed HTF bar.
+    if array.size(pbEvDir) > 0
+        int ev = array.size(pbEvDir) - 1
+        while ev >= 0
+            int evDir = array.get(pbEvDir, ev)
+            int evStart = array.get(pbEvStart, ev)
+            int evExpiry = array.get(pbEvExpiry, ev)
+            float evAtr = array.get(pbEvAtr, ev)
+            int histBase = evDir == 1 ? 0 : 4
+            for kind = 0 to 3
+                float zTopEv = kind == 0 ? array.get(pbEvTop0, ev) : kind == 1 ? array.get(pbEvTop1, ev) : kind == 2 ? array.get(pbEvTop2, ev) : array.get(pbEvTop3, ev)
+                float zBotEv = kind == 0 ? array.get(pbEvBot0, ev) : kind == 1 ? array.get(pbEvBot1, ev) : kind == 2 ? array.get(pbEvBot2, ev) : array.get(pbEvBot3, ev)
+                bool enteredEv = kind == 0 ? array.get(pbEvEntered0, ev) : kind == 1 ? array.get(pbEvEntered1, ev) : kind == 2 ? array.get(pbEvEntered2, ev) : array.get(pbEvEntered3, ev)
+                bool doneEv = kind == 0 ? array.get(pbEvDone0, ev) : kind == 1 ? array.get(pbEvDone1, ev) : kind == 2 ? array.get(pbEvDone2, ev) : array.get(pbEvDone3, ev)
+                bool enteredBefore = enteredEv
+                bool completedNow = false
+                bool reactedNow = false
+                if not doneEv and si > evStart
+                    bool overlapEv = not na(zTopEv) and not na(zBotEv) and h0 >= zBotEv and l0 <= zTopEv
+                    if not enteredEv and overlapEv
+                        enteredEv := true
+                    bool invalidEv = evDir == 1 ? c0 < zBotEv - pullbackInvalidAtr * evAtr : c0 > zTopEv + pullbackInvalidAtr * evAtr
+                    bool favorableEv = enteredBefore and (evDir == 1 ? h0 >= zTopEv + pullbackReactionAtr * evAtr : l0 <= zBotEv - pullbackReactionAtr * evAtr)
+                    if favorableEv and not invalidEv
+                        doneEv := true
+                        completedNow := true
+                        reactedNow := true
+                    else if invalidEv or si >= evExpiry
+                        doneEv := true
+                        completedNow := true
+                if kind == 0
+                    array.set(pbEvEntered0, ev, enteredEv)
+                    array.set(pbEvDone0, ev, doneEv)
+                else if kind == 1
+                    array.set(pbEvEntered1, ev, enteredEv)
+                    array.set(pbEvDone1, ev, doneEv)
+                else if kind == 2
+                    array.set(pbEvEntered2, ev, enteredEv)
+                    array.set(pbEvDone2, ev, doneEv)
+                else
+                    array.set(pbEvEntered3, ev, enteredEv)
+                    array.set(pbEvDone3, ev, doneEv)
+                if completedNow
+                    int hx = histBase + kind
+                    array.set(pbHistEvents, hx, array.get(pbHistEvents, hx) + 1.0)
+                    array.set(pbHistReached, hx, array.get(pbHistReached, hx) + (enteredEv ? 1.0 : 0.0))
+                    array.set(pbHistReacted, hx, array.get(pbHistReacted, hx) + (reactedNow ? 1.0 : 0.0))
+            bool allDone = array.get(pbEvDone0, ev) and array.get(pbEvDone1, ev) and array.get(pbEvDone2, ev) and array.get(pbEvDone3, ev)
+            if allDone
+                array.remove(pbEvDir, ev)
+                array.remove(pbEvStart, ev)
+                array.remove(pbEvExpiry, ev)
+                array.remove(pbEvAtr, ev)
+                array.remove(pbEvTop0, ev)
+                array.remove(pbEvBot0, ev)
+                array.remove(pbEvTop1, ev)
+                array.remove(pbEvBot1, ev)
+                array.remove(pbEvTop2, ev)
+                array.remove(pbEvBot2, ev)
+                array.remove(pbEvTop3, ev)
+                array.remove(pbEvBot3, ev)
+                array.remove(pbEvEntered0, ev)
+                array.remove(pbEvEntered1, ev)
+                array.remove(pbEvEntered2, ev)
+                array.remove(pbEvEntered3, ev)
+                array.remove(pbEvDone0, ev)
+                array.remove(pbEvDone1, ev)
+                array.remove(pbEvDone2, ev)
+                array.remove(pbEvDone3, ev)
+            ev -= 1
+
+    // Original range lifecycle, now advanced once per confirmed HTF candle.
+    float buf0 = atrSafe0 * breakBufferAtr
+    if sInRange
+        int rBars = si - sLeftIdx + 1
+        bool cAbove = c0 > sTop + buf0
+        bool cBelow = c0 < sBot - buf0
+        if absorbProbes and c0 < sTop and h0 > sTop and h0 - sTop <= atrSafe0 * WICK_ABSORB_ATR and f_fits_ctx(h0, sBot, rBars, sSeedW, atrSafe0)
+            sTop := h0
+        if absorbProbes and c0 > sBot and l0 < sBot and sBot - l0 <= atrSafe0 * WICK_ABSORB_ATR and f_fits_ctx(sTop, l0, rBars, sSeedW, atrSafe0)
+            sBot := l0
+        if cAbove or cBelow
+            int d = cAbove ? 1 : -1
+            if sProbeDir == d
+                sProbeBars += 1
+                sProbeExt := d == 1 ? math.max(sProbeExt, h0) : math.min(sProbeExt, l0)
+            else
+                sProbeDir := d
+                sProbeBars := 1
+                sProbeExt := d == 1 ? h0 : l0
+                probeOpened := true
+                probeOpenDir := d
+            float span = math.max(sTop - sBot, syminfo.mintick)
+            float dist = d == 1 ? c0 - sTop : sBot - c0
+            bool escapeHit = dist / span >= escapeFrac or (escapeCapAtr > 0 and dist / atrSafe0 >= escapeCapAtr)
+            bool breakoutReady = (sProbeBars >= MIN_PROBE_BARS and escapeHit) or sProbeBars >= confirmWindow
+            if breakoutReady
+                brokeUp := d == 1
+                brokeDown := d == -1
+                sBreakLevel := d == 1 ? sTop : sBot
+                sInRange := false
+                sLastBreakIdx := si
+                sCandidateStreak := 0
+                sProbeDir := 0
+                sProbeBars := 0
+                sProbeExt := na
+        else
+            if sProbeDir != 0
+                sRejects += 1
+                if absorbProbes and sProbeDir == 1 and f_fits_ctx(math.max(sTop, sProbeExt), sBot, rBars, sSeedW, atrSafe0)
+                    sTop := math.max(sTop, sProbeExt)
+                if absorbProbes and sProbeDir == -1 and f_fits_ctx(sTop, math.min(sBot, sProbeExt), rBars, sSeedW, atrSafe0)
+                    sBot := math.min(sBot, sProbeExt)
+                sProbeDir := 0
+                sProbeBars := 0
+                sProbeExt := na
+            sRightIdx := si
+
+    // Adaptive resize uses the latest confirmed HTF rolling shelf.
+    bool latestShelfInside = sInRange and rollingTop0 <= sTop and rollingBot0 >= sBot and (rollingTop0 < sTop or rollingBot0 > sBot)
+    bool canRefocus = adaptiveResize and sInRange and sProbeDir == 0 and confirmedCandidate0 and latestShelfInside and (si - sLeftIdx + 1) >= winLen
+    if canRefocus
+        float oldTop = sTop
+        float oldBot = sBot
+        int floorIdx = math.max(0, nz(sLastBreakIdx, -1) + 1)
+        sLeftIdx := math.max(floorIdx, si - winLen + 1)
+        sTop := rollingTop0
+        sBot := rollingBot0
+        sRightIdx := si
+        sSeedW := rollingWidth0
+        sRejects := 0
+        sProbeDir := 0
+        sProbeBars := 0
+        sProbeExt := na
+        sCandidateStreak := 0
+        rangeRefocused := true
+        if showAdaptationTrace
+            int prevCloseTime = si > 0 ? array.get(sCloseTimeA, si - 1) : sReqTime
+            if sTop != oldTop
+                line.new(prevCloseTime, oldTop, sReqCloseTime, sTop, xloc = xloc.bar_time, extend = extend.none, color = rangeColor, width = 2)
+            if sBot != oldBot
+                line.new(prevCloseTime, oldBot, sReqCloseTime, sBot, xloc = xloc.bar_time, extend = extend.none, color = rangeColor, width = 2)
+
+    bool cooldownReady = na(sLastBreakIdx) or si - sLastBreakIdx > COOLDOWN_BARS
+    bool wantSeed = not sInRange and not (brokeUp or brokeDown) and confirmedCandidate0 and cooldownReady
+    if wantSeed
+        int startIdx = math.max(0, si - winLen + 1)
+        float seedTop = rollingTop0
+        float seedBot = rollingBot0
+        float tol = atrSafe0 * BACKFILL_TOL_ATR
+        bool stopBack = false
+        for back = 1 to anchorLookback
+            int idx = si - back
+            if not stopBack and idx >= 0
+                if idx - winLen >= 0 and math.abs(array.get(sCloseA, idx) - array.get(sCloseA, idx - winLen)) > (rollingTop0 - rollingBot0) * maxDrift
+                    stopBack := true
+                else if array.get(sCloseA, idx) <= rollingTop0 + tol and array.get(sCloseA, idx) >= rollingBot0 - tol
+                    startIdx := idx
+                    seedTop := math.max(seedTop, math.min(array.get(sHighA, idx), rollingTop0 + atrSafe0))
+                    seedBot := math.min(seedBot, math.max(array.get(sLowA, idx), rollingBot0 - atrSafe0))
+                else
+                    stopBack := true
+        int floorIdx = math.max(0, nz(sLastBreakIdx, -1) + 1)
+        startIdx := math.max(startIdx, floorIdx)
+        int seedBars = si - startIdx + 1
+        if not f_fits_ctx(seedTop, seedBot, seedBars, na, atrSafe0)
+            seedTop := rollingTop0
+            seedBot := rollingBot0
+            startIdx := math.max(floorIdx, si - winLen + 1)
+        sInRange := true
+        sLeftIdx := startIdx
+        sTop := seedTop
+        sBot := seedBot
+        sRightIdx := si
+        sSeedW := seedTop - seedBot
+        sRejects := 0
+        sProbeDir := 0
+        sProbeBars := 0
+        sProbeExt := na
+        sCandidateStreak := 0
+        rangeStarted := true
+
+    // Profile from confirmed HTF bars. On a break it uses the completed old range.
+    bool profileNeeded = (profileBasis != "Off") or showPullbackZone
+    if profileNeeded and not na(sLeftIdx) and not na(sRightIdx) and sRightIdx >= sLeftIdx
+        bool useVol = profileBasis == "Volume"
+        [poc0, vah0, val0] = f_profile_arr(sLeftIdx, sRightIdx, sTop, sBot, useVol)
+        sPocValue := poc0
+        sVahValue := vah0
+        sValValue := val0
+
+    // Create the most-likely pullback zone from the confirmed HTF breakout.
+    if showPullbackZone and (brokeUp or brokeDown) and not na(sBreakLevel)
+        int newDir = brokeUp ? 1 : -1
+        float oldRangeW = math.max(sTop - sBot, syminfo.mintick)
+        float halfWRaw = math.max(atrSafe0 * pullbackZoneAtr, oldRangeW * pullbackZoneRangePct / 100.0)
+        float halfW = math.max(syminfo.mintick * 2.0, math.min(atrSafe0 * pullbackMaxHalfAtr, halfWRaw))
+        float edgeLevel = sBreakLevel
+        float roundLevel0 = na
+        bool roundValid = false
+        if useForexRoundNumbers and syminfo.type == "forex"
+            float pip0 = f_pipSize()
+            float roundStep0 = math.max(pip0 * float(roundNumberPips), syminfo.mintick)
+            roundLevel0 := newDir == 1 ? math.floor((c0 - syminfo.mintick) / roundStep0) * roundStep0 : math.ceil((c0 + syminfo.mintick) / roundStep0) * roundStep0
+            roundValid := newDir == 1 ? roundLevel0 < c0 and roundLevel0 >= sBot - halfW : roundLevel0 > c0 and roundLevel0 <= sTop + halfW
+        float vaLevel = newDir == 1 ? sVahValue : sValValue
+        float pocLevel0 = sPocValue
+        bool vaValid = not na(vaLevel) and vaLevel >= sBot and vaLevel <= sTop
+        bool pocValid = not na(pocLevel0) and pocLevel0 >= sBot and pocLevel0 <= sTop
+        float candleSpan = math.max(h0 - l0, syminfo.mintick)
+        float displacementQ = math.min(1.0, math.abs(c0 - edgeLevel) / atrSafe0)
+        float bodyQ = math.min(1.0, math.abs(c0 - o0) / candleSpan)
+        float closeLocationQ = newDir == 1 ? (c0 - l0) / candleSpan : (h0 - c0) / candleSpan
+        float breakoutQuality = f_clamp01(0.45 * displacementQ + 0.25 * bodyQ + 0.30 * closeLocationQ)
+        int leftForTests = math.max(0, sLeftIdx)
+        int rightForTests = math.max(leftForTests, sRightIdx)
+        [struct0, tests0] = f_candidateScore_arr(0, true, edgeLevel, edgeLevel, roundValid ? roundLevel0 : na, vaValid ? vaLevel : na,
+             pocValid ? pocLevel0 : na, halfW, newDir, leftForTests, rightForTests, si, breakoutQuality, c0, atrSafe0)
+        [struct1, tests1] = f_candidateScore_arr(1, roundValid, roundLevel0, edgeLevel, roundLevel0, vaValid ? vaLevel : na,
+             pocValid ? pocLevel0 : na, halfW, newDir, leftForTests, rightForTests, si, breakoutQuality, c0, atrSafe0)
+        [struct2, tests2] = f_candidateScore_arr(2, vaValid, vaLevel, edgeLevel, roundValid ? roundLevel0 : na, vaLevel,
+             pocValid ? pocLevel0 : na, halfW, newDir, leftForTests, rightForTests, si, breakoutQuality, c0, atrSafe0)
+        [struct3, tests3] = f_candidateScore_arr(3, pocValid, pocLevel0, edgeLevel, roundValid ? roundLevel0 : na, vaValid ? vaLevel : na,
+             pocLevel0, halfW, newDir, leftForTests, rightForTests, si, breakoutQuality, c0, atrSafe0)
+        int histBaseNew = newDir == 1 ? 0 : 4
+        [score0, histSuccess0, histReach0, histHold0, histN0] = f_blendScore(struct0, histBaseNew)
+        [score1, histSuccess1, histReach1, histHold1, histN1] = f_blendScore(struct1, histBaseNew + 1)
+        [score2, histSuccess2, histReach2, histHold2, histN2] = f_blendScore(struct2, histBaseNew + 2)
+        [score3, histSuccess3, histReach3, histHold3, histN3] = f_blendScore(struct3, histBaseNew + 3)
+        int bestKind = 0
+        float bestScore = score0
+        float bestLevel = edgeLevel
+        float bestHistSuccess = histSuccess0
+        float bestHistReach = histReach0
+        float bestHistHold = histHold0
+        float bestHistN = histN0
+        int bestTests = tests0
+        if score1 > bestScore
+            bestKind := 1
+            bestScore := score1
+            bestLevel := roundLevel0
+            bestHistSuccess := histSuccess1
+            bestHistReach := histReach1
+            bestHistHold := histHold1
+            bestHistN := histN1
+            bestTests := tests1
+        if score2 > bestScore
+            bestKind := 2
+            bestScore := score2
+            bestLevel := vaLevel
+            bestHistSuccess := histSuccess2
+            bestHistReach := histReach2
+            bestHistHold := histHold2
+            bestHistN := histN2
+            bestTests := tests2
+        if score3 > bestScore
+            bestKind := 3
+            bestScore := score3
+            bestLevel := pocLevel0
+            bestHistSuccess := histSuccess3
+            bestHistReach := histReach3
+            bestHistHold := histHold3
+            bestHistN := histN3
+            bestTests := tests3
+        float outsideW = halfW * 0.45
+        float insideW = halfW * 1.15
+        float zTop0 = newDir == 1 ? edgeLevel + outsideW : edgeLevel + insideW
+        float zBot0 = newDir == 1 ? edgeLevel - insideW : edgeLevel - outsideW
+        float zTop1 = roundValid ? roundLevel0 + halfW : na
+        float zBot1 = roundValid ? roundLevel0 - halfW : na
+        float zTop2 = vaValid ? vaLevel + halfW : na
+        float zBot2 = vaValid ? vaLevel - halfW : na
+        float zTop3 = pocValid ? pocLevel0 + halfW : na
+        float zBot3 = pocValid ? pocLevel0 - halfW : na
+        float selectedTop = bestKind == 0 ? zTop0 : bestKind == 1 ? zTop1 : bestKind == 2 ? zTop2 : zTop3
+        float selectedBot = bestKind == 0 ? zBot0 : bestKind == 1 ? zBot1 : bestKind == 2 ? zBot2 : zBot3
+        string confluenceText = ""
+        float mergeDistance = halfW * 1.50
+        bool edgeNear = bestKind != 0 and math.abs(bestLevel - edgeLevel) <= mergeDistance
+        bool roundNearBest = bestKind != 1 and roundValid and math.abs(bestLevel - roundLevel0) <= mergeDistance
+        bool valueNear = bestKind != 2 and vaValid and math.abs(bestLevel - vaLevel) <= mergeDistance
+        bool pocNear = bestKind != 3 and pocValid and math.abs(bestLevel - pocLevel0) <= mergeDistance
+        if edgeNear
+            confluenceText += " + edge"
+            if mergePullbackConfluence
+                selectedTop := math.max(selectedTop, zTop0)
+                selectedBot := math.min(selectedBot, zBot0)
+        if roundNearBest
+            confluenceText += " + round"
+            if mergePullbackConfluence
+                selectedTop := math.max(selectedTop, zTop1)
+                selectedBot := math.min(selectedBot, zBot1)
+        if valueNear
+            confluenceText += " + value"
+            if mergePullbackConfluence
+                selectedTop := math.max(selectedTop, zTop2)
+                selectedBot := math.min(selectedBot, zBot2)
+        if pocNear
+            confluenceText += " + POC"
+            if mergePullbackConfluence
+                selectedTop := math.max(selectedTop, zTop3)
+                selectedBot := math.min(selectedBot, zBot3)
+
+        // Retire prior visual objects according to history preference.
+        if not na(pbBox)
+            if keepHistoricalPullbackZones
+                pbBox := na
+            else
+                box.delete(pbBox)
+                pbBox := na
+        if not na(pbLabel)
+            if keepHistoricalPullbackZones
+                pbLabel := na
+            else
+                label.delete(pbLabel)
+                pbLabel := na
+        if not na(pbInvalidLine)
+            if keepHistoricalPullbackZones
+                pbInvalidLine := na
+            else
+                line.delete(pbInvalidLine)
+                pbInvalidLine := na
+
+        pbDir := newDir
+        pbCreatedStructIdx := si
+        pbExpiryStructIdx := si + pullbackHorizon
+        pbCreatedTime := sReqCloseTime
+        pbExpiryTime := sReqCloseTime + int(structureTfSeconds * 1000.0 * float(pullbackHorizon))
+        pbEndTime := na
+        pbTop := selectedTop
+        pbBot := selectedBot
+        pbMid := (selectedTop + selectedBot) * 0.50
+        pbAtrAtBreak := atrSafe0
+        pbRank := bestScore
+        pbObservedRate := bestHistSuccess
+        pbObservedReach := bestHistReach
+        pbObservedHold := bestHistHold
+        pbObservedN := bestHistN
+        pbCandidateName := f_candidateName(bestKind)
+        pbConfluence := confluenceText + " | prior HTF tests: " + str.tostring(bestTests)
+        pbStatus := "Waiting"
+        pbTouched := false
+        pbTouchBar := na
+        pbActive := true
+        pbInvalidLevel := newDir == 1 ? selectedBot - pullbackInvalidAtr * atrSafe0 : selectedTop + pullbackInvalidAtr * atrSafe0
+
+        pbEntryTouched := false
+        pbEntryConfirmed := false
+        pbEntryDead := false
+        pbAcceptance := false
+        pbReclaim := false
+        pbDisplacement := false
+        pbMicroBreak := false
+        pbChartTouchBar := na
+        pbChartBarsAfterTouch := 0
+        pbWeakCloses := 0
+        pbEntryExtreme := na
+        pbMicroLevel := na
+        pbReactionScore := na
+        pbEntryStatus := useChartReaction ? "WAITING FOR RETEST" : "Off"
+        array.clear(pbPreHighs)
+        array.clear(pbPreLows)
+
+        color zoneColor = newDir == 1 ? bullColor : bearColor
+        pbBox := box.new(pbCreatedTime, selectedTop, pbExpiryTime, selectedBot,
+             xloc = xloc.bar_time, bgcolor = color.new(zoneColor, 88), border_color = color.new(zoneColor, 15), border_width = 1)
+        if showHardInvalidation
+            pbInvalidLine := line.new(pbCreatedTime, pbInvalidLevel, pbExpiryTime, pbInvalidLevel,
+                 xloc = xloc.bar_time, extend = extend.none, color = color.new(rangeColor, 25), width = 1, style = line.style_dashed)
+        if showPullbackLabels
+            pbLabel := label.new(pbCreatedTime, newDir == 1 ? selectedBot : selectedTop,
+                 f_pullbackText(pbDir, pbCandidateName, pbConfluence, pbBot, pbTop, pbRank,
+                      pbObservedRate, pbObservedReach, pbObservedHold, pbObservedN, pbStatus) +
+                      f_entryText(pbInvalidLevel, pbEntryStatus, pbReactionScore, pbReclaim, pbDisplacement, pbMicroBreak, pbWeakCloses, pbMicroLevel),
+                 xloc = xloc.bar_time, yloc = yloc.price,
+                 style = newDir == 1 ? label.style_label_up : label.style_label_down,
+                 color = color.new(zoneColor, 10), textcolor = color.white, size = size.tiny)
+
+        // Add all frozen candidates to the HTF learning queue.
+        if array.size(pbEvDir) >= PULLBACK_MAX_EVENTS
+            array.remove(pbEvDir, 0)
+            array.remove(pbEvStart, 0)
+            array.remove(pbEvExpiry, 0)
+            array.remove(pbEvAtr, 0)
+            array.remove(pbEvTop0, 0)
+            array.remove(pbEvBot0, 0)
+            array.remove(pbEvTop1, 0)
+            array.remove(pbEvBot1, 0)
+            array.remove(pbEvTop2, 0)
+            array.remove(pbEvBot2, 0)
+            array.remove(pbEvTop3, 0)
+            array.remove(pbEvBot3, 0)
+            array.remove(pbEvEntered0, 0)
+            array.remove(pbEvEntered1, 0)
+            array.remove(pbEvEntered2, 0)
+            array.remove(pbEvEntered3, 0)
+            array.remove(pbEvDone0, 0)
+            array.remove(pbEvDone1, 0)
+            array.remove(pbEvDone2, 0)
+            array.remove(pbEvDone3, 0)
+        array.push(pbEvDir, newDir)
+        array.push(pbEvStart, si)
+        array.push(pbEvExpiry, si + pullbackHorizon)
+        array.push(pbEvAtr, atrSafe0)
+        array.push(pbEvTop0, zTop0)
+        array.push(pbEvBot0, zBot0)
+        array.push(pbEvTop1, zTop1)
+        array.push(pbEvBot1, zBot1)
+        array.push(pbEvTop2, zTop2)
+        array.push(pbEvBot2, zBot2)
+        array.push(pbEvTop3, zTop3)
+        array.push(pbEvBot3, zBot3)
+        array.push(pbEvEntered0, false)
+        array.push(pbEvEntered1, false)
+        array.push(pbEvEntered2, false)
+        array.push(pbEvEntered3, false)
+        array.push(pbEvDone0, false)
+        array.push(pbEvDone1, not roundValid)
+        array.push(pbEvDone2, not vaValid)
+        array.push(pbEvDone3, not pocValid)
+        pullbackZoneStarted := true
+
+    // Structure trigger values after this confirmed bar.
+    sBreakUpLevel := sInRange ? sTop + atrSafe0 * breakBufferAtr : na
+    sBreakDownLevel := sInRange ? sBot - atrSafe0 * breakBufferAtr : na
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Adaptive resize to the latest shelf
-//
-// One live range only - the existing box moves, nothing is duplicated.
-// v6 adds two conditions the old version lacked:
-//   - the target shelf must be materially tighter (SHELF_TIGHTEN), so the box
-//     stops creeping inward one tick at a time on drifting structure
-//   - resizes are spaced by confirmWindow bars
-// Because the resize reuses confirmedRangeCandidate, it now also inherits the
-// full horizontality gate - a sloped shelf can no longer capture the box.
+// Live HTF range/profile drawings on ANY lower chart timeframe.
 // ─────────────────────────────────────────────────────────────────────────────
-bool latestShelfInside = inRange and
-     rollingTop <= rTop and rollingBottom >= rBot and
-     (rollingTop < rTop or rollingBottom > rBot)
+if showBoxes and sInRange and not na(sLeftIdx) and array.size(sTimeA) > 0
+    int leftTime = array.get(sTimeA, sLeftIdx)
+    int rightTime = time_close
+    if na(rBox)
+        rBox := box.new(leftTime, sTop, rightTime, sBot, xloc = xloc.bar_time,
+             bgcolor = color.new(rangeColor, boxTransp), border_color = color.new(rangeColor, 15), border_width = 1)
+    else
+        box.set_left(rBox, leftTime)
+        box.set_right(rBox, rightTime)
+        box.set_top(rBox, sTop)
+        box.set_bottom(rBox, sBot)
+else if not showBoxes and not na(rBox)
+    box.delete(rBox)
+    rBox := na
 
-bool shelfTighter = inRange and rollingWidth <= math.max(rTop - rBot, syminfo.mintick) * SHELF_TIGHTEN
-bool resizeCooled = na(lastResizeBar) or bar_index - lastResizeBar >= confirmWindow
+if (brokeUp or brokeDown) and not na(rBox)
+    color bc = brokeUp ? bullColor : bearColor
+    box.set_right(rBox, structureEventCloseTime)
+    box.set_border_color(rBox, bc)
+    box.set_bgcolor(rBox, color.new(bc, 94))
+    rBox := na
 
-bool canRefocus = adaptiveResize and inRange and probeDir == 0 and
-     confirmedRangeCandidate and latestShelfInside and shelfTighter and resizeCooled and
-     (bar_index - rLeft + 1) >= winLen
-
-if canRefocus
+bool profileOn = profileBasis != "Off"
+if profileOn and sInRange and not na(sLeftIdx) and not na(sRightIdx) and not na(sPocValue)
+    int pLeftTime = array.get(sTimeA, sLeftIdx)
+    int pRightTime = time_close
+    if na(pocLine)
+        pocLine := line.new(pLeftTime, sPocValue, pRightTime, sPocValue, xloc = xloc.bar_time, color = profileColor, width = 2)
+        vahLine := line.new(pLeftTime, sVahValue, pRightTime, sVahValue, xloc = xloc.bar_time, color = color.new(profileColor, 40), width = 1, style = line.style_dotted)
+        valLine := line.new(pLeftTime, sValValue, pRightTime, sValValue, xloc = xloc.bar_time, color = color.new(profileColor, 40), width = 1, style = line.style_dotted)
+    else
+        line.set_xy1(pocLine, pLeftTime, sPocValue)
+        line.set_xy2(pocLine, pRightTime, sPocValue)
+        line.set_xy1(vahLine, pLeftTime, sVahValue)
+        line.set_xy2(vahLine, pRightTime, sVahValue)
+        line.set_xy1(valLine, pLeftTime, sValValue)
+        line.set_xy2(valLine, pRightTime, sValValue)
+else if not profileOn
     if not na(pocLine)
         line.delete(pocLine)
         pocLine := na
@@ -515,201 +1072,209 @@ if canRefocus
         line.delete(valLine)
         valLine := na
 
-    pocValue := na
-    vahValue := na
-    valValue := na
-
-    int floorBar = math.max(0, nz(lastBreakBar, -1) + 1)
-
-    rLeft   := math.max(floorBar, bar_index - winLen + 1)
-    rTop    := rollingTop
-    rBot    := rollingBottom
-    rRight  := bar_index
-    rSeedW  := rollingWidth
-    rejects := 0
-
-    lastResizeBar := bar_index
-
-    probeDir  := 0
-    probeBars := 0
-    probeExt  := na
-
-    candidateStreak := 0
-    rangeRefocused := true
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Seeding
-// ─────────────────────────────────────────────────────────────────────────────
-bool wantSeed = not inRange and not (brokeUp or brokeDown) and confirmedRangeCandidate
-
-[sb, st, sb2] = f_backfill(rollingTop, rollingBottom, wantSeed)
-
-if wantSeed
-    inRange := true
-    rLeft   := sb
-    rTop    := st
-    rBot    := sb2
-    rRight  := bar_index
-    rSeedW  := st - sb2
-    rejects := 0
-    rBox    := na
-    pocLine := na
-    vahLine := na
-    valLine := na
-    pocValue := na
-    vahValue := na
-    valValue := na
-    rangeStarted := true
-    probeDir  := 0
-    probeBars := 0
-    probeExt  := na
-
-    lastResizeBar   := na
-    candidateStreak := 0
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Profile
-// ─────────────────────────────────────────────────────────────────────────────
-bool profileOn  = profileBasis != "Off"
-bool profileDue = (inRange and barstate.islast) or brokeUp or brokeDown
-bool doProfile  = profileOn and not na(rTop) and not na(rLeft) and profileDue
-
-[pocP, vahP, valP] = f_profile(math.max(0, bar_index - rRight), math.max(0, bar_index - rLeft),
-     rTop, rBot, profileRows, valueAreaPct / 100.0, profileBasis == "Volume", doProfile)
-
-if doProfile and not na(pocP)
-    pocValue := pocP
-    vahValue := vahP
-    valValue := valP
-    if na(pocLine)
-        pocLine := line.new(rLeft, pocP, rRight, pocP, xloc = xloc.bar_index,
-             color = profileColor, width = 2)
-        vahLine := line.new(rLeft, vahP, rRight, vahP, xloc = xloc.bar_index,
-             color = color.new(profileColor, 40), width = 1, style = line.style_dotted)
-        valLine := line.new(rLeft, valP, rRight, valP, xloc = xloc.bar_index,
-             color = color.new(profileColor, 40), width = 1, style = line.style_dotted)
-    else
-        line.set_xy1(pocLine, rLeft, pocP)
-        line.set_xy2(pocLine, rRight, pocP)
-        line.set_xy1(vahLine, rLeft, vahP)
-        line.set_xy2(vahLine, rRight, vahP)
-        line.set_xy1(valLine, rLeft, valP)
-        line.set_xy2(valLine, rRight, valP)
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Drawing
-// ─────────────────────────────────────────────────────────────────────────────
-if showBoxes and inRange
-    if na(rBox)
-        rBox := box.new(rLeft, rTop, rRight, rBot,
-             xloc         = xloc.bar_index,
-             bgcolor      = color.new(rangeColor, boxTransp),
-             border_color = color.new(rangeColor, 15),
-             border_style = line.style_solid,
-             border_width = 1)
-    else
-        box.set_left(rBox,   rLeft)
-        box.set_right(rBox,  rRight)
-        box.set_top(rBox,    rTop)
-        box.set_bottom(rBox, rBot)
-
 if brokeUp or brokeDown
-    if not na(rBox)
-        color bc = brokeUp ? bullColor : bearColor
-        box.set_right(rBox, rRight)
-        box.set_border_color(rBox, bc)
-        box.set_bgcolor(rBox, color.new(bc, 94))
-        rBox := na
     pocLine := na
     vahLine := na
     valLine := na
-
-if showBreakLabels and (brokeUp or brokeDown)
-    label.new(bar_index, breakLevel,
-         brokeUp ? "Bull break" : "Bear break",
-         xloc      = xloc.bar_index,
-         yloc      = yloc.price,
-         style     = brokeUp ? label.style_label_up : label.style_label_down,
-         color     = color.new(brokeUp ? bullColor : bearColor, 10),
-         textcolor = color.white,
-         size      = size.tiny)
-
-if not showBoxes and not na(rBox)
-    box.delete(rBox)
-    rBox := na
+    if showBreakLabels
+        label.new(structureEventCloseTime, sBreakLevel, brokeUp ? "HTF Bull break" : "HTF Bear break",
+             xloc = xloc.bar_time, yloc = yloc.price,
+             style = brokeUp ? label.style_label_up : label.style_label_down,
+             color = color.new(brokeUp ? bullColor : bearColor, 10), textcolor = color.white, size = size.tiny)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Entry aids
+// Latest-zone generic lifecycle on the chart timeframe.
+// This is display/entry responsiveness only; adaptive ranking history above is HTF.
 // ─────────────────────────────────────────────────────────────────────────────
-float breakUpLevel   = inRange ? rTop + buf : na
-float breakDownLevel = inRange ? rBot - buf : na
+if pbActive and not na(pbCreatedTime) and time >= pbCreatedTime
+    bool overlapNow = high >= pbBot and low <= pbTop
+    if not pbTouched and overlapNow
+        pbTouched := true
+        pbTouchBar := bar_index
+        pbStatus := "Reached - waiting for reaction"
+        pullbackZoneTouched := true
+    bool currentInvalid = pbDir == 1 ? close < pbInvalidLevel : close > pbInvalidLevel
+    bool currentReacted = pbTouched and not na(pbTouchBar) and bar_index > pbTouchBar and
+         (pbDir == 1 ? high >= pbTop + pullbackReactionAtr * pbAtrAtBreak : low <= pbBot - pullbackReactionAtr * pbAtrAtBreak)
+    if currentReacted and not currentInvalid
+        pbActive := false
+        pbStatus := "Reacted"
+        pbEndTime := time_close
+        pullbackZoneReacted := true
+        if not na(pbBox)
+            box.set_right(pbBox, pbEndTime)
+            box.set_border_width(pbBox, 2)
+            box.set_bgcolor(pbBox, color.new(pbDir == 1 ? bullColor : bearColor, 82))
+    else if currentInvalid
+        pbActive := false
+        pbStatus := "Invalidated"
+        pbEndTime := time_close
+        pullbackZoneFailed := true
+        if not na(pbBox)
+            box.set_right(pbBox, pbEndTime)
+            box.set_border_color(pbBox, color.new(rangeColor, 20))
+            box.set_bgcolor(pbBox, color.new(rangeColor, 92))
+    else if not na(pbExpiryStructIdx) and array.size(sCloseA) - 1 >= pbExpiryStructIdx
+        pbActive := false
+        pbStatus := pbTouched ? "Expired after reach" : "Expired - not reached"
+        pbEndTime := time_close
+        pullbackZoneExpired := true
+        if not na(pbBox)
+            box.set_right(pbBox, pbEndTime)
+            box.set_border_color(pbBox, color.new(rangeColor, 35))
 
-plot(showTriggers ? breakUpLevel : na,   "Break Up Level",
-     color = color.new(bullColor, 25), style = plot.style_linebr, linewidth = 1)
-plot(showTriggers ? breakDownLevel : na, "Break Down Level",
-     color = color.new(bearColor, 25), style = plot.style_linebr, linewidth = 1)
-
-plotshape(showProbes and probeOpened and probeOpenDir ==  1, "Probe Up",
-     style = shape.triangleup,   location = location.abovebar,
-     color = color.new(bullColor, 30), size = size.tiny)
-plotshape(showProbes and probeOpened and probeOpenDir == -1, "Probe Down",
-     style = shape.triangledown, location = location.belowbar,
-     color = color.new(bearColor, 30), size = size.tiny)
+if not pbActive and not na(pbInvalidLine) and not na(pbEndTime)
+    line.set_x2(pbInvalidLine, pbEndTime)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Strategy outputs and tuning diagnostics
-//
-// The gate readouts are the tuning surface. Open the Data Window on a structure
-// that was wrongly accepted or wrongly rejected and read which gate decided it,
-// then move Range Sensitivity in that direction. This is why every gate is
-// exposed individually rather than as one opaque score.
+// Chart-timeframe rejection / acceptance engine.
+// Only CLOSED chart bars are used. HTF zone never moves because of this engine.
 // ─────────────────────────────────────────────────────────────────────────────
-plot(brokeUp ? 1.0 : brokeDown ? -1.0 : 0.0, "Breakout Signal (+1/-1)", display = display.data_window)
-plot(probeOpened ? float(probeOpenDir) : 0.0, "Probe Signal (+1/-1)", display = display.data_window)
-plot(breakUpLevel,   "Break Up Level (value)",   display = display.data_window)
-plot(breakDownLevel, "Break Down Level (value)", display = display.data_window)
-plot(breakLevel,          "Last Break Level", display = display.data_window)
-plot(inRange ? rTop : na, "Range Top",        display = display.data_window)
-plot(inRange ? rBot : na, "Range Bottom",     display = display.data_window)
-plot(pocValue,            "POC",              display = display.data_window)
-plot(vahValue,            "VAH",              display = display.data_window)
-plot(valValue,            "VAL",              display = display.data_window)
-plot(inRange ? 1.0 : 0.0, "In Range",         display = display.data_window)
-plot(float(winLen),       "Detection Window", display = display.data_window)
-plot(float(probeBars),    "Bars Outside",     display = display.data_window)
-plot(float(rejects),      "Rejected Probes",  display = display.data_window)
+if pullbackZoneFailed and not pbEntryConfirmed
+    pbEntryDead := true
+    pbEntryStatus := "INVALIDATED - AVOID"
+    chartEntryInvalidNow := true
+if pullbackZoneExpired and not pbEntryConfirmed and not pbEntryDead
+    pbEntryDead := true
+    pbEntryStatus := "EXPIRED - AVOID"
 
-// clean-window diagnostics
-plot(cleanWindow ? 1.0 : 0.0,   "Gate: Clean Window",  display = display.data_window)
-plot(float(barsSinceBreak),     "Bars Since Break",    display = display.data_window)
+bool chartBarReady = barstate.isconfirmed
+if useChartReaction and chartBarReady and pbDir != 0 and not na(pbCreatedTime) and time >= pbCreatedTime and not pbEntryConfirmed and not pbEntryDead
+    float chartAtr = math.max(ta.atr(14), syminfo.mintick)
+    float zoneW = math.max(pbTop - pbBot, syminfo.mintick)
+    bool overlapChart = high >= pbBot and low <= pbTop
 
-// mandatory horizontality gates
-plot(gateSlope     ? 1.0 : 0.0, "Gate: Slope",         display = display.data_window)
-plot(gateDrift     ? 1.0 : 0.0, "Gate: Drift",         display = display.data_window)
-plot(gateShape     ? 1.0 : 0.0, "Gate: Half Overlap",  display = display.data_window)
-plot(gateOccupancy ? 1.0 : 0.0, "Gate: Occupancy",     display = display.data_window)
-plot(horizontalOk  ? 1.0 : 0.0, "Gate: Horizontal ALL",display = display.data_window)
+    if not pbEntryTouched and not overlapChart
+        array.push(pbPreHighs, high)
+        array.push(pbPreLows, low)
+        if array.size(pbPreHighs) > microLookback
+            array.shift(pbPreHighs)
+            array.shift(pbPreLows)
 
-// raw gate measurements
-plot(slopeAtr,                  "Slope (ATR/bar)",     display = display.data_window)
-plot(blendedDrift,              "Net Drift",           display = display.data_window)
-plot(halfOverlap,               "Half Overlap (0-1)",  display = display.data_window)
-plot(float(quadrantsFilled),    "Quadrants Filled",    display = display.data_window)
+    if not pbEntryTouched and overlapChart
+        pbEntryTouched := true
+        pbChartTouchBar := bar_index
+        pbChartBarsAfterTouch := 1
+        pbEntryExtreme := pbDir == 1 ? low : high
+        pbMicroLevel := pbDir == 1 ? (array.size(pbPreHighs) > 0 ? array.max(pbPreHighs) : high) :
+             (array.size(pbPreLows) > 0 ? array.min(pbPreLows) : low)
+        pbEntryStatus := "TESTING - WAIT"
+    else if pbEntryTouched
+        pbChartBarsAfterTouch += 1
+        pbEntryExtreme := pbDir == 1 ? math.min(nz(pbEntryExtreme, low), low) : math.max(nz(pbEntryExtreme, high), high)
 
-// quality votes
-plot(float(qualityVotes),       "Quality Votes (0-4)", display = display.data_window)
-plot(float(votesNeeded),        "Votes Needed",        display = display.data_window)
-plot(efficiency,                "Efficiency",          display = display.data_window)
-plot(avgOverlap,                "Bar Overlap",         display = display.data_window)
-plot(widthAtr,                  "Width (ATR)",         display = display.data_window)
+    if pbEntryTouched
+        float barSpan = math.max(high - low, syminfo.mintick)
+        float wickRatio = pbDir == 1 ? (math.min(open, close) - low) / barSpan : (high - math.max(open, close)) / barSpan
+        wickRatio := f_clamp01(wickRatio)
+        float closeQuality = pbDir == 1 ? f_clamp01((close - pbBot) / zoneW) : f_clamp01((pbTop - close) / zoneW)
+        float penetration = pbDir == 1 ? (pbTop - pbEntryExtreme) / zoneW : (pbEntryExtreme - pbBot) / zoneW
+        penetration := math.max(0.0, math.min(1.50, penetration))
+        float reclaimLevel = reclaimMode == "Outer Edge" ? (pbDir == 1 ? pbTop : pbBot) : pbMid
+        bool reclaimNow = reclaimMode == "Off" ? true : (pbDir == 1 ? close > reclaimLevel : close < reclaimLevel)
+        if reclaimNow
+            pbReclaim := true
+        bool displacementNow = pbDir == 1 ? close >= pbEntryExtreme + entryReactionAtr * chartAtr : close <= pbEntryExtreme - entryReactionAtr * chartAtr
+        if displacementNow
+            pbDisplacement := true
+        bool microNow = na(pbMicroLevel) ? false : (pbDir == 1 ? close > pbMicroLevel : close < pbMicroLevel)
+        if microNow
+            pbMicroBreak := true
+        float acceptFrac = acceptanceDepthPct / 100.0
+        float weakThreshold = pbDir == 1 ? pbTop - zoneW * acceptFrac : pbBot + zoneW * acceptFrac
+        bool weakClose = pbDir == 1 ? close <= weakThreshold : close >= weakThreshold
+        pbWeakCloses := weakClose ? pbWeakCloses + 1 : (pbReclaim ? 0 : math.max(0, pbWeakCloses - 1))
+        bool hardInvalid = pbDir == 1 ? close < pbInvalidLevel : close > pbInvalidLevel
+        bool acceptanceNow = pbWeakCloses >= acceptanceCloses or (penetration >= 1.0 and closeQuality < 0.35)
+        if acceptanceNow and not pbAcceptance
+            chartAcceptanceWarningNow := true
+        pbAcceptance := acceptanceNow
+        float reclaimPts = pbReclaim ? 30.0 : 0.0
+        float displacementPts = pbDisplacement ? 25.0 : 0.0
+        float microPts = requireMicroBreak ? (pbMicroBreak ? 20.0 : 0.0) : 20.0
+        float wickPts = 15.0 * wickRatio
+        float closePts = 10.0 * closeQuality
+        float acceptancePenalty = pbAcceptance ? 20.0 : 0.0
+        pbReactionScore := math.max(0.0, math.min(100.0, reclaimPts + displacementPts + microPts + wickPts + closePts - acceptancePenalty))
+        bool microPass = not requireMicroBreak or pbMicroBreak
+        bool confirmEntry = pbReclaim and pbDisplacement and microPass and pbReactionScore >= minReactionScore and not hardInvalid
+        if hardInvalid
+            pbEntryDead := true
+            pbEntryStatus := "INVALIDATED - AVOID"
+            chartEntryInvalidNow := true
+        else if confirmEntry
+            pbEntryConfirmed := true
+            pbEntryStatus := "ENTRY CONFIRMED"
+            chartEntryConfirmedNow := true
+        else if pbChartBarsAfterTouch >= maxReactionBars
+            pbEntryDead := true
+            pbEntryStatus := pbAcceptance ? "ACCEPTANCE / NO CONFIRMATION - AVOID" : "NO CONFIRMATION - AVOID"
+            chartEntryTimedOutNow := true
+        else if pbAcceptance
+            pbEntryStatus := "ACCEPTANCE WARNING - WAIT/AVOID"
+        else if pbReclaim or pbDisplacement or pbMicroBreak
+            pbEntryStatus := "REJECTING - WAIT"
+        else
+            pbEntryStatus := "TESTING - WAIT"
 
-plot(inRange ? float(bar_index - rLeft + 1) : 0.0, "Range Age (bars)",  display = display.data_window)
-plot(inRange ? (rTop - rBot) / atrSafe : 0.0,      "Range Width (ATR)", display = display.data_window)
-plot(rangeRefocused ? 1.0 : 0.0, "Range Auto-Resized", display = display.data_window)
+// Keep current pullback label synchronized.
+if showPullbackLabels and not na(pbLabel)
+    int labelX = pbActive ? math.min(time_close, pbExpiryTime) : nz(pbEndTime, math.min(time_close, pbExpiryTime))
+    label.set_text(pbLabel,
+         f_pullbackText(pbDir, pbCandidateName, pbConfluence, pbBot, pbTop, pbRank,
+              pbObservedRate, pbObservedReach, pbObservedHold, pbObservedN, pbStatus) +
+              f_entryText(pbInvalidLevel, pbEntryStatus, pbReactionScore, pbReclaim, pbDisplacement, pbMicroBreak, pbWeakCloses, pbMicroLevel))
+    label.set_x(pbLabel, labelX)
+    label.set_y(pbLabel, pbDir == 1 ? pbBot : pbTop)
 
-alertcondition(rangeStarted, "Range Started", "A new price range was detected")
-alertcondition(rangeRefocused, "Range Auto-Resized", "The active range resized to the latest confirmed nested shelf")
-alertcondition(probeOpened and probeOpenDir ==  1, "Probe Up (fast)",   "Price closed above the range - fast trigger, not yet confirmed")
-alertcondition(probeOpened and probeOpenDir == -1, "Probe Down (fast)", "Price closed below the range - fast trigger, not yet confirmed")
-alertcondition(brokeUp,      "Bullish Range Breakout", "Price confirmed above the range")
-alertcondition(brokeDown,    "Bearish Range Breakout", "Price confirmed below the range")
+// MTF status badge.
+var table tfTable = table.new(position.top_right, 1, 1)
+if barstate.islast
+    if showTfBadge
+        string badge = "Structure: " + structureTf + "\nReaction: chart " + timeframe.period +
+             "\nHTF bars loaded: " + str.tostring(array.size(sCloseA))
+        table.cell(tfTable, 0, 0, badge, text_color = color.white, bgcolor = color.new(rangeColor, 20))
+    else
+        table.clear(tfTable, 0, 0, 0, 0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plots / diagnostics
+// ─────────────────────────────────────────────────────────────────────────────
+plot(showTriggers ? sBreakUpLevel : na, "HTF Break Up Level", color = color.new(bullColor, 25), style = plot.style_linebr, linewidth = 1)
+plot(showTriggers ? sBreakDownLevel : na, "HTF Break Down Level", color = color.new(bearColor, 25), style = plot.style_linebr, linewidth = 1)
+plotshape(showProbes and probeOpened and probeOpenDir == 1, "HTF Probe Up", style = shape.triangleup, location = location.abovebar, color = color.new(bullColor, 30), size = size.tiny)
+plotshape(showProbes and probeOpened and probeOpenDir == -1, "HTF Probe Down", style = shape.triangledown, location = location.belowbar, color = color.new(bearColor, 30), size = size.tiny)
+
+plot(brokeUp ? 1.0 : brokeDown ? -1.0 : 0.0, "HTF Breakout Signal (+1/-1)", display = display.data_window)
+plot(sBreakLevel, "Last HTF Break Level", display = display.data_window)
+plot(sInRange ? sTop : na, "HTF Range Top", display = display.data_window)
+plot(sInRange ? sBot : na, "HTF Range Bottom", display = display.data_window)
+plot(sPocValue, "HTF POC", display = display.data_window)
+plot(sVahValue, "HTF VAH", display = display.data_window)
+plot(sValValue, "HTF VAL", display = display.data_window)
+plot(float(sRangeScore), "HTF Range Score (0-6)", display = display.data_window)
+plot(float(winLen), "HTF Detection Window", display = display.data_window)
+plot(pbTop, "Pullback Zone Top", display = display.data_window)
+plot(pbBot, "Pullback Zone Bottom", display = display.data_window)
+plot(pbInvalidLevel, "Hard Invalidation Level", display = display.data_window)
+plot(pbRank, "Pullback Relative Rank", display = display.data_window)
+plot(pbReactionScore, "Chart-TF Reaction Score", display = display.data_window)
+plot(pbEntryConfirmed ? 1.0 : 0.0, "Entry Confirmed", display = display.data_window)
+plot(pbAcceptance ? 1.0 : 0.0, "Acceptance Warning", display = display.data_window)
+
+// Alerts
+alertcondition(rangeStarted, "HTF Range Started", "A new confirmed structure-timeframe range was detected")
+alertcondition(rangeRefocused, "HTF Range Auto-Resized", "The confirmed HTF range resized to the latest nested shelf")
+alertcondition(probeOpened and probeOpenDir == 1, "HTF Probe Up", "A confirmed structure-timeframe candle probed above the range")
+alertcondition(probeOpened and probeOpenDir == -1, "HTF Probe Down", "A confirmed structure-timeframe candle probed below the range")
+alertcondition(brokeUp, "HTF Bullish Range Breakout", "A confirmed structure-timeframe bullish breakout occurred")
+alertcondition(brokeDown, "HTF Bearish Range Breakout", "A confirmed structure-timeframe bearish breakout occurred")
+alertcondition(pullbackZoneStarted, "HTF Pullback Zone Predicted", "A new most-likely HTF supply/demand or support/resistance pullback zone was ranked")
+alertcondition(pullbackZoneTouched, "Pullback Zone Reached", "Price reached the predicted HTF pullback zone")
+alertcondition(pullbackZoneReacted, "Pullback Zone Reacted", "Price reached the HTF pullback zone and reacted")
+alertcondition(pullbackZoneFailed, "Pullback Zone Invalidated", "Price closed beyond the HTF pullback zone hard invalidation")
+alertcondition(pullbackZoneExpired, "Pullback Zone Expired", "The HTF pullback zone reached its evaluation horizon")
+alertcondition(chartAcceptanceWarningNow, "Chart-TF Acceptance Warning", "Closed chart-timeframe candles are accepting too deeply through the HTF pullback zone")
+alertcondition(chartEntryConfirmedNow, "Chart-TF Pullback Entry Confirmed", "The chart timeframe confirmed rejection/reclaim/displacement at the frozen HTF zone")
+alertcondition(chartEntryInvalidNow, "Chart-TF Hard Invalidation", "A closed chart-timeframe candle closed beyond the frozen HTF hard-invalidation level")
+alertcondition(chartEntryTimedOutNow, "Chart-TF No Confirmation", "The HTF zone was tested but did not confirm within the configured chart-bar limit")
