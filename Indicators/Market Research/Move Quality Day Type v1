@@ -1,5 +1,17 @@
 //@version=6
-// Move Quality Day Type v1
+// Move Quality Day Type v1.2
+//
+// v1.2: the day label now states both halves of the answer - how likely a move is today, and
+// how likely it is to continue if it comes (research numbers until this chart has its own).
+// A quiet CLEAN day reads as "probably no move, but a real one if it comes".
+// Moves that reach the level within 30 minutes of the open are marked FAST: they continued
+// 59-60% of the time on NQ and ES in both halves of the data, including ~57% on NOISY days.
+//
+// v1.1: VIX is optional. "Use VIX" (default on) uses the VIX-weighted forecast; when it is off,
+// or the VIX feed returns nothing, the indicator falls back to weights fitted WITHOUT VIX
+// instead of showing NO DATA. Each mode is ranked only against its own history, and the
+// research table switches with it. Without VIX, NOISY still separates cleanly; on NQ the
+// CLEAN/NORMAL line blurs (NORMAL 62% vs CLEAN 60%), which is why VIX stays on by default.
 //
 // ONE question, answered before the 09:30 New York cash open: when price makes a real move
 // today, will the move be CLEAN (follow through, shallow pullbacks) or NOISY (chop, deep
@@ -27,7 +39,7 @@
 // Non-repainting: the type uses only data available before 09:30 and is fixed at the open.
 //
 // CC BY-NC-SA 4.0 · https://creativecommons.org/licenses/by-nc-sa/4.0/
-indicator("Move Quality Day Type v1", shorttitle = "Move Quality v1", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+indicator("Move Quality Day Type v1.2", shorttitle = "Move Quality v1.2", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Inputs
@@ -40,6 +52,8 @@ var string G_STY = "Style"
 
 model     = input.string("NQ", "Model", options = ["NQ", "ES"], group = G_MOD,
      tooltip = "Forecast weights fitted on Nasdaq 100 or S&P 500 cash sessions, 2014-2018.")
+useVix    = input.bool(true, "Use VIX", group = G_MOD,
+     tooltip = "On: forecast includes VIX vs its 20-day average (sharper on NQ). Off, or VIX unavailable: forecast uses overnight range, yesterday's range and gap only.")
 vixSym    = input.symbol("CBOE:VIX", "VIX Symbol", group = G_MOD)
 moveK     = input.float(0.5, "Move Size (x Daily ATR)", minval = 0.1, maxval = 2.0, step = 0.05, group = G_MOD,
      tooltip = "The research statistics are for 0.5. Other values change what a 'move' is, so the research table no longer applies - read the chart's own record instead.")
@@ -74,21 +88,34 @@ noneCol     = input.color(#787b86, "No Data", group = G_STY)
 // ─────────────────────────────────────────────────────────────────────────────
 // Model weights (log cash range ~ log VIX ratio, log overnight range, log prior range, |gap|)
 // ─────────────────────────────────────────────────────────────────────────────
+// with VIX
 float bV = model == "NQ" ? 0.8327 : 0.9382
 float bO = model == "NQ" ? 0.1937 : 0.2077
 float bP = model == "NQ" ? 0.0964 : 0.1168
 float bG = model == "NQ" ? 0.1380 : 0.0991
+// without VIX
+float nO = model == "NQ" ? 0.2549 : 0.2686
+float nP = model == "NQ" ? 0.2165 : 0.2640
+float nG = model == "NQ" ? 0.1906 : 0.1730
 
 // Research table: [continue %, median pullback ATR, % of days with a move] per type
-f_res(int t, int k) =>
+f_res(int t, int k, bool vx) =>
     bool nq = model == "NQ"
     float v = na
-    if t == 1
-        v := k == 0 ? (nq ? 62.0 : 67.0) : k == 1 ? (nq ? 0.17 : 0.16) : (nq ? 40.0 : 30.0)
-    if t == 2
-        v := k == 0 ? (nq ? 52.0 : 53.0) : k == 1 ? (nq ? 0.20 : 0.19) : (nq ? 52.0 : 44.0)
-    if t == 3
-        v := k == 0 ? (nq ? 51.0 : 50.0) : k == 1 ? (nq ? 0.27 : 0.29) : (nq ? 69.0 : 69.0)
+    if vx
+        if t == 1
+            v := k == 0 ? (nq ? 62.0 : 67.0) : k == 1 ? (nq ? 0.17 : 0.16) : (nq ? 40.0 : 30.0)
+        if t == 2
+            v := k == 0 ? (nq ? 52.0 : 53.0) : k == 1 ? (nq ? 0.20 : 0.19) : (nq ? 52.0 : 44.0)
+        if t == 3
+            v := k == 0 ? (nq ? 51.0 : 50.0) : k == 1 ? (nq ? 0.27 : 0.29) : (nq ? 69.0 : 69.0)
+    if not vx
+        if t == 1
+            v := k == 0 ? (nq ? 60.0 : 70.0) : k == 1 ? (nq ? 0.18 : 0.16) : (nq ? 42.0 : 30.0)
+        if t == 2
+            v := k == 0 ? (nq ? 62.0 : 51.0) : k == 1 ? (nq ? 0.18 : 0.21) : (nq ? 49.0 : 48.0)
+        if t == 3
+            v := k == 0 ? (nq ? 49.0 : 50.0) : k == 1 ? (nq ? 0.28 : 0.30) : (nq ? 68.0 : 68.0)
     if t == 4
         v := k == 0 ? (nq ? 32.0 : 39.0) : k == 1 ? (nq ? 0.46 : 0.41) : (nq ? 69.0 : 66.0)
     v
@@ -127,11 +154,14 @@ var float prevRangeAtr  = na
 // Day type — fixed at the cash open
 //   0 NO DATA · 1 CLEAN · 2 NORMAL · 3 NOISY · 4 AVOID
 // ─────────────────────────────────────────────────────────────────────────────
-var array<float> fcHist = array.new<float>()
+var array<float> fcHistV = array.new<float>()     // forecasts made WITH VIX
+var array<float> fcHistN = array.new<float>()     // forecasts made WITHOUT VIX
+var bool  dVix    = false                         // mode used today
 var int   dayType = 0
 var bool  dayLive = false
 var float A       = na
 var float cOpen   = na
+var int   cOpenT  = na
 var float cHigh   = na
 var float cLow    = na
 var float fcPct   = na
@@ -143,6 +173,7 @@ bool typeSet = false
 
 if cashOpen and tfOk
     A      := math.max(nz(dAtr, 0.0), syminfo.mintick)
+    cOpenT := time
     cOpen  := open
     cHigh  := high
     cLow   := low
@@ -150,21 +181,30 @@ if cashOpen and tfOk
     inON_  := (onHigh - onLow) / A
     inPrev := prevRangeAtr
     inGap  := na(prevCashClose) ? na : math.abs(open - prevCashClose) / A
-    bool  ok = not na(dAtr) and inVix > 0 and inON_ > 0 and inPrev > 0 and not na(inGap)
-    float fc = ok ? bV * math.log(inVix) + bO * math.log(inON_) + bP * math.log(inPrev) + bG * inGap : na
-    int   nH = fcHist.size()
+    bool  ok   = not na(dAtr) and inON_ > 0 and inPrev > 0 and not na(inGap)
+    bool  vxOk = ok and inVix > 0
+    float fcN  = ok ? nO * math.log(inON_) + nP * math.log(inPrev) + nG * inGap : na
+    float fcV  = vxOk ? bV * math.log(inVix) + bO * math.log(inON_) + bP * math.log(inPrev) + bG * inGap : na
+    dVix := useVix and vxOk
+    float fc = dVix ? fcV : fcN
+    array<float> hist = dVix ? fcHistV : fcHistN
+    int   nH = hist.size()
     fcPct := na
     if ok and nH >= minRank
         int below = 0
-        for v in fcHist
+        for v in hist
             below += v < fc ? 1 : 0
         fcPct := 100.0 * below / nH
     bool isFomc = str.contains(fomcList, str.format_time(time, "yyyy-MM-dd", tz))
     dayType := isFomc ? 4 : na(fcPct) ? 0 : fcPct <= cleanMax ? 1 : fcPct >= noisyMin ? 3 : 2
+    if vxOk
+        fcHistV.push(fcV)
+        if fcHistV.size() > rankDays
+            fcHistV.shift()
     if ok
-        fcHist.push(fc)
-        if fcHist.size() > rankDays
-            fcHist.shift()
+        fcHistN.push(fcN)
+        if fcHistN.size() > rankDays
+            fcHistN.shift()
     dayLive := true
     typeSet := true
 
@@ -176,6 +216,7 @@ var float mvLvl   = na
 var int   mvBar   = na
 var int   mvRes   = 0          // +1 continued · -1 gave back · 0 unresolved
 var float mvBack  = 0.0
+var bool  mvFast  = false
 bool moveNow = false
 
 if typeSet
@@ -184,6 +225,7 @@ if typeSet
     mvBar  := na
     mvRes  := 0
     mvBack := 0.0
+    mvFast := false
 
 if dayLive and inCash
     cHigh := math.max(cHigh, high)
@@ -199,11 +241,13 @@ if dayLive and inCash
             mvDir := 1
             mvLvl := up
             mvBar := bar_index
+            mvFast := time - cOpenT < 30 * 60 * 1000
             moveNow := true
         if hd and not hu
             mvDir := -1
             mvLvl := dn
             mvBar := bar_index
+            mvFast := time - cOpenT < 30 * 60 * 1000
             moveNow := true
     if (mvDir == 1 or mvDir == -1) and bar_index > mvBar
         float ext  = mvDir == 1 ? high - mvLvl : mvLvl - low
@@ -273,8 +317,11 @@ f_cont(int t) =>
 f_depth(int t)   => t > 0 and recs.get(t).depth.size() > 0 ? recs.get(t).depth.median() : na
 f_moveRate(int t)=> t > 0 and recs.get(t).moved.size() > 0 ? 100.0 * recs.get(t).moved.avg() : na
 f_measured(int t)=> f_nMoves(t) >= minMeasured
+f_mrUse(int t)   => t > 0 and recs.get(t).moved.size() >= minMeasured ? f_moveRate(t) : f_res(t, 2, dVix)
+f_contUse(int t) => f_measured(t) ? f_cont(t) : f_res(t, 0, dVix)
+f_odds(int t)    => t == 0 ? "" : "move ~" + str.tostring(math.round(f_mrUse(t))) + "%  ·  if it moves, continues ~" + str.tostring(math.round(f_contUse(t))) + "%"
 // Pullback depth used for drawing: measured median once there is enough history, else research
-f_pullUse(int t) => f_measured(t) ? f_depth(t) : f_res(t, 1)
+f_pullUse(int t) => f_measured(t) ? f_depth(t) : f_res(t, 1, dVix)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -312,7 +359,7 @@ if typeSet and showBox
     color c = f_col(dayType)
     curBox := box.new(time, high, time, low, xloc = xloc.bar_time,
          bgcolor = color.new(c, boxTransp), border_color = color.new(c, 30), border_width = 1,
-         text = f_name(dayType) + "  ·  " + f_note(dayType), text_color = c, text_size = size.small,
+         text = f_name(dayType) + "  ·  " + f_odds(dayType), text_color = c, text_size = size.small,
          text_halign = text.align_left, text_valign = text.align_top)
     boxes.push(curBox)
     f_trimB(boxes, historyDays)
@@ -339,7 +386,7 @@ if dayLive and inCash and not typeSet
 
 if moveNow and dayType > 0
     color c = f_col(dayType)
-    labels.push(label.new(time, mvLvl, mvDir == 1 ? "MOVE ▲" : "MOVE ▼", xloc = xloc.bar_time,
+    labels.push(label.new(time, mvLvl, (mvDir == 1 ? "MOVE ▲" : "MOVE ▼") + (mvFast ? "  FAST ~60%" : ""), xloc = xloc.bar_time,
          style = mvDir == 1 ? label.style_label_down : label.style_label_up,
          color = color.new(c, 20), textcolor = color.white, size = size.tiny))
     f_trimT(labels, historyDays)
@@ -372,15 +419,16 @@ if showPanel and barstate.islast
         f_cell(0, 0, "TODAY", dim, hbg)
         f_cell(1, 0, f_name(dayType), f_col(dayType), hbg)
         f_cell(2, 0, f_note(dayType), f_col(dayType), hbg)
-        for k = 3 to 6
+        f_cell(3, 0, f_odds(dayType), f_col(dayType), hbg)
+        for k = 4 to 6
             f_cell(k, 0, "", dim, hbg)
         f_cell(0, 1, "Forecast rank", dim, bg)
         f_cell(1, 1, na(fcPct) ? "—" : str.tostring(math.round(fcPct)) + "%", dim, bg)
-        f_cell(2, 1, "VIX " + f_fmt(inVix, "#.00") + "× avg · ON " + f_fmt(inON_, "#.00") + " · prev " + f_fmt(inPrev, "#.00") + " · gap " + f_fmt(inGap, "#.00") + " ATR", dim, bg)
+        f_cell(2, 1, (dVix ? "VIX " + f_fmt(inVix, "#.00") + "× avg · " : useVix ? "VIX unavailable · " : "VIX off · ") + "ON " + f_fmt(inON_, "#.00") + " · prev " + f_fmt(inPrev, "#.00") + " · gap " + f_fmt(inGap, "#.00") + " ATR", dim, bg)
         for k = 3 to 6
             f_cell(k, 1, "", dim, bg)
         f_cell(0, 2, "", dim, hbg)
-        f_cell(1, 2, "RESEARCH " + model, dim, hbg)
+        f_cell(1, 2, "RESEARCH " + model + (dVix ? " · VIX" : " · no VIX"), dim, hbg)
         f_cell(2, 2, "", dim, hbg)
         f_cell(3, 2, "", dim, hbg)
         f_cell(4, 2, "THIS CHART", dim, hbg)
@@ -396,9 +444,9 @@ if showPanel and barstate.islast
         for t = 1 to 4
             bool ms = f_measured(t)
             f_cell(0, 3 + t, f_name(t), f_col(t), bg)
-            f_cell(1, 3 + t, str.tostring(f_res(t, 0), "#") + "%", dim, bg)
-            f_cell(2, 3 + t, str.tostring(f_res(t, 1), "#.00"), dim, bg)
-            f_cell(3, 3 + t, str.tostring(f_res(t, 2), "#") + "%", dim, bg)
+            f_cell(1, 3 + t, str.tostring(f_res(t, 0, dVix), "#") + "%", dim, bg)
+            f_cell(2, 3 + t, str.tostring(f_res(t, 1, dVix), "#.00"), dim, bg)
+            f_cell(3, 3 + t, str.tostring(f_res(t, 2, dVix), "#") + "%", dim, bg)
             f_cell(4, 3 + t, ms ? f_fmt(f_cont(t), "#") + "%" : "need " + str.tostring(minMeasured), ms ? f_col(t) : dim, bg)
             f_cell(5, 3 + t, ms ? f_fmt(f_depth(t), "#.00") : "—", dim, bg)
             f_cell(6, 3 + t, str.tostring(f_nMoves(t)), dim, bg)
@@ -409,10 +457,12 @@ if showPanel and barstate.islast
 plot(dayLive ? float(dayType) : na, "Day Type (1 clean 2 normal 3 noisy 4 avoid)", display = display.data_window)
 plot(dayLive ? fcPct : na, "Forecast Percentile", display = display.data_window)
 plot(dayLive ? inVix : na, "VIX / 20d Avg", display = display.data_window)
+plot(dayLive ? (dVix ? 1.0 : 0.0) : na, "VIX Used (1/0)", display = display.data_window)
 plot(dayLive ? inON_ : na, "Overnight Range / ATR", display = display.data_window)
 plot(dayLive ? inPrev : na, "Prior Cash Range / ATR", display = display.data_window)
 plot(dayLive ? inGap : na, "Gap / ATR", display = display.data_window)
 plot(dayLive and (mvDir == 1 or mvDir == -1) ? float(mvDir) : na, "Move Direction", display = display.data_window)
+plot(dayLive and (mvDir == 1 or mvDir == -1) ? (mvFast ? 1.0 : 0.0) : na, "Move Was Fast (1/0)", display = display.data_window)
 plot(outRes, "Result: Move Continued (1/-1, 0 unresolved)", display = display.data_window)
 plot(outDepth, "Result: Pullback Depth (ATR)", display = display.data_window)
 
@@ -424,3 +474,4 @@ alertcondition(typeSet and dayType == 2, "NORMAL Day", "Cash open: NORMAL day")
 alertcondition(typeSet and dayType == 3, "NOISY Day", "Cash open: NOISY day - moves chop, use wide stops")
 alertcondition(typeSet and dayType == 4, "AVOID Day", "Cash open: FOMC day - moves tend to fail")
 alertcondition(moveNow and dayType == 1, "Move On CLEAN Day", "0.5 ATR move from the open on a CLEAN day")
+alertcondition(moveNow and mvFast, "FAST Move", "0.5 ATR move within 30 minutes of the open")
