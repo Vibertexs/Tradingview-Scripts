@@ -1,0 +1,58 @@
+//@version=6
+indicator("Trend Health", shorttitle="Trend Health", overlay=false, precision=1)
+
+// ─── Inputs ───
+len        = input.int(20,    "Lookback",                  minval=5)
+strongThr  = input.float(55.0,"Strong threshold",          minval=0, maxval=100)
+maLen      = input.int(50,    "Stretch mean length",       minval=5)
+atrLen     = input.int(14,    "ATR length",                minval=1)
+stretchThr = input.float(2.5, "Stretch threshold (ATR)",   minval=0.5, step=0.1)
+smoothLen  = input.int(5,     "Velocity smoothing",        minval=1)
+accelBars  = input.int(2,     "Accel confirm bars",        minval=1)
+
+// ─── Strength: efficiency × cleanliness ───
+path   = math.sum(math.abs(close - close[1]), len)
+er     = path > 0 ? math.abs(close - close[len]) / path : 0.0      // Kaufman efficiency ratio
+r      = nz(ta.correlation(close, bar_index, len))
+r2     = r * r                                                     // regression R²
+health = 100 * math.sqrt(er * r2)                                  // 0-100
+dir    = int(math.sign(r))
+strong = health >= strongThr
+
+// ─── Exhaustion inputs: acceleration + stretch ───
+sm  = ta.ema(close, smoothLen)
+vel = ta.change(sm)
+acc = ta.ema(ta.change(vel), smoothLen)
+z   = (close - ta.ema(close, maLen)) / ta.atr(atrLen)
+
+// ─── State ───
+var int  trend  = 0       // 1 = strong up leg in progress, -1 = strong down leg
+var bool locked = false   // after an exit, wait for health to reset before re-arming
+
+if not strong
+    locked := false
+if strong and not locked
+    trend := dir
+
+armedUp = trend == 1  and (not strong or z >=  stretchThr)
+armedDn = trend == -1 and (not strong or z <= -stretchThr)
+
+accDownRun = math.sum(acc < 0 ? 1 : 0, accelBars) == accelBars
+accUpRun   = math.sum(acc > 0 ? 1 : 0, accelBars) == accelBars
+
+exitUp = armedUp and accDownRun
+exitDn = armedDn and accUpRun
+
+armed = armedUp or armedDn
+
+if exitUp or exitDn
+    trend  := 0
+    locked := true
+
+// ─── Plots ───
+col = armed ? color.orange : not strong ? color.gray : dir > 0 ? color.teal : color.red
+plot(health, "Health", col, 2)
+hline(strongThr, "Strong", color.new(color.gray, 50), hline.style_dashed)
+
+plotshape(exitUp, "Exhaustion (up)",   shape.xcross, location.abovebar, color.orange, size=size.small, force_overlay=true)
+plotshape(exitDn, "Exhaustion (down)", shape.xcross, location.belowbar, color.orange, size=size.small, force_overlay=true)
