@@ -1,14 +1,19 @@
 //@version=6
-indicator("Trend Health", shorttitle="Trend Health", overlay=false, precision=1)
+indicator("Trend Health", overlay=false, precision=1)
 
 // ─── Inputs ───
-len        = input.int(20,    "Lookback",                  minval=5)
-strongThr  = input.float(55.0,"Strong threshold",          minval=0, maxval=100)
-maLen      = input.int(50,    "Stretch mean length",       minval=5)
-atrLen     = input.int(14,    "ATR length",                minval=1)
-stretchThr = input.float(2.5, "Stretch threshold (ATR)",   minval=0.5, step=0.1)
-smoothLen  = input.int(5,     "Velocity smoothing",        minval=1)
-accelBars  = input.int(2,     "Accel confirm bars",        minval=1)
+len        = input.int(20,    "Lookback",                minval=5)
+strongThr  = input.float(55.0,"Strong threshold",        minval=0, maxval=100)
+maLen      = input.int(50,    "Stretch mean length",     minval=5)
+atrLen     = input.int(14,    "ATR length",              minval=1)
+stretchThr = input.float(2.5, "Stretch threshold (ATR)", minval=0.5, step=0.1)
+smoothLen  = input.int(5,     "Velocity smoothing",      minval=1)
+accelBars  = input.int(2,     "Accel confirm bars",      minval=1)
+
+baseThr    = input.float(30.0,"Base threshold",              minval=0, maxval=100,        group="Trend start")
+igLen      = input.int(5,     "Ignition length",             minval=2,                    group="Trend start")
+igER       = input.float(0.6, "Ignition efficiency",         minval=0, maxval=1, step=0.05, group="Trend start")
+igDisp     = input.float(1.0, "Ignition displacement (ATR)", minval=0, step=0.1,          group="Trend start")
 
 // ─── Strength: efficiency × cleanliness ───
 path   = math.sum(math.abs(close - close[1]), len)
@@ -19,21 +24,41 @@ health = 100 * math.sqrt(er * r2)                                  // 0-100
 dir    = int(math.sign(r))
 strong = health >= strongThr
 
-// ─── Exhaustion inputs: acceleration + stretch ───
+// ─── Velocity, acceleration, stretch ───
+atr = ta.atr(atrLen)
 sm  = ta.ema(close, smoothLen)
 vel = ta.change(sm)
 acc = ta.ema(ta.change(vel), smoothLen)
-z   = (close - ta.ema(close, maLen)) / ta.atr(atrLen)
+z   = (close - ta.ema(close, maLen)) / atr
+
+// ─── Ignition: short-window efficiency + displacement ───
+igPath = math.sum(math.abs(close - close[1]), igLen)
+igMove = close - close[igLen]
+erFast = igPath > 0 ? math.abs(igMove) / igPath : 0.0
+based  = ta.lowest(health, len) < baseThr                          // came out of a weak/choppy base
 
 // ─── State ───
-var int  trend  = 0       // 1 = strong up leg in progress, -1 = strong down leg
-var bool locked = false   // after an exit, wait for health to reset before re-arming
+var int  trend     = 0      // 1 = strong up leg in progress, -1 = strong down leg
+var bool locked    = false  // after an exit, wait for health to reset before re-arming
+var int  lastStart = 0      // one start signal per leg
 
 if not strong
     locked := false
 if strong and not locked
     trend := dir
+if health < baseThr
+    lastStart := 0
 
+// Trend start
+startUp = trend == 0 and based and erFast >= igER and igMove >=  igDisp * atr and vel > 0 and acc > 0 and lastStart != 1
+startDn = trend == 0 and based and erFast >= igER and igMove <= -igDisp * atr and vel < 0 and acc < 0 and lastStart != -1
+
+if startUp
+    lastStart := 1
+if startDn
+    lastStart := -1
+
+// Exhaustion
 armedUp = trend == 1  and (not strong or z >=  stretchThr)
 armedDn = trend == -1 and (not strong or z <= -stretchThr)
 
@@ -53,6 +78,9 @@ if exitUp or exitDn
 col = armed ? color.orange : not strong ? color.gray : dir > 0 ? color.teal : color.red
 plot(health, "Health", col, 2)
 hline(strongThr, "Strong", color.new(color.gray, 50), hline.style_dashed)
+hline(baseThr,   "Base",   color.new(color.gray, 70), hline.style_dotted)
 
-plotshape(exitUp, "Exhaustion (up)",   shape.xcross, location.abovebar, color.orange, size=size.small, force_overlay=true)
-plotshape(exitDn, "Exhaustion (down)", shape.xcross, location.belowbar, color.orange, size=size.small, force_overlay=true)
+plotshape(startUp, "Trend start (up)",   shape.triangleup,   location.belowbar, color.teal, size=size.small, force_overlay=true)
+plotshape(startDn, "Trend start (down)", shape.triangledown, location.abovebar, color.red,  size=size.small, force_overlay=true)
+plotshape(exitUp,  "Exhaustion (up)",    shape.xcross,       location.abovebar, color.orange, size=size.small, force_overlay=true)
+plotshape(exitDn,  "Exhaustion (down)",  shape.xcross,       location.belowbar, color.orange, size=size.small, force_overlay=true)
