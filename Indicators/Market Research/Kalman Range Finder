@@ -1,10 +1,19 @@
 //@version=6
-// Range Finder [Kalman] v5.13 - Lux Core + LTF Trigger Level
+// Range Finder [Kalman] v5.15 - Lux Core + Intrabar Wick Trigger + Edge Test
 //
 // Purpose:
 //   Detect a selectable confirmed-HTF range using Lux-style close containment and
 //   mean +/- ATR boundaries, keep our trend guards and breakout engine,
 //   and warn early on the chart timeframe when price forcefully escapes the range.
+//
+// v5.15 Edge Test (no detector or signal logic was touched):
+//   Hypothesis: after an LTF break signal inside the London window, price reaches
+//   Test RR x (distance from entry to box center) BEFORE it crosses back through the
+//   box center more often than a random walk would. For a driftless random walk the
+//   chance of hitting +RR before -1 is 1 / (1 + RR) (40% at RR 1.5), so that is the
+//   number to beat. The table reports the hit rate, a z-score against that null,
+//   average R, and how often price reached 1R / 1.5R / 2R / 3R before the center.
+//   Trades still open at the end of the trading day are closed at the next open.
 //
 // v5.12-v5.13 detector architecture:
 //   1) Lux-style core: current mean of the range window + confirmed HTF ATR(500).
@@ -19,7 +28,34 @@
 //   6) Rejected-probe absorption is user-selectable again.
 //   7) v5.13 replaces the fuzzy LTF distance/sensitivity gate with one visible
 //      breakout trigger level: HTF edge +/- a user-set % of HTF range height.
-//      The arrow only prints when LTF price actually crosses that trigger.
+//
+// v5.14 LTF changes (no detector logic was touched):
+//   A) Intrabar wick trigger. The signal fires the moment the RUNNING high/low
+//      reaches the trigger level. Every gate on the intrabar path is monotone
+//      non-decreasing within the live bar (high is a running max, low a running
+//      min, open is fixed, ATR is locked to the prior bar), so once the arrow
+//      prints it cannot vanish before the bar closes. close, body size and
+//      close-location are NOT monotone and are excluded from that path entirely.
+//   B) Momentum gates normalised against a random-walk null. For driftless BM
+//      sampled as OHLC bars, E[N-bar range] = ATR * sqrt(N), so the drive ratio
+//      has expectation ~1.0 under the null at ANY lookback. 1.0 is the noise line
+//      and the threshold is lookback-invariant.
+//   C) Trigger distance floored in ATR units and absolute price units, so a narrow
+//      HTF box cannot put the trigger inside the spread + noise band.
+//   D) Failed attempts widen that side's trigger (escalation), then reset on a
+//      clean escape or a new range.
+//   E) Failed-break marks (trigger crossed, LTF bar closed back inside the box)
+//      exposed as their own signal stream for the mean-reversion variant.
+//   F) Wick and close streams plot separately so they can be compared on one chart.
+//
+// v5.14.1 plot-budget fix (RE10140):
+//   Pine charges TWO plot slots for any plot()/plotshape() whose color argument is
+//   a series value, which color.new(inputColor, n) produces. Twelve coloured calls
+//   pushed the script to 72 against the hard limit of 64. Dead plots (the two
+//   hard-disabled HTF confirm levels and the two hard-disabled probe shapes) were
+//   removed and the Data Window set was trimmed from 38 to 26 series. Budget now:
+//   2 coloured plots (4) + 6 coloured shapes (12) + 10 alerts (10) + 26 plain
+//   plots (26) = 52 of 64, leaving room for a few more diagnostics later.
 //
 // Containment concept derived from Range Detector [LuxAlgo], (c) LuxAlgo,
 // licensed CC BY-NC-SA 4.0. This implementation is rewritten for confirmed MTF
@@ -27,7 +63,7 @@
 //
 // CC BY-NC-SA 4.0
 // https://creativecommons.org/licenses/by-nc-sa/4.0/
-indicator("Range Finder [Kalman] v5.13 - Lux Core Trigger", overlay = true,
+indicator("Range Finder [Kalman] v5.15 - Lux Core Intrabar Trigger + Edge Test", overlay = true,
      max_boxes_count = 500, max_labels_count = 100, max_lines_count = 500, max_bars_back = 750)
 
 // -----------------------------------------------------------------------------
@@ -38,6 +74,8 @@ var string G_CORE  = "Lux-Core Range Detection"
 var string G_ADAPT = "Range Adaptability"
 var string G_BRK   = "HTF Breakout"
 var string G_EARLY = "LTF Early HTF Break"
+var string G_MOM   = "LTF Break Momentum"
+var string G_TEST  = "Edge Test"
 var string G_STY   = "Style"
 
 structureTf = input.timeframe("60", "Structure Timeframe", group = G_MTF,
@@ -64,20 +102,38 @@ float adaptiveMinPriceOverlap = 0.50
 float adaptiveMaxCenterShiftAtr = 0.90
 float escapePct = 15.0
 float escapeCapAtr = 1.50
-bool showTriggers = false
-bool showProbes = false
 
+// ---- LTF Early HTF Break (v5.14 intrabar) -----------------------------------
 useEarlyBreak = input.bool(true, "Show Early Break Arrow", group = G_EARLY)
-earlyBreakTiming = input.string("Closed LTF bar", "Signal Timing", options = ["Closed LTF bar", "Live LTF bar"], group = G_EARLY,
-     tooltip = "Closed requires an LTF candle close through the trigger level. Live can warn as realtime price crosses it, but the arrow can disappear if price rejects before close.")
-ltfBreakLevelPct = input.float(5.0, "LTF Break Level (% of HTF Range)", minval = 0.5, maxval = 20.0, step = 0.5, group = G_EARLY,
-     tooltip = "The only main LTF breakout-distance setting. Example: 5 means the trigger sits 5% of the HTF range height beyond the top/bottom edge. The arrow cannot print until price crosses that level.")
+earlyBreakMode = input.string("Wick (intrabar)", "Signal Timing",
+     options = ["Wick (intrabar)", "Close (confirmed)", "Both"], group = G_EARLY,
+     tooltip = "Wick fires the moment the running high/low reaches the trigger level. It cannot vanish before the bar closes because every gate is monotone within the bar. Close waits for an LTF close beyond the level. Both prints each stream separately so you can compare them on the same chart.")
+ltfBreakLevelPct = input.float(5.0, "Trigger Distance (% of HTF Range)", minval = 0.5, maxval = 20.0, step = 0.5, group = G_EARLY,
+     tooltip = "Base trigger distance beyond the HTF edge, as a percent of HTF range height.")
+ltfBreakMinAtr = input.float(0.35, "Trigger Floor (x LTF ATR14)", minval = 0.0, maxval = 3.0, step = 0.05, group = G_EARLY,
+     tooltip = "Hard floor on the trigger distance in LTF ATR units. Prevents the trigger sitting inside the noise band when the HTF range is narrow. This is the main gold setting.")
+ltfBreakMinPoints = input.float(0.0, "Trigger Floor (price units)", minval = 0.0, step = 0.01, group = G_EARLY,
+     tooltip = "Absolute floor in instrument price units. Set to roughly 3x measured round-trip cost, or leave 0 and let the ATR floor dominate.")
+escalateAfterFail = input.float(0.50, "Widen Trigger per Failed Attempt", minval = 0.0, maxval = 2.0, step = 0.1, group = G_EARLY,
+     tooltip = "Each failed escape on a side pushes that side's trigger further out. 0.5 = +50% per failure, capped at 3 failures. Set 0 to disable.")
+cooldownBars = input.int(3, "Re-arm Cooldown (LTF bars)", minval = 0, maxval = 50, group = G_EARLY)
+showFadeSignal = input.bool(true, "Mark Failed Breaks (fade setup)", group = G_EARLY,
+     tooltip = "Marks bars where the trigger was crossed and the LTF bar then closed back inside the HTF box.")
 
-// Secondary LTF candle-quality checks are intentionally hard-coded. The visible
-// trigger level is the main decision rule; these only reject extremely weak drifts.
-float earlyBodyAtrTarget = 0.45
-float earlyRangeAtrTarget = 0.75
-bool earlyRequireDirectionalBody = true
+thrustOpenAtr = input.float(0.55, "Min Excursion from Bar Open (x ATR)", minval = 0.0, maxval = 3.0, step = 0.05, group = G_MOM,
+     tooltip = "How far price must have travelled from THIS bar's open in the break direction. Monotone within the bar, so it never un-triggers.")
+driveLen = input.int(6, "Drive Lookback (bars)", minval = 2, maxval = 100, group = G_MOM)
+driveRatioMin = input.float(1.30, "Min Drive Ratio", minval = 0.5, maxval = 4.0, step = 0.05, group = G_MOM,
+     tooltip = "N-bar excursion divided by ATR*sqrt(N). Under a driftless random walk this has expectation ~1.0 at any N, so 1.0 is the noise line and the threshold is lookback-invariant.")
+useSessionGate = input.bool(false, "Restrict to Session", group = G_MOM,
+     tooltip = "OFF by default. This is a filter, not an entry primitive. Test it as a separate variant after the base trigger has been measured.")
+sessionSpec = input.session("0800-1700", "Allowed Session", group = G_MOM)
+
+testOn = input.bool(true, "Show Edge Test", group = G_TEST)
+testRR = input.float(1.5, "Test RR (target / distance to center)", minval = 0.5, maxval = 5.0, step = 0.25, group = G_TEST,
+     tooltip = "Target = entry + RR x (entry to box center). Stop = box center.")
+testSess = input.session("0800-1600", "Signal Window (London time)", group = G_TEST,
+     tooltip = "Only signals inside this window are tested. Trades are followed until target, center, or the end of the trading day.")
 
 showBoxes = input.bool(true, "Show HTF Range Boxes", group = G_STY)
 boxTransp = input.int(90, "Range Fill Transparency", minval = 0, maxval = 100, group = G_STY)
@@ -109,9 +165,6 @@ float maxDrift = 0.30 + s * 0.035
 int minTrendGuards = rangeSensitivity >= 6 ? 2 : 3
 float breakBufferAtr = rangeSensitivity >= 9 ? 0.10 : rangeSensitivity >= 6 ? 0.15 : 0.20
 float escapeFrac = escapePct / 100.0
-
-// LTF breakout distance is now explicit and visible rather than hidden behind
-// a sensitivity mapping. All other LTF thresholds remain fixed.
 
 // -----------------------------------------------------------------------------
 // Confirmed selectable-HTF feed
@@ -206,8 +259,6 @@ var float sSlopeAtr = na
 var float sDrift = na
 var float sOverlap = na
 var float sWidthSlowAtr = na
-var float sBreakUpLevel = na
-var float sBreakDownLevel = na
 
 bool rangeStarted = false
 bool rangeAdapted = false
@@ -516,9 +567,6 @@ if newStructData
         sCandidateStreak := 0
         rangeStarted := true
 
-    sBreakUpLevel := sInRange ? sTop + atrSafe0 * breakBufferAtr : na
-    sBreakDownLevel := sInRange ? sBot - atrSafe0 * breakBufferAtr : na
-
 // -----------------------------------------------------------------------------
 // HTF range drawing on any lower chart timeframe
 // -----------------------------------------------------------------------------
@@ -549,81 +597,287 @@ if not showBoxes and not na(rBox)
     rBox := na
 
 // -----------------------------------------------------------------------------
-// LTF early HTF-break trigger engine
+// LTF early HTF-break trigger engine (v5.14 - intrabar wick trigger)
+//
+// Design rule: every quantity that can fire an intrabar signal must be MONOTONE
+// non-decreasing within the live bar. high is a running max, low is a running min,
+// open is fixed, and ATR is LOCKED to the previous bar so the trigger level and
+// the normaliser cannot move mid-bar. Once such a condition turns true it cannot
+// turn false before the bar closes, so the arrow cannot vanish. close, body size
+// and close-location are NOT monotone and are excluded from the intrabar path.
 // -----------------------------------------------------------------------------
-float ltfAtr = ta.atr(14)
-float ltfAtrSafe = math.max(ltfAtr, syminfo.mintick)
-float candleRange = math.max(high - low, syminfo.mintick)
-float candleBody = math.abs(close - open)
-float bodyEfficiency = f_clamp01(candleBody / candleRange)
-float rangeExpansion = f_clamp01((candleRange / ltfAtrSafe) / math.max(earlyRangeAtrTarget, 0.05))
-float bodyExpansion = f_clamp01((candleBody / ltfAtrSafe) / math.max(earlyBodyAtrTarget, 0.05))
-float closeLocBull = f_clamp01((close - low) / candleRange)
-float closeLocBear = f_clamp01((high - close) / candleRange)
+float ltfAtrRaw = ta.atr(14)
+// Lock ATR to the prior bar. ta.atr(14) on the live bar rises as the bar's true
+// range grows, which would make the trigger level and the drive normaliser drift
+// mid-bar and reintroduce repainting. Locking removes that entirely.
+float ltfAtrLocked = nz(ltfAtrRaw[1], ltfAtrRaw)
+float ltfAtrSafe = math.max(ltfAtrLocked, syminfo.mintick)
 float htfRangeW = sInRange ? math.max(sTop - sBot, syminfo.mintick) : na
 
-// One explicit trigger level on each side of the active HTF box. This is the
-// primary LTF break rule. A shallow poke beyond the box is NOT a break.
-float ltfBreakDistance = sInRange ? htfRangeW * ltfBreakLevelPct / 100.0 : na
-float ltfBreakUpLevel = sInRange ? sTop + ltfBreakDistance : na
-float ltfBreakDownLevel = sInRange ? sBot - ltfBreakDistance : na
+// Monotone intrabar momentum primitives.
+float excUp = high - open
+float excDn = open - low
+float driveLow = ta.lowest(low, driveLen)
+float driveHigh = ta.highest(high, driveLen)
+// Random-walk normaliser: E[N-bar range] = ATR * sqrt(N) for driftless BM sampled
+// as OHLC bars, so a ratio of 1.0 is what pure noise produces at ANY lookback.
+float driveNorm = ltfAtrSafe * math.sqrt(float(driveLen))
+float driveRatioUp = (high - driveLow) / driveNorm
+float driveRatioDn = (driveHigh - low) / driveNorm
 
-float distBeyondUp = sInRange ? math.max(0.0, close - sTop) : 0.0
-float distBeyondDown = sInRange ? math.max(0.0, sBot - close) : 0.0
+// -----------------------------------------------------------------------------
+// LTF signal state
+// -----------------------------------------------------------------------------
+var int failUp = 0
+var int failDn = 0
+var bool armWickUp = true
+var bool armWickDn = true
+var bool armCloseUp = true
+var bool armCloseDn = true
+var int lastFireUpBar = na
+var int lastFireDnBar = na
+var bool pendingUp = false
+var bool pendingDn = false
+var int fireBarWickUp = na
+var int fireBarWickDn = na
+var int fireBarCloseUp = na
+var int fireBarCloseDn = na
+var int failedUpBar = na
+var int failedDnBar = na
+
+// A brand new HTF range clears all escalation and arming state.
+if rangeStarted
+    armWickUp := true
+    armWickDn := true
+    armCloseUp := true
+    armCloseDn := true
+    failUp := 0
+    failDn := 0
+    pendingUp := false
+    pendingDn := false
+
+// Failed-attempt escalation. Gold in particular runs an edge, fails, then runs it
+// again; each failure should cost the next attempt more room, not less.
+float escUpMult = 1.0 + escalateAfterFail * float(failUp)
+float escDnMult = 1.0 + escalateAfterFail * float(failDn)
+
+// Trigger distance: percent of HTF range, floored by ATR and by an absolute
+// price amount. The floor is what keeps the trigger outside spread + noise.
+float baseTrigDist = sInRange ? math.max(htfRangeW * ltfBreakLevelPct / 100.0, math.max(ltfBreakMinAtr * ltfAtrSafe, ltfBreakMinPoints)) : na
+float ltfBreakDistance = baseTrigDist
+float trigDistUp = sInRange ? baseTrigDist * escUpMult : na
+float trigDistDn = sInRange ? baseTrigDist * escDnMult : na
+float ltfBreakUpLevel = sInRange ? sTop + trigDistUp : na
+float ltfBreakDownLevel = sInRange ? sBot - trigDistDn : na
+
+// Penetration measured with wicks, not closes.
+float distBeyondUp = sInRange ? math.max(0.0, high - sTop) : 0.0
+float distBeyondDown = sInRange ? math.max(0.0, sBot - low) : 0.0
 float distPctUp = sInRange and htfRangeW > 0 ? distBeyondUp / htfRangeW * 100.0 : 0.0
 float distPctDown = sInRange and htfRangeW > 0 ? distBeyondDown / htfRangeW * 100.0 : 0.0
 
-// Force remains diagnostic/secondary. Once the set trigger level is crossed, we
-// only reject extremely weak drifts; there is no hidden force-score threshold.
-float edgeQUp = sInRange and ltfBreakDistance > 0 ? f_clamp01(distBeyondUp / (ltfBreakDistance * 1.50)) : 0.0
-float edgeQDown = sInRange and ltfBreakDistance > 0 ? f_clamp01(distBeyondDown / (ltfBreakDistance * 1.50)) : 0.0
-float forceUp = 100.0 * (0.15 * bodyEfficiency + 0.25 * rangeExpansion + 0.20 * bodyExpansion + 0.10 * closeLocBull + 0.30 * edgeQUp)
-float forceDown = 100.0 * (0.15 * bodyEfficiency + 0.25 * rangeExpansion + 0.20 * bodyExpansion + 0.10 * closeLocBear + 0.30 * edgeQDown)
+// No composite force score. Each gate below is an independent AND condition, which
+// is what makes the trigger separable in testing; a blended 0-100 score would hide
+// which condition actually did the work.
 
-bool timingOk = earlyBreakTiming == "Live LTF bar" ? true : barstate.isconfirmed
-bool bodyDirUp = not earlyRequireDirectionalBody or close > open
-bool bodyDirDown = not earlyRequireDirectionalBody or close < open
+// Session gate must be evaluated unconditionally.
+bool sessionActive = not na(time(timeframe.period, sessionSpec))
+bool sessionOk = not useSessionGate or sessionActive
 
-// It must CROSS the set level, not merely remain somewhere outside the range.
-// Using the current trigger against the previous close also prevents an adaptive
-// boundary change from repeatedly printing while price is already beyond it.
-bool crossedUp = sInRange and not na(ltfBreakUpLevel) and close >= ltfBreakUpLevel and close[1] < ltfBreakUpLevel
-bool crossedDown = sInRange and not na(ltfBreakDownLevel) and close <= ltfBreakDownLevel and close[1] > ltfBreakDownLevel
+// Independent AND-gates rather than a composite score.
+bool momUp = excUp >= thrustOpenAtr * ltfAtrSafe and driveRatioUp >= driveRatioMin
+bool momDn = excDn >= thrustOpenAtr * ltfAtrSafe and driveRatioDn >= driveRatioMin
 
-// Very mild impulse veto only. The trigger distance does the real filtering.
-bool impulsePass = rangeExpansion >= 0.30 or bodyExpansion >= 0.30 or bodyEfficiency >= 0.60
+bool wickCrossUp = sInRange and not na(ltfBreakUpLevel) and high >= ltfBreakUpLevel
+bool wickCrossDn = sInRange and not na(ltfBreakDownLevel) and low <= ltfBreakDownLevel
+bool closeCrossUp = sInRange and not na(ltfBreakUpLevel) and close >= ltfBreakUpLevel
+bool closeCrossDn = sInRange and not na(ltfBreakDownLevel) and close <= ltfBreakDownLevel
 
-// Re-arm only after price closes back inside the actual HTF box. This avoids
-// multiple arrows from chopping around the trigger line during one escape attempt.
-var bool earlyUpArmed = true
-var bool earlyDownArmed = true
-if rangeStarted
-    earlyUpArmed := true
-    earlyDownArmed := true
-if sInRange
+bool wantWick = earlyBreakMode == "Wick (intrabar)" or earlyBreakMode == "Both"
+bool wantClose = earlyBreakMode == "Close (confirmed)" or earlyBreakMode == "Both"
+
+bool cdUpOk = na(lastFireUpBar) or bar_index - lastFireUpBar >= cooldownBars
+bool cdDnOk = na(lastFireDnBar) or bar_index - lastFireDnBar >= cooldownBars
+
+// Raw fires. Latched by bar_index so the signal survives every tick of the live
+// bar. Arm flags are mutated ONLY on confirmed bars, so realtime rollback cannot
+// produce inconsistent behaviour tick to tick.
+bool rawWickUp = useEarlyBreak and wantWick and armWickUp and cdUpOk and sessionOk and wickCrossUp and momUp
+bool rawWickDn = useEarlyBreak and wantWick and armWickDn and cdDnOk and sessionOk and wickCrossDn and momDn
+bool rawCloseUp = useEarlyBreak and wantClose and barstate.isconfirmed and armCloseUp and cdUpOk and sessionOk and closeCrossUp and momUp and close > open
+bool rawCloseDn = useEarlyBreak and wantClose and barstate.isconfirmed and armCloseDn and cdDnOk and sessionOk and closeCrossDn and momDn and close < open
+
+if rawWickUp
+    fireBarWickUp := bar_index
+if rawWickDn
+    fireBarWickDn := bar_index
+if rawCloseUp
+    fireBarCloseUp := bar_index
+if rawCloseDn
+    fireBarCloseDn := bar_index
+
+bool earlyUpWick = not na(fireBarWickUp) and fireBarWickUp == bar_index
+bool earlyDownWick = not na(fireBarWickDn) and fireBarWickDn == bar_index
+bool earlyUpClose = not na(fireBarCloseUp) and fireBarCloseUp == bar_index
+bool earlyDownClose = not na(fireBarCloseDn) and fireBarCloseDn == bar_index
+bool earlyUpNow = earlyUpWick or earlyUpClose
+bool earlyDownNow = earlyDownWick or earlyDownClose
+
+// Confirmed-bar state machine: disarm, resolve the outcome of the attempt, re-arm.
+if barstate.isconfirmed and sInRange
+    if earlyUpNow
+        armWickUp := false
+        armCloseUp := false
+        lastFireUpBar := bar_index
+        pendingUp := true
+    if earlyDownNow
+        armWickDn := false
+        armCloseDn := false
+        lastFireDnBar := bar_index
+        pendingDn := true
+
+    if pendingUp
+        if close < sTop
+            failUp := math.min(failUp + 1, 3)
+            pendingUp := false
+            failedUpBar := bar_index
+        else if close >= sTop + trigDistUp
+            failUp := 0
+            pendingUp := false
+    if pendingDn
+        if close > sBot
+            failDn := math.min(failDn + 1, 3)
+            pendingDn := false
+            failedDnBar := bar_index
+        else if close <= sBot - trigDistDn
+            failDn := 0
+            pendingDn := false
+
     if close <= sTop
-        earlyUpArmed := true
+        armWickUp := true
+        armCloseUp := true
     if close >= sBot
-        earlyDownArmed := true
+        armWickDn := true
+        armCloseDn := true
 
-bool earlyUpNow = useEarlyBreak and timingOk and earlyUpArmed and crossedUp and bodyDirUp and impulsePass
-bool earlyDownNow = useEarlyBreak and timingOk and earlyDownArmed and crossedDown and bodyDirDown and impulsePass
-if earlyUpNow
-    earlyUpArmed := false
-if earlyDownNow
-    earlyDownArmed := false
+// Failed break = trigger crossed, LTF bar closed back inside the box.
+// The fade direction is OPPOSITE the attempted break.
+bool fadeUpNow = showFadeSignal and not na(failedUpBar) and failedUpBar == bar_index
+bool fadeDownNow = showFadeSignal and not na(failedDnBar) and failedDnBar == bar_index
 
-// The trigger levels are intentionally visible so you can see exactly where an
-// LTF break becomes valid. They disappear when no HTF range is active.
+// Backtest fill reference. In wick mode a resting stop order fills AT the trigger
+// level, not at the close, which is the main measurable gain over close confirmation.
+float earlyFillPrice = earlyUpWick ? ltfBreakUpLevel : earlyDownWick ? ltfBreakDownLevel : earlyUpClose or earlyDownClose ? close : na
+
 plot(useEarlyBreak ? ltfBreakUpLevel : na, "LTF Break Trigger Up", color = color.new(bullColor, 55), style = plot.style_linebr, linewidth = 1)
 plot(useEarlyBreak ? ltfBreakDownLevel : na, "LTF Break Trigger Down", color = color.new(bearColor, 55), style = plot.style_linebr, linewidth = 1)
-plotshape(earlyUpNow, "Early HTF Break Up", style = shape.arrowup, location = location.belowbar, color = bullColor, size = size.small)
-plotshape(earlyDownNow, "Early HTF Break Down", style = shape.arrowdown, location = location.abovebar, color = bearColor, size = size.small)
+plotshape(earlyUpWick, "Early Break Up (wick)", style = shape.triangleup, location = location.belowbar, color = bullColor, size = size.small)
+plotshape(earlyDownWick, "Early Break Down (wick)", style = shape.triangledown, location = location.abovebar, color = bearColor, size = size.small)
+plotshape(earlyUpClose and not earlyUpWick, "Early Break Up (close)", style = shape.arrowup, location = location.belowbar, color = color.new(bullColor, 25), size = size.small)
+plotshape(earlyDownClose and not earlyDownWick, "Early Break Down (close)", style = shape.arrowdown, location = location.abovebar, color = color.new(bearColor, 25), size = size.small)
+plotshape(fadeUpNow, "Failed Break Up (fade short)", style = shape.xcross, location = location.abovebar, color = bearColor, size = size.tiny)
+plotshape(fadeDownNow, "Failed Break Down (fade long)", style = shape.xcross, location = location.belowbar, color = bullColor, size = size.tiny)
 
-plot(showTriggers ? sBreakUpLevel : na, "HTF Break Up Confirm Level", color = color.new(bullColor, 30), style = plot.style_linebr, linewidth = 1)
-plot(showTriggers ? sBreakDownLevel : na, "HTF Break Down Confirm Level", color = color.new(bearColor, 30), style = plot.style_linebr, linewidth = 1)
-plotshape(showProbes and probeOpened and probeOpenDir == 1, "HTF Probe Up", style = shape.triangleup, location = location.abovebar, color = color.new(bullColor, 35), size = size.tiny)
-plotshape(showProbes and probeOpened and probeOpenDir == -1, "HTF Probe Down", style = shape.triangledown, location = location.belowbar, color = color.new(bearColor, 35), size = size.tiny)
+// -----------------------------------------------------------------------------
+// Edge test (v5.15)
+//
+// Each London-window signal is followed from its fill price:
+//   stop   = box center at the signal (distance entry -> center = 1R)
+//   target = entry + Test RR x 1R
+//   end    = the next trading day starts (exit at that bar's open)
+// On the signal bar itself a wick fill's extreme always comes AFTER the fill, so
+// it counts toward the target only when that bar never touched the center.
+// Close fills start measuring on the next bar. When a later bar touches both
+// target and center, the center (loss) is assumed to come first.
+// -----------------------------------------------------------------------------
+bool tInSess = not na(time(timeframe.period, testSess, "Europe/London"))
+bool tNewDay = timeframe.change("D")
+
+var int   tDir    = 0
+var float tEntry  = na
+var float tCenter = na
+var float tRisk   = na
+var float tBest   = na
+var int   tBar    = na
+var bool  tHit    = false
+
+var int   tN    = 0
+var int   tWin  = 0
+var int   tLoss = 0
+var float tSumR = 0.0
+var int   tR1   = 0
+var int   tR15  = 0
+var int   tR2   = 0
+var int   tR3   = 0
+
+// Follow the open test trade.
+if tDir != 0 and bar_index > tBar
+    bool stopHit = (tDir == 1 and low <= tCenter) or (tDir == -1 and high >= tCenter)
+    bool ended = tNewDay or stopHit
+    if not ended
+        tBest := tDir == 1 ? math.max(tBest, high) : math.min(tBest, low)
+        if tDir * (tBest - tEntry) >= testRR * tRisk
+            tHit := true
+    if ended
+        if tHit
+            tWin += 1
+            tSumR += testRR
+        else if stopHit and not tNewDay
+            tLoss += 1
+            tSumR -= 1.0
+        else
+            tSumR += tDir * (open - tEntry) / tRisk
+        float mfeR = tDir * (tBest - tEntry) / tRisk
+        tR1  += mfeR >= 1.0 ? 1 : 0
+        tR15 += mfeR >= 1.5 ? 1 : 0
+        tR2  += mfeR >= 2.0 ? 1 : 0
+        tR3  += mfeR >= 3.0 ? 1 : 0
+        tN   += 1
+        tDir := 0
+
+// Open a test trade on a London-window signal.
+if testOn and tDir == 0 and (earlyUpNow or earlyDownNow) and tInSess and sInRange and not na(earlyFillPrice)
+    tDir    := earlyUpNow ? 1 : -1
+    tEntry  := earlyFillPrice
+    tCenter := (sTop + sBot) * 0.5
+    tRisk   := math.max(math.abs(tEntry - tCenter), syminfo.mintick)
+    tBar    := bar_index
+    tHit    := false
+    bool wickFill = earlyUpWick or earlyDownWick
+    bool cleanBar = tDir == 1 ? low > tCenter : high < tCenter
+    tBest   := wickFill and cleanBar ? (tDir == 1 ? high : low) : tEntry
+    if tDir * (tBest - tEntry) >= testRR * tRisk
+        tHit := true
+
+var table testTbl = table.new(position.bottom_right, 2, 7, bgcolor = color.new(color.black, 20))
+f_tc(int c, int r, string txt, color col) =>
+    table.cell(testTbl, c, r, txt, text_color = col, text_size = size.small, text_halign = text.align_left)
+f_pct(int k) =>
+    tN > 0 ? str.tostring(100.0 * k / tN, "#") + "%" : "—"
+
+if testOn and barstate.islast
+    int   resolved = tWin + tLoss
+    float p0       = 1.0 / (1.0 + testRR)
+    float pHit     = resolved > 0 ? float(tWin) / resolved : na
+    float zScore   = resolved > 0 ? (pHit - p0) / math.sqrt(p0 * (1.0 - p0) / resolved) : na
+    float avgR     = tN > 0 ? tSumR / tN : na
+    color w        = color.white
+    string verdict = na(zScore) ? "" : zScore >= 2.0 ? "  edge" : zScore <= -2.0 ? "  worse than random" : "  not proven"
+    color zCol     = na(zScore) ? w : zScore >= 2.0 ? bullColor : zScore <= -2.0 ? bearColor : w
+    f_tc(0, 0, "Edge test · RR " + str.tostring(testRR, "#.##"), w)
+    f_tc(1, 0, "London signals", w)
+    f_tc(0, 1, "Trades", w)
+    f_tc(1, 1, str.tostring(tN) + "  (" + str.tostring(tN - resolved) + " ran out of day)", w)
+    f_tc(0, 2, "Target before center", w)
+    f_tc(1, 2, na(pHit) ? "—" : str.tostring(100.0 * pHit, "#.0") + "%  vs random " + str.tostring(100.0 * p0, "#.0") + "%", w)
+    f_tc(0, 3, "z-score", w)
+    f_tc(1, 3, na(zScore) ? "—" : str.tostring(zScore, "#.00") + verdict, zCol)
+    f_tc(0, 4, "Avg R / trade", w)
+    f_tc(1, 4, na(avgR) ? "—" : str.tostring(avgR, "#.00"), na(avgR) ? w : avgR > 0 ? bullColor : bearColor)
+    f_tc(0, 5, "Reached before center", w)
+    f_tc(1, 5, "1R " + f_pct(tR1) + " · 1.5R " + f_pct(tR15) + " · 2R " + f_pct(tR2) + " · 3R " + f_pct(tR3), w)
+    f_tc(0, 6, "Random walk", w)
+    f_tc(1, 6, "1R 50% · 1.5R 40% · 2R 33% · 3R 25%", w)
 
 // -----------------------------------------------------------------------------
 // MTF badge
@@ -635,41 +889,55 @@ if barstate.islast
         table.cell(tfBadge, 0, 0, "Structure " + structureTf + " | Chart " + timeframe.period, text_color = color.white, bgcolor = color.new(rangeColor, 35))
         table.cell(tfBadge, 0, 1, stateText + " | Quality " + str.tostring(nz(sHybridQuality, 0.0), "#.0") + "/100", text_color = color.white, bgcolor = color.new(rangeColor, 60))
         table.cell(tfBadge, 0, 2, "Lux outside " + str.tostring(sLuxOutsideCount) + " / " + str.tostring(luxAllowedOutside), text_color = color.white, bgcolor = color.new(rangeColor, 70))
-        table.cell(tfBadge, 0, 3, "LTF trigger " + str.tostring(ltfBreakLevelPct, "#.0") + "% | force " + str.tostring(math.max(forceUp, forceDown), "#.0"), text_color = color.white, bgcolor = color.new(rangeColor, 75))
-        table.cell(tfBadge, 0, 4, "Adaptive " + (adaptiveRange ? "ON" : "OFF") + " | Absorb " + (absorbProbes ? "ON" : "OFF"), text_color = color.white, bgcolor = color.new(rangeColor, 80))
+        table.cell(tfBadge, 0, 3, "Trig " + str.tostring(nz(ltfBreakDistance, 0.0) / ltfAtrSafe, "#.00") + " ATR | fails " + str.tostring(failUp) + "/" + str.tostring(failDn), text_color = color.white, bgcolor = color.new(rangeColor, 75))
+        table.cell(tfBadge, 0, 4, "Mode " + earlyBreakMode + " | Drive " + str.tostring(math.max(driveRatioUp, driveRatioDn), "#.00"), text_color = color.white, bgcolor = color.new(rangeColor, 80))
     else
         for r = 0 to 4
             table.cell(tfBadge, 0, r, "", bgcolor = color.new(color.black, 100))
 
 // -----------------------------------------------------------------------------
 // Data Window diagnostics
+//
+// Plot budget: Pine charges 2 slots for any plot/plotshape with a series color,
+// so every series below is deliberately colourless (1 slot each). 26 series here
+// keeps the script at 52 of the 64 hard limit. Adding a coloured plot costs 2.
 // -----------------------------------------------------------------------------
+// Signal streams. Export these three for backtesting; the fill price is the one
+// that matters, since a wick signal fills at the trigger level, not at the close.
+plot(earlyUpWick ? 1.0 : earlyDownWick ? -1.0 : 0.0, "LTF Wick Signal (+1/-1)", display = display.data_window)
+plot(earlyUpClose ? 1.0 : earlyDownClose ? -1.0 : 0.0, "LTF Close Signal (+1/-1)", display = display.data_window)
+plot(fadeUpNow ? -1.0 : fadeDownNow ? 1.0 : 0.0, "Failed Break Fade (+1/-1)", display = display.data_window)
+plot(earlyFillPrice, "LTF Signal Fill Price", display = display.data_window)
 plot(brokeUp ? 1.0 : brokeDown ? -1.0 : 0.0, "HTF Confirmed Break (+1/-1)", display = display.data_window)
-plot(earlyUpNow ? 1.0 : earlyDownNow ? -1.0 : 0.0, "LTF Early Break (+1/-1)", display = display.data_window)
+
+// HTF range geometry and detector state.
 plot(sInRange ? sTop : na, "HTF Range Top", display = display.data_window)
 plot(sInRange ? sBot : na, "HTF Range Bottom", display = display.data_window)
 plot(sRangeCenter, "HTF Range Mean", display = display.data_window)
-plot(sContainment, "HTF Close Containment (%)", display = display.data_window)
-plot(float(sLuxOutsideCount), "HTF Lux Outside-Close Count", display = display.data_window)
-plot(sLuxBandHalfWidth, "HTF Lux Band Half-Width", display = display.data_window)
 plot(sHybridQuality, "HTF Lux-Core Range Quality (0-100)", display = display.data_window)
-plot(sSlowAtr, "HTF Slow ATR Baseline", display = display.data_window)
+plot(float(sLuxOutsideCount), "HTF Lux Outside-Close Count", display = display.data_window)
+plot(sContainment, "HTF Close Containment (%)", display = display.data_window)
 plot(sEfficiency, "HTF Path Efficiency", display = display.data_window)
 plot(sSlopeAtr, "HTF Slope / ATR", display = display.data_window)
 plot(sDrift, "HTF Drift Ratio", display = display.data_window)
-plot(sOverlap, "HTF Candle Overlap", display = display.data_window)
 plot(sWidthSlowAtr, "HTF Range Width / Slow ATR", display = display.data_window)
-plot(forceUp, "LTF Bull Break Force (0-100)", display = display.data_window)
-plot(forceDown, "LTF Bear Break Force (0-100)", display = display.data_window)
-plot(ltfBreakDistance, "LTF Break Trigger Distance", display = display.data_window)
-plot(ltfBreakUpLevel, "LTF Break Trigger Up (value)", display = display.data_window)
-plot(ltfBreakDownLevel, "LTF Break Trigger Down (value)", display = display.data_window)
+plot(sSlowAtr, "HTF Slow ATR Baseline", display = display.data_window)
+
+// LTF trigger geometry. Escalated distances already include the failure multiplier,
+// so the base distance is recoverable as escalated / (1 + escalate * fails).
+plot(trigDistUp, "LTF Trigger Distance Up (escalated)", display = display.data_window)
+plot(trigDistDn, "LTF Trigger Distance Down (escalated)", display = display.data_window)
+plot(float(failUp), "Failed Up Attempts", display = display.data_window)
+plot(float(failDn), "Failed Down Attempts", display = display.data_window)
 plot(distPctUp, "LTF Bull Distance Beyond Range (%)", display = display.data_window)
 plot(distPctDown, "LTF Bear Distance Beyond Range (%)", display = display.data_window)
-plot(distBeyondUp, "LTF Distance Beyond Top", display = display.data_window)
-plot(distBeyondDown, "LTF Distance Beyond Bottom", display = display.data_window)
-plot(float(winLen), "HTF Detection Window", display = display.data_window)
-plot(float(sRejects), "Rejected HTF Probes", display = display.data_window)
+
+// Momentum primitives. Drive ratio is normalised so 1.0 is the random-walk
+// expectation at any lookback; log these to calibrate driveRatioMin on real data.
+plot(driveRatioUp, "LTF Drive Ratio Up (noise=1.0)", display = display.data_window)
+plot(driveRatioDn, "LTF Drive Ratio Down (noise=1.0)", display = display.data_window)
+plot(excUp / ltfAtrSafe, "LTF Excursion From Open Up (ATR)", display = display.data_window)
+plot(excDn / ltfAtrSafe, "LTF Excursion From Open Down (ATR)", display = display.data_window)
 
 // -----------------------------------------------------------------------------
 // Alerts
@@ -680,5 +948,7 @@ alertcondition(probeOpened and probeOpenDir == 1, "HTF Probe Up", "A confirmed H
 alertcondition(probeOpened and probeOpenDir == -1, "HTF Probe Down", "A confirmed HTF candle probed below the active range")
 alertcondition(earlyUpNow, "Early HTF Break Up", "Chart-timeframe price crossed the configured LTF breakout trigger above the active HTF range")
 alertcondition(earlyDownNow, "Early HTF Break Down", "Chart-timeframe price crossed the configured LTF breakout trigger below the active HTF range")
+alertcondition(fadeUpNow, "Failed Break Up", "Price crossed the upper LTF trigger and closed back inside the HTF range")
+alertcondition(fadeDownNow, "Failed Break Down", "Price crossed the lower LTF trigger and closed back inside the HTF range")
 alertcondition(brokeUp, "HTF Bullish Range Breakout", "The selected structure timeframe confirmed a bullish range breakout")
 alertcondition(brokeDown, "HTF Bearish Range Breakout", "The selected structure timeframe confirmed a bearish range breakout")
